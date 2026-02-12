@@ -195,7 +195,8 @@ class vLLMHttpServerBase:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.model_config.hf_config.max_position_embeddings
+        if not self.config.max_model_len:
+            self.config.max_model_len = getattr(self.model_config.hf_config, "max_position_embeddings", 32768)
         self.rollout_mode = rollout_mode
         self.workers = workers
 

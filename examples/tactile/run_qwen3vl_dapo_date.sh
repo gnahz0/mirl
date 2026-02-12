@@ -5,7 +5,7 @@ set -xeuo pipefail
 
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 
-CUDA_VISIBLE_DEVICES=0,1,3,4 python3 -m verl.trainer.main_ppo \
+python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
@@ -40,6 +40,7 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.max_model_len=32768 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
@@ -61,13 +62,12 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=12288 \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
-    reward.reward_manager.name=dapo \
-    +reward.reward_kwargs.overlong_buffer_cfg.enable=True \
-    +reward.reward_kwargs.overlong_buffer_cfg.len=512 \
-    +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
-    +reward.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward.reward_kwargs.max_resp_len=2048 \
+    reward_model.reward_manager=dapo \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=2048 \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=tactile \
