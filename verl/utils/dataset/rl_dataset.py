@@ -106,6 +106,7 @@ class RLHFDataset(Dataset):
         self.prompt_key = config.get("prompt_key", "prompt")
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
+        self.data_source_dir = os.path.dirname(os.path.abspath(data_files[0]))
         self.image_patch_size = config.get("image_patch_size", 14)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
@@ -323,7 +324,10 @@ class RLHFDataset(Dataset):
                     image_offset += 1
                 elif segment == "<video>":
                     assert video_offset < len(videos), f"video_offset {video_offset} >= len(videos) {len(videos)}"
-                    content_list.append({"type": "video", "video": videos[video_offset]})
+                    video = dict(videos[video_offset]) if isinstance(videos[video_offset], dict) else {"video": videos[video_offset]}
+                    if "video" in video and not os.path.isabs(video["video"]):
+                        video["video"] = os.path.join(self.data_source_dir, video["video"])
+                    content_list.append({"type": "video", **video})
                     video_offset += 1
                 else:
                     content_list.append({"type": "text", "text": segment})

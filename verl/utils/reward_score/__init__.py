@@ -91,6 +91,16 @@ def default_compute_score(
 
         res = geo3k.compute_score(solution_str, ground_truth)
     elif data_source in [
+        "verify", "initial_fingers", "highest_pressure", "more_deformable",
+        "deformation_type", "objA_texture", "objB_texture", "grasp_location",
+        "contact_feature", "local_shape", "grip_stability", "future_stability",
+        "force_level", "shear_direction", "object_motion", "fail_reason",
+        "fail_improvement",
+    ]:
+        from . import tactile
+
+        res = tactile.compute_score(solution_str, ground_truth)
+    elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",
         "searchR1_popqa",
