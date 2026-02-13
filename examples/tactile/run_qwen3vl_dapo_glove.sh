@@ -10,6 +10,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=/scratch/raofu/3DHaptic/annotation_verl_split_glove_train.json \
     data.val_files=/scratch/raofu/3DHaptic/annotation_verl_split_glove_test.json \
     data.train_batch_size=64 \
+    data.val_batch_size=64 \
     data.max_prompt_length=4096 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
