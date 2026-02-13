@@ -47,12 +47,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
             videos=videos,
         )
 
+        # For video inputs with processor, use tokenizer-style prompt_ids for vLLM.
+        # processor.apply_chat_template() creates per-frame video placeholders that
+        # conflict with vLLM's own video expansion (causes IndexError in MRoPE).
+        # The tokenizer generates a single placeholder per video that vLLM can expand.
+        if videos is not None and self.processor is not None:
+            vllm_prompt_ids = await self.apply_chat_template_for_vllm(messages)
+        else:
+            vllm_prompt_ids = prompt_ids
+
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
                 request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
+                prompt_ids=vllm_prompt_ids,
                 sampling_params=sampling_params,
                 image_data=images,
                 video_data=videos,
