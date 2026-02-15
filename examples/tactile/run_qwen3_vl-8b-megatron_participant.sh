@@ -11,6 +11,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation ov
 
 
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0 # for vllm0.11.0 with TP
+export CUDA_LAUNCH_BLOCKING=1
 
 GEN_TP=${GEN_TP:-4}
 CP=${CP:-2}
