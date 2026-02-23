@@ -17,8 +17,8 @@ CP=${CP:-2}
 TP=${TP:-2}
 PP=${PP:-1}
 
-train_path=/scratch/raofu/3DHaptic/annotation_verl_split_question_train.json
-test_path=/scratch/raofu/3DHaptic/annotation_verl_split_question_test_mini.json
+train_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_question_train.json"
+test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_question_test_mini.json"
 
 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
