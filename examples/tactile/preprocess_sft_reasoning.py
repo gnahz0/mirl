@@ -4,12 +4,8 @@ Produces:
   - Parquet files with `messages` + `videos` columns for MultiTurnSFTDataset
   - RL-format JSONL test files (no reasoning) for generation-based evaluation
 
-Split strategies (identical to convert_to_verl.py):
-  - date:        group by date, random 80/20
-  - participant:  group by participant, random 80/20
-  - glove:        v1=train, v2=test
-  - question:     Q17 and earlier=train, Q18+=test
-  - task:         {actuation,push,pour,insert}=test, rest=train
+Splits are derived from existing GRPO annotation split files (annotation_verl_split_*),
+using (video_path, user_content) as the identifier to ensure consistency and no leakage.
 """
 
 import argparse
@@ -20,68 +16,38 @@ from pathlib import Path
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Constants (must match convert_to_verl.py for identical splits)
+# Constants
 # ---------------------------------------------------------------------------
 SEED = 42
-TEST_RATIO = 0.2
-QUESTION_SPLIT_CUTOFF = 17
-TASK_TEST_SET = {"actuation", "push", "pour", "insert"}
-
-QUESTION_NUMBER = {
-    "initial_fingers": 1,
-    "highest_pressure": 2,
-    "more_deformable": 4,
-    "deformation_type": 5,
-    "objA_texture": 6,
-    "objB_texture": 8,
-    "grasp_location": 10,
-    "contact_feature": 16,
-    "local_shape": 17,
-    "grip_stability": 18,
-    "future_stability": 19,
-    "force_level": 20,
-    "shear_direction": 26,
-    "object_motion": 27,
-    "fail_reason": 30,
-    "fail_improvement": 31,
-}
+SPLIT_NAMES = ["date", "participant", "glove", "question", "task"]
 
 
 # ---------------------------------------------------------------------------
-# Split helpers (same logic as convert_to_verl.py)
+# Helpers
 # ---------------------------------------------------------------------------
-def split_items_random(items, key_fn, test_ratio, rng):
-    """Group items by key_fn, randomly assign groups to train/test."""
-    groups = {}
-    for item in items:
-        k = key_fn(item)
-        groups.setdefault(k, []).append(item)
-
-    group_keys = sorted(groups.keys())
-    rng.shuffle(group_keys)
-
-    total = len(items)
-    test_target = int(total * test_ratio)
-    test_keys = set()
-    test_count = 0
-    for k in group_keys:
-        if test_count >= test_target:
+def sample_key(sample):
+    """Return (video_path, user_content) as a unique identifier for a sample."""
+    video = sample["videos"][0]["video"] if sample.get("videos") else ""
+    user_content = ""
+    for m in sample["prompt"]:
+        if m["role"] == "user":
+            user_content = m["content"]
             break
-        test_keys.add(k)
-        test_count += len(groups[k])
-
-    return {k: ("test" if k in test_keys else "train") for k in groups}
+    return (video, user_content)
 
 
-def first_word_task(task):
-    if not task:
-        return "unknown"
-    return task.split("_")[0].lower()
+def read_jsonl(path):
+    """Read JSONL file, return list of dicts."""
+    samples = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            samples.append(json.loads(line))
+    return samples
 
 
-# ---------------------------------------------------------------------------
-# Conversion helpers
-# ---------------------------------------------------------------------------
 def read_reasoning_jsonl(path):
     """Read JSONL file, filter to reasoning_status == 'ok'."""
     samples = []
@@ -95,6 +61,31 @@ def read_reasoning_jsonl(path):
                 continue
             samples.append(d)
     return samples
+
+
+def load_split_keys(grpo_dir, split_name):
+    """Load train/test keys from existing GRPO split files."""
+    train_file = grpo_dir / f"annotation_verl_split_{split_name}_train.json"
+    test_file = grpo_dir / f"annotation_verl_split_{split_name}_test.json"
+
+    train_keys = set()
+    if train_file.exists():
+        for s in read_jsonl(train_file):
+            train_keys.add(sample_key(s))
+
+    test_keys = set()
+    if test_file.exists():
+        for s in read_jsonl(test_file):
+            test_keys.add(sample_key(s))
+
+    # Also load mini test keys
+    mini_file = grpo_dir / f"annotation_verl_split_{split_name}_test_mini.json"
+    mini_keys = set()
+    if mini_file.exists():
+        for s in read_jsonl(mini_file):
+            mini_keys.add(sample_key(s))
+
+    return train_keys, test_keys, mini_keys
 
 
 def to_sft_record(sample):
@@ -147,6 +138,12 @@ def main():
         help="Path to annotation_verl_reasoning.json (JSONL)",
     )
     parser.add_argument(
+        "--grpo_dir",
+        type=str,
+        default=None,
+        help="Directory containing GRPO split files (annotation_verl_split_*). Default: same as input file directory.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
@@ -155,101 +152,68 @@ def main():
     args = parser.parse_args()
 
     input_path = Path(args.input)
+    grpo_dir = Path(args.grpo_dir) if args.grpo_dir else input_path.parent
     output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+
+    rng = random.Random(SEED)
 
     # Read and filter
     samples = read_reasoning_jsonl(input_path)
     print(f"Loaded {len(samples)} valid reasoning samples from {input_path}")
 
-    rng = random.Random(SEED)
-
-    # Extract extra_info for splitting
-    def get_date(s):
-        return s["extra_info"].get("date") or "unknown"
-
-    def get_participant(s):
-        return (s["extra_info"].get("participant") or "unknown").lower()
-
-    def get_glove(s):
-        return s["extra_info"].get("glove_type", "v1")
-
-    def get_question_type(s):
-        return s["extra_info"].get("question_type", "unknown")
-
-    def get_task_first_word(s):
-        return first_word_task(s["extra_info"].get("task"))
-
-    # ---------- Compute splits ----------
-    date_split = split_items_random(samples, get_date, TEST_RATIO, rng)
-    participant_split = split_items_random(samples, get_participant, TEST_RATIO, rng)
-    glove_split = {"v1": "train", "v2": "test"}
-
     # ---------- Write all-samples file ----------
     all_sft = [to_sft_record(s) for s in samples]
     save_parquet(all_sft, output_dir / "annotation_verl_reasoning_sft.parquet")
 
-    # ---------- Helper to write a split ----------
-    def write_split(name, split_fn):
-        """Write train/test parquet + RL JSONL test + mini files for a split."""
-        train_samples = [s for s in samples if split_fn(s) == "train"]
-        test_samples = [s for s in samples if split_fn(s) == "test"]
+    # ---------- Process each split ----------
+    for split_name in SPLIT_NAMES:
+        print(f"\n{split_name.capitalize()} split:")
 
-        train_sft = [to_sft_record(s) for s in train_samples]
-        test_sft = [to_sft_record(s) for s in test_samples]
+        train_keys, test_keys, mini_keys = load_split_keys(grpo_dir, split_name)
+        if not train_keys and not test_keys:
+            print(f"  WARNING: No GRPO split files found for '{split_name}' in {grpo_dir}, skipping.")
+            continue
 
-        prefix = f"annotation_verl_reasoning_sft_split_{name}"
-        save_parquet(train_sft, output_dir / f"{prefix}_train.parquet")
-        save_parquet(test_sft, output_dir / f"{prefix}_test.parquet")
+        train_samples = []
+        test_samples = []
+        unmatched = []
+        for s in samples:
+            k = sample_key(s)
+            if k in train_keys:
+                train_samples.append(s)
+            elif k in test_keys:
+                test_samples.append(s)
+            else:
+                unmatched.append(s)
 
-        # Mini test (10% of test)
-        if test_samples:
+        if unmatched:
+            print(f"  WARNING: {len(unmatched)} samples not found in GRPO splits, assigning to train.")
+            train_samples.extend(unmatched)
+
+        # SFT parquets
+        prefix = f"annotation_verl_reasoning_sft_split_{split_name}"
+        save_parquet([to_sft_record(s) for s in train_samples], output_dir / f"{prefix}_train.parquet")
+        save_parquet([to_sft_record(s) for s in test_samples], output_dir / f"{prefix}_test.parquet")
+
+        # Mini test: use the same mini keys from GRPO if available
+        if mini_keys:
+            mini_samples = [s for s in test_samples if sample_key(s) in mini_keys]
+        elif test_samples:
             mini_samples = rng.sample(test_samples, max(1, len(test_samples) // 10))
-            mini_sft = [to_sft_record(s) for s in mini_samples]
-            save_parquet(mini_sft, output_dir / f"{prefix}_test_mini.parquet")
         else:
             mini_samples = []
 
+        if mini_samples:
+            save_parquet([to_sft_record(s) for s in mini_samples], output_dir / f"{prefix}_test_mini.parquet")
+
         # RL-format JSONL for eval (test only)
-        rl_prefix = f"annotation_verl_reasoning_split_{name}"
-        test_rl = [to_rl_record(s) for s in test_samples]
-        write_jsonl(test_rl, output_dir / f"{rl_prefix}_test.json")
+        rl_prefix = f"annotation_verl_reasoning_split_{split_name}"
+        write_jsonl([to_rl_record(s) for s in test_samples], output_dir / f"{rl_prefix}_test.json")
 
         if mini_samples:
-            mini_rl = [to_rl_record(s) for s in mini_samples]
-            write_jsonl(mini_rl, output_dir / f"{rl_prefix}_test_mini.json")
+            write_jsonl([to_rl_record(s) for s in mini_samples], output_dir / f"{rl_prefix}_test_mini.json")
 
-        print(f"  Split '{name}': {len(train_samples)} train, {len(test_samples)} test, {len(mini_samples)} mini")
-
-    # ---------- Date split ----------
-    print("\nDate split:")
-    write_split("date", lambda s: date_split.get(get_date(s), "train"))
-
-    # ---------- Participant split ----------
-    print("\nParticipant split:")
-    write_split("participant", lambda s: participant_split.get(get_participant(s), "train"))
-
-    # ---------- Glove split ----------
-    print("\nGlove split:")
-    write_split("glove", lambda s: glove_split.get(get_glove(s), "train"))
-
-    # ---------- Question split ----------
-    print("\nQuestion split:")
-
-    def question_split_fn(s):
-        q_type = get_question_type(s)
-        q_num = QUESTION_NUMBER.get(q_type, 999)
-        return "train" if q_num <= QUESTION_SPLIT_CUTOFF else "test"
-
-    write_split("question", question_split_fn)
-
-    # ---------- Task split ----------
-    print("\nTask split:")
-
-    def task_split_fn(s):
-        fw = get_task_first_word(s)
-        return "test" if fw in TASK_TEST_SET else "train"
-
-    write_split("task", task_split_fn)
+        print(f"  Split '{split_name}': {len(train_samples)} train, {len(test_samples)} test, {len(mini_samples)} mini")
 
     print(f"\nDone. Output directory: {output_dir}")
 

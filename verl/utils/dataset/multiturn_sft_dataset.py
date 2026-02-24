@@ -131,6 +131,7 @@ class MultiTurnSFTDataset(Dataset):
             parquet_files = [parquet_files]
 
         self.parquet_files = parquet_files
+        self.data_source_dir = os.path.dirname(os.path.abspath(parquet_files[0]))
         if isinstance(tokenizer, str):
             tokenizer = hf_tokenizer(tokenizer)
         self.tokenizer: PreTrainedTokenizer = tokenizer
@@ -283,7 +284,10 @@ class MultiTurnSFTDataset(Dataset):
                     content_list.append({"type": "image", "image": image})
                     image_offset += 1
                 elif segment == "<video>":
-                    video = process_video(videos[video_offset], image_patch_size=self.image_patch_size)
+                    video_info = dict(videos[video_offset]) if isinstance(videos[video_offset], dict) else {"video": videos[video_offset]}
+                    if "video" in video_info and not os.path.isabs(video_info["video"]):
+                        video_info["video"] = os.path.join(self.data_source_dir, video_info["video"])
+                    video = process_video(video_info, image_patch_size=self.image_patch_size)
                     content_list.append({"type": "video", "video": video})
                     video_offset += 1
                 else:
