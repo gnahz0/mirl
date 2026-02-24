@@ -169,9 +169,13 @@ class MegatronModelMerger(BaseModelMerger):
         self.hf_config = AutoConfig.from_pretrained(
             self.config.hf_model_config_path, trust_remote_code=self.config.trust_remote_code
         )
-        # VLM configs (e.g. Qwen3VLConfig, Qwen2_5_VLConfig) nest LLM params under text_config
+        # VLM configs (e.g. Qwen3VLConfig, Qwen2_5_VLConfig) nest LLM params under text_config.
+        # Unwrap to text_config but preserve top-level fields like architectures.
         if hasattr(self.hf_config, "text_config") and not hasattr(self.hf_config, "num_hidden_layers"):
-            self.hf_config = self.hf_config.text_config
+            vlm_config = self.hf_config
+            self.hf_config = vlm_config.text_config
+            if not getattr(self.hf_config, "architectures", None):
+                self.hf_config.architectures = vlm_config.architectures
         print(self.hf_config, flush=True)
 
         self.params_mapping = {
