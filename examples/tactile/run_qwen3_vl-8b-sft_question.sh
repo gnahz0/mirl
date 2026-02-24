@@ -68,7 +68,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=${NUM_TRAINERS:-4} \
     trainer.save_freq=100 \
     trainer.test_freq=100 \
     trainer.total_epochs=1 \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=disable \
     trainer.max_ckpt_to_keep=2 \
     checkpoint.save_contents=[model,optimizer,extra] $@
 

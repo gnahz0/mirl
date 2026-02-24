@@ -172,6 +172,7 @@ def main():
     # ---------- Write all-samples file ----------
     all_sft = [to_sft_record(s) for s in samples]
     save_parquet(all_sft, output_dir / "annotation_verl_reasoning_sft.parquet")
+    write_jsonl(all_sft, output_dir / "annotation_verl_reasoning_sft.json")
 
     # ---------- Process each split ----------
     for split_name in SPLIT_NAMES:
@@ -198,10 +199,14 @@ def main():
             print(f"  WARNING: {len(unmatched)} samples not found in GRPO splits, assigning to train.")
             train_samples.extend(unmatched)
 
-        # SFT parquets
+        # SFT parquets + JSON mirrors
         prefix = f"annotation_verl_reasoning_sft_split_{split_name}"
-        save_parquet([to_sft_record(s) for s in train_samples], output_dir / f"{prefix}_train.parquet")
-        save_parquet([to_sft_record(s) for s in test_samples], output_dir / f"{prefix}_test.parquet")
+        train_sft = [to_sft_record(s) for s in train_samples]
+        test_sft = [to_sft_record(s) for s in test_samples]
+        save_parquet(train_sft, output_dir / f"{prefix}_train.parquet")
+        save_parquet(test_sft, output_dir / f"{prefix}_test.parquet")
+        write_jsonl(train_sft, output_dir / f"{prefix}_train.json")
+        write_jsonl(test_sft, output_dir / f"{prefix}_test.json")
 
         # Mini test: use the same mini keys from GRPO if available
         if mini_keys:
@@ -212,7 +217,9 @@ def main():
             mini_samples = []
 
         if mini_samples:
-            save_parquet([to_sft_record(s) for s in mini_samples], output_dir / f"{prefix}_test_mini.parquet")
+            mini_sft = [to_sft_record(s) for s in mini_samples]
+            save_parquet(mini_sft, output_dir / f"{prefix}_test_mini.parquet")
+            write_jsonl(mini_sft, output_dir / f"{prefix}_test_mini.json")
 
         # RL-format JSONL for eval (test only)
         rl_prefix = f"annotation_verl_reasoning_split_{split_name}"
