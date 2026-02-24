@@ -170,14 +170,27 @@ class MegatronModelMerger(BaseModelMerger):
             self.config.hf_model_config_path, trust_remote_code=self.config.trust_remote_code
         )
         # VLM configs (e.g. Qwen3VLConfig) nest LLM params under text_config.
-        # Promote key text_config attributes so downstream code can access them directly.
+        # Patch __getattr__ so missing attributes fall through to text_config,
+        # while preserving top-level attrs like vision_config and architectures.
         if hasattr(self.hf_config, "text_config") and not hasattr(self.hf_config, "num_hidden_layers"):
-            for attr in ("num_hidden_layers", "hidden_size", "num_attention_heads",
-                         "num_key_value_heads", "intermediate_size", "rms_norm_eps",
-                         "attention_dropout", "head_dim", "vocab_size",
-                         "max_position_embeddings", "rope_scaling", "tie_word_embeddings"):
-                if hasattr(self.hf_config.text_config, attr) and not hasattr(self.hf_config, attr):
-                    setattr(self.hf_config, attr, getattr(self.hf_config.text_config, attr))
+            _text_config = self.hf_config.text_config
+            _orig_cls = type(self.hf_config)
+            if not hasattr(_orig_cls, "_verl_patched"):
+                _orig_getattr = getattr(_orig_cls, "__getattr__", None)
+
+                def _fallback_getattr(self_inner, name):
+                    if _orig_getattr is not None:
+                        try:
+                            return _orig_getattr(self_inner, name)
+                        except AttributeError:
+                            pass
+                    tc = object.__getattribute__(self_inner, "text_config")
+                    if hasattr(tc, name):
+                        return getattr(tc, name)
+                    raise AttributeError(f"'{type(self_inner).__name__}' object has no attribute '{name}'")
+
+                _orig_cls.__getattr__ = _fallback_getattr
+                _orig_cls._verl_patched = True
         print(self.hf_config, flush=True)
 
         self.params_mapping = {
