@@ -30,7 +30,7 @@ from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
-from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.models.transformers.qwen2_vl import get_rope_index as get_rope_index_qwen2_vl
 from verl.utils import hf_tokenizer
 from verl.utils.chat_template import extract_system_prompt_and_generation
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -516,7 +516,16 @@ class MultiTurnSFTDataset(Dataset):
             video_grid_thw = multi_modal_inputs.get("video_grid_thw", None)
             second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts", None)
 
-            vision_position_ids = get_rope_index(
+            # Qwen3-VL uses per-frame video timestamps, requiring a different get_rope_index
+            is_qwen3_vl = "Qwen3VL" in self.processor.__class__.__name__
+            if is_qwen3_vl:
+                from verl.models.transformers.qwen3_vl import get_rope_index as get_rope_index_qwen3_vl
+
+                _get_rope_index = get_rope_index_qwen3_vl
+            else:
+                _get_rope_index = get_rope_index_qwen2_vl
+
+            vision_position_ids = _get_rope_index(
                 self.processor,
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
