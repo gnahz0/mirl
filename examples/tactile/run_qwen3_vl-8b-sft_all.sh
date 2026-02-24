@@ -70,7 +70,7 @@ for SPLIT_NAME in date glove question task; do
         trainer.experiment_name="${EXPERIMENT_NAME}" \
         trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
-        trainer.save_freq=100 \
+        trainer.save_freq=10 \
         trainer.test_freq=100 \
         trainer.total_epochs=1 \
         trainer.resume_mode=disable \
