@@ -20,12 +20,21 @@ from omegaconf import MISSING
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 from verl.utils.profiler.config import ProfilerConfig
+from verl.utils.qat import QATConfig
 
-from .engine import FSDPEngineConfig, McoreEngineConfig
+from .engine import FSDPEngineConfig, McoreEngineConfig, VeOmniEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = [
+    "PolicyLossConfig",
+    "RouterReplayConfig",
+    "ActorConfig",
+    "FSDPActorConfig",
+    "McoreActorConfig",
+    "VeOmniActorConfig",
+    "QATConfig",
+]
 
 
 @dataclass
@@ -148,6 +157,8 @@ class ActorConfig(BaseConfig):
     tau_neg: float = 1.05
     calculate_entropy: bool = False
     use_kl_loss: bool = False
+    # Whether to enable PrefixGrouper-based shared-prefix forward
+    use_prefix_grouper: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
@@ -283,6 +294,9 @@ class FSDPActorConfig(ActorConfig):
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
     use_rollout_log_probs: bool = False
+    calculate_sum_pi_squared: bool = False
+    sum_pi_squared_checkpointing: bool = False
+    qat: QATConfig = field(default_factory=QATConfig)
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
@@ -302,3 +316,26 @@ class FSDPActorConfig(ActorConfig):
                 raise ValueError(
                     "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
                 )
+
+
+@dataclass
+class VeOmniActorConfig(ActorConfig):
+    """Configuration for VeOmni actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'veomni' for VeOmni parallelism.
+        veomni (dict[str, Any]): Configuration for VeOmni settings.
+        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+    """
+
+    strategy: str = "veomni"
+    veomni: VeOmniEngineConfig = field(default_factory=VeOmniEngineConfig)
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate VeOmni actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.veomni

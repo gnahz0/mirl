@@ -88,6 +88,8 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
 
+        self.routed_experts = None
+
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
 
@@ -203,6 +205,7 @@ class ToolAgentLoop(AgentLoopBase):
             else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
+            routed_experts=agent_data.routed_experts,
             extra_fields={},
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
@@ -233,6 +236,12 @@ class ToolAgentLoop(AgentLoopBase):
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
             )
+        # first time to set num_preempted
+        if agent_data.metrics.get("num_preempted") is None:
+            agent_data.metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        # then add num_preempted to the metrics
+        else:
+            agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
