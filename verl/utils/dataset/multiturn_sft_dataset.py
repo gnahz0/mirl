@@ -39,6 +39,7 @@ from verl.utils.fs import copy_local_path_from_hdfs
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logging.getLogger("qwen_vl_utils.vision_process").setLevel(logging.WARNING)
 
 
 def once(func):
