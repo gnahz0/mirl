@@ -49,7 +49,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=${NUM_TRAINERS:-4} \
     ${ENTRYPOINT} \
     data.train_files="$train_path" \
     data.val_files="$test_path" \
-    data.train_batch_size=64 \
+    data.train_batch_size=32 \
     data.micro_batch_size_per_gpu=1 \
     data.max_length=8192 \
     data.pad_mode=no_padding \
