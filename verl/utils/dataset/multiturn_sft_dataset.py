@@ -308,6 +308,27 @@ class MultiTurnSFTDataset(Dataset):
                         return True
         return False
 
+    @staticmethod
+    def _flatten_message_content(message: dict[str, Any]) -> dict[str, Any]:
+        """Convert multimodal content list back to plain text for tokenizer.
+
+        Replaces image/video dicts with their placeholder tokens (<image>/<video>)
+        so the tokenizer produces simple placeholder token IDs.
+        """
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return message
+
+        text_parts = []
+        for item in content:
+            if item["type"] == "image":
+                text_parts.append("<image>")
+            elif item["type"] == "video":
+                text_parts.append("<video>")
+            elif item["type"] == "text":
+                text_parts.append(item["text"])
+        return {**message, "content": "".join(text_parts)}
+
     def _process_multimodal(self, messages, tools=None, enable_thinking=None):
         """Process the full conversation through the processor for multimodal inputs.
 
@@ -317,8 +338,9 @@ class MultiTurnSFTDataset(Dataset):
         2. pixel_values_videos, video_grid_thw, etc.
         3. Correct loss_mask computed from the expanded input_ids
 
-        This avoids the per-frame video placeholder mismatch issue with Qwen3-VL.
-        See: https://github.com/verl-project/verl/issues/5024
+        This avoids the per-frame video placeholder mismatch issue with Qwen3-VL
+        that occurs when using processor.apply_chat_template per-message with
+        tokenize=True. See: https://github.com/verl-project/verl/issues/5024
 
         Returns:
             input_ids, loss_mask, attention_mask, multi_modal_inputs
@@ -327,7 +349,10 @@ class MultiTurnSFTDataset(Dataset):
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
 
-        # Get the raw prompt text from processor (handles multimodal content)
+        # Get the raw prompt text from processor (with tokenize=False).
+        # This produces a single <|vision_start|><|video_pad|><|vision_end|>
+        # placeholder per video. The actual token expansion happens below
+        # in processor() call which properly handles video_grid_thw.
         raw_prompt = self.processor.apply_chat_template(
             messages,
             tools=tools,
