@@ -287,8 +287,10 @@ class MultiTurnSFTDataset(Dataset):
                     video_info = dict(videos[video_offset]) if isinstance(videos[video_offset], dict) else {"video": videos[video_offset]}
                     if "video" in video_info and not os.path.isabs(video_info["video"]):
                         video_info["video"] = os.path.join(self.data_source_dir, video_info["video"])
-                    video = process_video(video_info, image_patch_size=self.image_patch_size)
-                    content_list.append({"type": "video", "video": video})
+                    video, video_metadata = process_video(
+                        video_info, image_patch_size=self.image_patch_size, return_video_metadata=True,
+                    )
+                    content_list.append({"type": "video", "video": video, "video_metadata": video_metadata})
                     video_offset += 1
                 else:
                     content_list.append({"type": "text", "text": segment})
@@ -367,9 +369,10 @@ class MultiTurnSFTDataset(Dataset):
         raw_prompt = raw_prompt.replace("<video>", "<|vision_start|><|video_pad|><|vision_end|>")
         raw_prompt = raw_prompt.replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")
 
-        # Extract pre-processed images and videos from the messages
+        # Extract pre-processed images, videos, and video metadata from messages
         images_list = []
         videos_list = []
+        video_metadata_list = []
         for message in messages:
             content = message.get("content", "")
             if not isinstance(content, list):
@@ -379,13 +382,23 @@ class MultiTurnSFTDataset(Dataset):
                     images_list.append(item["image"])
                 elif item["type"] == "video":
                     videos_list.append(item["video"])
+                    if "video_metadata" in item:
+                        video_metadata_list.append(item["video_metadata"])
 
-        # Call processor with pre-processed vision data
+        # Call processor with pre-processed vision data.
+        # Pass video_metadata and do_sample_frames=False to tell the processor
+        # not to re-sample/re-process the video (which would create per-frame
+        # entries causing video_grid_thw mismatch). This matches rl_dataset.py.
         processor_kwargs = {}
         if images_list:
             processor_kwargs["images"] = images_list
         if videos_list:
             processor_kwargs["videos"] = videos_list
+            if video_metadata_list:
+                processor_kwargs["videos_kwargs"] = {
+                    "video_metadata": video_metadata_list,
+                    "do_sample_frames": False,
+                }
 
         inputs = dict(self.processor(
             text=[raw_prompt],
