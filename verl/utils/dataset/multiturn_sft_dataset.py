@@ -349,17 +349,23 @@ class MultiTurnSFTDataset(Dataset):
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
 
-        # Get the raw prompt text from processor (with tokenize=False).
-        # This produces a single <|vision_start|><|video_pad|><|vision_end|>
-        # placeholder per video. The actual token expansion happens below
-        # in processor() call which properly handles video_grid_thw.
-        raw_prompt = self.processor.apply_chat_template(
-            messages,
+        # Use tokenizer (not processor) to get the raw prompt text, then replace
+        # <video>/<image> with the special vision tokens the processor expects.
+        # The processor's apply_chat_template may generate per-frame video timestamp
+        # placeholders (on Qwen3-VL) that cause double-expansion when passed to
+        # processor(). The tokenizer produces literal <video>/<image> text which
+        # we manually convert to single <|vision_start|><|video_pad|><|vision_end|>.
+        text_messages = [self._flatten_message_content(m) for m in messages]
+        raw_prompt = self.tokenizer.apply_chat_template(
+            text_messages,
             tools=tools,
             add_generation_prompt=False,
             tokenize=False,
             **apply_chat_template_kwargs,
         )
+        # Replace literal placeholders with vision special tokens
+        raw_prompt = raw_prompt.replace("<video>", "<|vision_start|><|video_pad|><|vision_end|>")
+        raw_prompt = raw_prompt.replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")
 
         # Extract pre-processed images and videos from the messages
         images_list = []
