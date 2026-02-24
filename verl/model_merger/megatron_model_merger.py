@@ -510,6 +510,65 @@ class MegatronModelMerger(BaseModelMerger):
                 print(f"Saving tokenizer to {self.config.target_dir}")
                 tokenizer.save_pretrained(self.config.target_dir)
 
+    def _add_vision_weights(self, merged_state_dict):
+        """For VLM models, copy vision encoder weights from the original HF model.
+
+        Megatron only trains the language model, so vision weights are not in the checkpoint.
+        We load them from the original pretrained model specified in the config.
+        """
+        if not hasattr(self.hf_config, "vision_config"):
+            return merged_state_dict
+
+        # Check if vision weights are already present
+        vision_prefixes = ("visual.", "vision_model.")
+        if any(k.startswith(vision_prefixes) for k in merged_state_dict):
+            return merged_state_dict
+
+        # Resolve the original model path from the saved config
+        original_model_path = getattr(self.hf_config, "_name_or_path", None) or getattr(
+            self.hf_config, "name_or_path", None
+        )
+        if not original_model_path:
+            print("WARNING: Cannot determine original model path for vision weights, skipping.")
+            return merged_state_dict
+
+        print(f"VLM detected: copying vision weights from {original_model_path}")
+
+        from huggingface_hub import snapshot_download
+        from safetensors.torch import load_file
+
+        # Resolve to local path (handles both HF hub IDs and local paths)
+        if os.path.isdir(original_model_path):
+            model_dir = Path(original_model_path)
+        else:
+            model_dir = Path(snapshot_download(original_model_path))
+
+        # Load original model weights and extract vision-related keys
+        index_path = model_dir / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+            vision_files = set()
+            for key, filename in index["weight_map"].items():
+                if key.startswith(vision_prefixes):
+                    vision_files.add(filename)
+            for filename in vision_files:
+                shard = load_file(str(model_dir / filename))
+                for key, tensor in shard.items():
+                    if key.startswith(vision_prefixes):
+                        merged_state_dict[key] = tensor
+        else:
+            single_path = model_dir / "model.safetensors"
+            if single_path.exists():
+                shard = load_file(str(single_path))
+                for key, tensor in shard.items():
+                    if key.startswith(vision_prefixes):
+                        merged_state_dict[key] = tensor
+
+        vision_keys = [k for k in merged_state_dict if k.startswith(vision_prefixes)]
+        print(f"  Added {len(vision_keys)} vision weight tensors")
+        return merged_state_dict
+
     def merge_and_save(self):
         from verl.utils.megatron_utils import get_dist_checkpoint_path
 
@@ -518,6 +577,9 @@ class MegatronModelMerger(BaseModelMerger):
         model_state_dict = self._load_state_dicts(model_ckpt_path)
         merged_state_dict = self._merge_state_dicts(model_state_dict)
         del model_state_dict
+
+        # For VLMs, add vision encoder weights from the original model
+        merged_state_dict = self._add_vision_weights(merged_state_dict)
 
         if self.config.operation == "test":
             if not self.config.test_hf_dir:
