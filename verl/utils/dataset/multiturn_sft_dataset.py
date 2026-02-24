@@ -205,32 +205,24 @@ class MultiTurnSFTDataset(Dataset):
         """
         Process a single message and return its tokenized representation.
 
-        Uses tokenizer (not processor) for apply_chat_template to avoid
-        per-frame video placeholder expansion issues with Qwen3-VL.
-        See: https://github.com/verl-project/verl/issues/5024
-
         Args:
             index: turn index in the conversation
             message: A single message dictionary
+            images: List of images to be used
+            videos: List of videos to be used
             tools: List of tools to be used
             enable_thinking: Whether to enable thinking mode
 
         Returns:
-            Tuple of (input_ids, loss_mask, attention_mask)
+            Tuple of (input_ids, loss_mask, attention_mask, dict[str, torch.Tensor])
         """
-        # Always use tokenizer for per-message tokenization to get simple placeholders.
-        # The processor would generate per-frame timestamp placeholders for videos,
-        # causing a mismatch with video_grid_thw in MRoPE position calculation.
+        processor = self.processor if self.processor is not None else self.tokenizer
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
 
-        # For multimodal messages, we need to convert content list back to text
-        # so the tokenizer can handle it (tokenizer doesn't understand content dicts)
-        text_message = self._flatten_message_content(message)
-
-        inputs = self.tokenizer.apply_chat_template(
-            [text_message],
+        inputs = processor.apply_chat_template(
+            [message],
             tools=tools,
             add_generation_prompt=False,
             tokenize=True,
@@ -255,29 +247,7 @@ class MultiTurnSFTDataset(Dataset):
         else:
             loss_mask = torch.zeros_like(attention_mask)
 
-        return input_ids, loss_mask, attention_mask
-
-    @staticmethod
-    def _flatten_message_content(message: dict[str, Any]) -> dict[str, Any]:
-        """Convert multimodal content list back to plain text for tokenizer.
-
-        Replaces image/video dicts with their placeholder tokens (<image>/<video>)
-        so the tokenizer produces simple placeholder token IDs.
-        """
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return message
-
-        # Content is a list of dicts like [{"type": "video", ...}, {"type": "text", "text": "..."}]
-        text_parts = []
-        for item in content:
-            if item["type"] == "image":
-                text_parts.append("<image>")
-            elif item["type"] == "video":
-                text_parts.append("<video>")
-            elif item["type"] == "text":
-                text_parts.append(item["text"])
-        return {**message, "content": "".join(text_parts)}
+        return input_ids, loss_mask, attention_mask, inputs
 
     def _build_messages(self, example: dict):
         """Replace <image> and <video> placeholder in messages with corresponding image and video
@@ -328,16 +298,30 @@ class MultiTurnSFTDataset(Dataset):
         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
         return messages
 
-    def _process_vision_with_processor(self, messages, tools=None, enable_thinking=None):
-        """Process the full conversation through the processor to get multimodal inputs.
+    def _has_vision_content(self, messages):
+        """Check if any message contains vision content (images or videos)."""
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") in ("image", "video"):
+                        return True
+        return False
 
-        Uses processor.apply_chat_template on the full conversation (with pre-processed
-        video tensors) to get properly expanded input_ids, pixel_values_videos,
-        video_grid_thw, etc.
+    def _process_multimodal(self, messages, tools=None, enable_thinking=None):
+        """Process the full conversation through the processor for multimodal inputs.
+
+        For multimodal conversations (with images/videos), we must process the full
+        conversation through the processor at once to get:
+        1. Properly expanded input_ids (video/image pad tokens expanded to match frames)
+        2. pixel_values_videos, video_grid_thw, etc.
+        3. Correct loss_mask computed from the expanded input_ids
+
+        This avoids the per-frame video placeholder mismatch issue with Qwen3-VL.
+        See: https://github.com/verl-project/verl/issues/5024
 
         Returns:
-            input_ids: Tensor with properly expanded video/image pad tokens
-            multi_modal_inputs: Dict of pixel_values_videos, video_grid_thw, etc.
+            input_ids, loss_mask, attention_mask, multi_modal_inputs
         """
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
         if enable_thinking is not None:
@@ -372,19 +356,59 @@ class MultiTurnSFTDataset(Dataset):
         if videos_list:
             processor_kwargs["videos"] = videos_list
 
-        if not processor_kwargs:
-            return None, {}
-
-        inputs = self.processor(
+        inputs = dict(self.processor(
             text=[raw_prompt],
             **processor_kwargs,
             return_tensors="pt",
-        )
-        inputs = dict(inputs)
-        input_ids = inputs.pop("input_ids")[0]
-        inputs.pop("attention_mask", None)
+        ))
 
-        return input_ids, inputs
+        input_ids = inputs.pop("input_ids")[0]
+        attention_mask = inputs.pop("attention_mask")[0]
+        multi_modal_inputs = inputs
+
+        # Compute loss_mask from the processor's input_ids by finding assistant turns.
+        # Pattern: <|im_start|>assistant\n{content}<|im_end|>\n
+        # We mask loss on everything except the assistant content.
+        loss_mask = self._compute_loss_mask_from_ids(input_ids)
+
+        return input_ids, loss_mask, attention_mask, multi_modal_inputs
+
+    def _compute_loss_mask_from_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Compute loss_mask directly from input_ids by finding assistant turn boundaries.
+
+        Identifies assistant responses by the pattern:
+          <|im_start|> assistant \\n {content} <|im_end|>
+        and sets loss_mask=1 for {content} tokens only.
+        """
+        loss_mask = torch.zeros_like(input_ids)
+        ids_list = input_ids.tolist()
+
+        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+        # generation_prompt is the token sequence for "<|im_start|>assistant\n"
+        gen_prompt_len = len(self.generation_prompt)
+
+        i = 0
+        while i < len(ids_list):
+            if ids_list[i] == im_start_id:
+                # Check if this is an assistant turn by matching the generation_prompt
+                gen_end = i + gen_prompt_len
+                if gen_end <= len(ids_list) and ids_list[i:gen_end] == list(self.generation_prompt):
+                    # Find the <|im_end|> for this assistant turn
+                    end_pos = None
+                    for j in range(gen_end, len(ids_list)):
+                        if ids_list[j] == im_end_id:
+                            end_pos = j
+                            break
+                    if end_pos is not None:
+                        # Set loss_mask=1 for the assistant content (after generation prompt, before im_end)
+                        loss_mask[gen_end:end_pos] = 1
+                        i = end_pos + 1
+                        continue
+            i += 1
+
+        return loss_mask
 
     def __getitem__(self, item):
         row_dict: dict = self.dataframe.iloc[item].to_dict()
@@ -394,49 +418,55 @@ class MultiTurnSFTDataset(Dataset):
             self.enable_thinking[item] if self.enable_thinking is not None else self.enable_thinking_default
         )
 
-        # 1. Tokenize each message using tokenizer (not processor) for loss mask computation.
-        # The tokenizer produces simple placeholder tokens for <video>/<image>,
-        # avoiding per-frame expansion issues with Qwen3-VL processor.
-        input_ids, loss_mask, attention_mask = [], [], []
-        for i, message in enumerate(messages):
-            _input_ids, _loss_mask, _attention_mask = self._process_single_message(
-                index=i,
-                message=message,
-                full_message=messages,
-                tools=tools if i == 0 else None,
-                enable_thinking=enable_thinking,
-            )
-            input_ids.append(_input_ids)
-            loss_mask.append(_loss_mask)
-            attention_mask.append(_attention_mask)
-
-        input_ids = torch.cat(input_ids, dim=0)
-        loss_mask = torch.cat(loss_mask, dim=0)
-        attention_mask = torch.cat(attention_mask, dim=0)
-        assert input_ids.shape == loss_mask.shape == attention_mask.shape, (
-            f"Shape mismatch: {input_ids.shape}, {loss_mask.shape}, {attention_mask.shape}"
-        )
-
-        print_assembled_message(self.tokenizer, messages, input_ids, loss_mask, attention_mask, tools)
-        self.sanity_check(input_ids, messages, tools, enable_thinking)
-
-        # 2. Process vision data through processor to get properly expanded input_ids
-        # and multimodal inputs (pixel_values_videos, video_grid_thw, etc.)
-        multi_modal_inputs = {}
-        if self.processor is not None:
-            processor_input_ids, multi_modal_inputs = self._process_vision_with_processor(
+        # For multimodal conversations, process through processor at once to avoid
+        # per-frame video placeholder expansion issues (GitHub issue #5024).
+        if self.processor is not None and self._has_vision_content(messages):
+            input_ids, loss_mask, attention_mask, multi_modal_inputs = self._process_multimodal(
                 messages, tools=tools, enable_thinking=enable_thinking,
             )
+        else:
+            # Text-only: use the original per-message tokenization approach
+            input_ids, loss_mask, attention_mask, multi_modal_inputs = [], [], [], {}
+            for i, message in enumerate(messages):
+                _input_ids, _loss_mask, _attention_mask, _inputs = self._process_single_message(
+                    index=i,
+                    message=message,
+                    full_message=messages,
+                    tools=tools if i == 0 else None,
+                    enable_thinking=enable_thinking,
+                )
+                input_ids.append(_input_ids)
+                loss_mask.append(_loss_mask)
+                attention_mask.append(_attention_mask)
+                for k, v in _inputs.items():
+                    multi_modal_inputs.setdefault(k, []).append(v)
 
-            if processor_input_ids is not None:
-                # Transfer loss_mask from tokenizer input_ids to processor input_ids.
-                # The processor expands placeholder tokens (e.g. single <|video_pad|> becomes
-                # many), so we need to map loss_mask to the expanded sequence.
-                loss_mask = self._transfer_loss_mask(input_ids, loss_mask, processor_input_ids)
-                input_ids = processor_input_ids
-                attention_mask = torch.ones_like(input_ids)
+            input_ids = torch.cat(input_ids, dim=0)
+            loss_mask = torch.cat(loss_mask, dim=0)
+            attention_mask = torch.cat(attention_mask, dim=0)
+            assert input_ids.shape == loss_mask.shape == attention_mask.shape, (
+                f"Shape mismatch: {input_ids.shape}, {loss_mask.shape}, {attention_mask.shape}"
+            )
 
-        # 3. handle position_ids for Qwen-VL series models
+            print_assembled_message(self.tokenizer, messages, input_ids, loss_mask, attention_mask, tools)
+            self.sanity_check(input_ids, messages, tools, enable_thinking)
+
+            # Since the tokenizer may return user-customized results, we need to filter out inconsistent tensor shapes
+            keys_to_remove = []
+            for k, v in multi_modal_inputs.items():
+                if len(v) > 0 and v[0] is not None and isinstance(v[0], torch.Tensor):
+                    # Check if all tensors in the list have the same shape
+                    first_shape = v[0].shape[1:]
+                    if not all(tensor.shape[1:] == first_shape for tensor in v):
+                        keys_to_remove.append(k)
+
+            for k in keys_to_remove:
+                del multi_modal_inputs[k]
+
+            for k, v in multi_modal_inputs.items():
+                multi_modal_inputs[k] = torch.concat(v, dim=0)
+
+        # handle position_ids for Qwen-VL series models
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             image_grid_thw = multi_modal_inputs.get("image_grid_thw", None)
             video_grid_thw = multi_modal_inputs.get("video_grid_thw", None)
@@ -455,7 +485,7 @@ class MultiTurnSFTDataset(Dataset):
         else:
             position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)  # (seq_len,)
 
-        # 4. handle padding
+        # handle padding
         sequence_length = input_ids.shape[0]
         # Handle sequence length
         if self.pad_mode == DatasetPadMode.RIGHT:
@@ -514,67 +544,16 @@ class MultiTurnSFTDataset(Dataset):
         else:
             raise ValueError(f"Unknown pad mode {self.pad_mode}")
 
-    def _transfer_loss_mask(
-        self,
-        tokenizer_ids: torch.Tensor,
-        loss_mask: torch.Tensor,
-        processor_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Transfer loss_mask from tokenizer input_ids to processor input_ids.
-
-        The processor expands vision placeholder tokens (e.g. a single <|video_pad|>
-        becomes N tokens based on video frames/patches). Non-vision tokens match 1:1.
-        Vision tokens (image_pad, video_pad) get loss_mask=0 (no loss on vision tokens).
-
-        This uses a two-pointer approach: walk both sequences, matching non-vision tokens
-        and expanding vision regions.
-        """
-        if self.processor is None:
-            return loss_mask
-
-        image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        video_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|video_pad|>")
-        vision_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        vision_end_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
-        vision_token_ids = {image_token_id, video_token_id, vision_start_id, vision_end_id}
-
-        new_loss_mask = torch.zeros(len(processor_ids), dtype=loss_mask.dtype)
-
-        tok_i = 0  # pointer into tokenizer_ids
-        proc_i = 0  # pointer into processor_ids
-
-        while tok_i < len(tokenizer_ids) and proc_i < len(processor_ids):
-            tok_id = tokenizer_ids[tok_i].item()
-            proc_id = processor_ids[proc_i].item()
-
-            if tok_id == proc_id:
-                # Tokens match — copy loss mask value
-                if tok_id not in vision_token_ids:
-                    new_loss_mask[proc_i] = loss_mask[tok_i]
-                tok_i += 1
-                proc_i += 1
-            elif proc_id in vision_token_ids:
-                # Processor has expanded vision tokens — skip them (loss_mask=0)
-                proc_i += 1
-            elif tok_id in vision_token_ids:
-                # Tokenizer has a vision placeholder that processor expanded — skip it
-                tok_i += 1
-            else:
-                # Timestamp tokens from processor (e.g. <0.5 seconds>) that tokenizer doesn't have
-                # These are injected by the processor for per-frame timestamps
-                proc_i += 1
-
-        return new_loss_mask
-
     def sanity_check(self, input_ids: torch.Tensor, messages: list[dict], tools: list[dict], enable_thinking: bool):
         """Check concatenated input_ids of apply_chat_template to each turn equals
         apply_chat_template to whole messages.
         """
+        processor = self.processor if self.processor is not None else self.tokenizer
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
-        inputs = self.tokenizer.apply_chat_template(
-            [self._flatten_message_content(m) for m in messages],
+        inputs = processor.apply_chat_template(
+            messages,
             tools=tools,
             add_generation_prompt=False,
             tokenize=True,
