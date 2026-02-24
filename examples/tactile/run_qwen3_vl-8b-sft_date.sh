@@ -50,12 +50,12 @@ torchrun --standalone --nnodes=1 --nproc-per-node=${NUM_TRAINERS:-4} \
     data.train_files="$train_path" \
     data.val_files="$test_path" \
     data.train_batch_size=32 \
-    data.micro_batch_size_per_gpu=2 \
-    data.max_length=16384 \
+    data.micro_batch_size_per_gpu=1 \
+    data.max_length=8192 \
     data.pad_mode=no_padding \
     data.truncation=right \
     data.use_dynamic_bsz=True \
-    data.max_token_len_per_gpu=16384 \
+    data.max_token_len_per_gpu=8192 \
     data.ignore_input_ids_mismatch=True \
     model.path=Qwen/Qwen3-VL-8B-Instruct \
     model.use_remove_padding=True \

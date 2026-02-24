@@ -88,6 +88,14 @@ def load_split_keys(grpo_dir, split_name):
     return train_keys, test_keys, mini_keys
 
 
+MAX_FRAMES = 8
+
+
+def cap_max_frames(videos):
+    """Cap max_frames in video metadata."""
+    return [{**v, "max_frames": min(v.get("max_frames", MAX_FRAMES), MAX_FRAMES)} for v in videos]
+
+
 def to_sft_record(sample):
     """Convert a reasoning sample to SFT parquet record (messages + videos)."""
     prompt_messages = sample["prompt"]  # [system, user]
@@ -95,7 +103,7 @@ def to_sft_record(sample):
 
     messages = list(prompt_messages) + [{"role": "assistant", "content": reasoning}]
 
-    videos = sample.get("videos", [])
+    videos = cap_max_frames(sample.get("videos", []))
 
     return {"messages": messages, "videos": videos}
 
@@ -105,7 +113,7 @@ def to_rl_record(sample):
     return {
         "data_source": sample["data_source"],
         "prompt": sample["prompt"],
-        "videos": sample.get("videos", []),
+        "videos": cap_max_frames(sample.get("videos", [])),
         "reward_model": sample["reward_model"],
         "extra_info": sample["extra_info"],
     }
