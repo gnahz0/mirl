@@ -83,5 +83,4 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.val_only=True \
     trainer.total_epochs=15 $@
