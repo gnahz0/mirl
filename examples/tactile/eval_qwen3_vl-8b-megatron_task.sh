@@ -2,6 +2,7 @@ set -x
 ENGINE=${1:-vllm}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+export CUDA_LAUNCH_BLOCKING=1
 
 # Evaluate non-reasoning RL checkpoint on full test set — split: task
 
@@ -22,8 +23,8 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     algorithm.adv_estimator=grpo \
     data.train_files="$test_path" \
     data.val_files="$test_path" \
-    data.train_batch_size=64 \
-    data.val_batch_size=32 \
+    data.train_batch_size=16 \
+    data.val_batch_size=64 \
     data.max_prompt_length=8192 \
     data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
