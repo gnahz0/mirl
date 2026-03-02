@@ -8,7 +8,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation ov
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0 # for vllm0.11.0 with TP
 
 GEN_TP=${GEN_TP:-2}
-CP=${CP:-2}
+CP=${CP:-1}
 TP=${TP:-2}
 PP=${PP:-1}
 
