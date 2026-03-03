@@ -17,7 +17,7 @@ echo "Evaluating model at: ${MODEL_PATH}"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_date_test.json"
 
-CUDA_VISIBLE_DEVICES=1,2,3,4 python3 -m verl.trainer.main_ppo --config-path=config \
+CUDA_VISIBLE_DEVICES=0,3,4,7 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
     algorithm.adv_estimator=grpo \
     data.train_files="$test_path" \
