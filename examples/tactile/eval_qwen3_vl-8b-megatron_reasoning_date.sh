@@ -2,7 +2,7 @@ set -x
 
 # Evaluate reasoning RL checkpoint on full test set — split: date
 
-MODEL_PATH="/scratch/dvdai/qwen3vl_dapo_reasoning_split_date_2"
+MODEL_PATH="/scratch/dvdai/qwen3vl_dapo_reasoning_split_date_new_data"
 echo "Evaluating model at: ${MODEL_PATH}"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_date_test.json"
@@ -47,7 +47,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='tactile' \
-    trainer.experiment_name='eval_qwen3vl_dapo_reasoning_split_date' \
+    trainer.experiment_name='eval_qwen3vl_dapo_reasoning_split_date_new_data' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
