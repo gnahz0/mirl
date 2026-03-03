@@ -80,6 +80,6 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.test_freq=5 \
+    trainer.test_freq=20 \
     trainer.val_before_train=True \
     trainer.total_epochs=15 $@
