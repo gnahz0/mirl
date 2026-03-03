@@ -2,7 +2,7 @@ set -x
 
 # Evaluate non-reasoning RL checkpoint on full test set — split: date
 
-MODEL_PATH="/scratch/dvdai/qwen3vl_dapo_reasoning_split_date_2"
+MODEL_PATH="/home/dvdai/verl/checkpoints/tactile/qwen3vl_dapo_split_date_official/global_step_120/actor/h"
 echo "Evaluating model at: ${MODEL_PATH}"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_date_test.json"
