@@ -23,7 +23,7 @@ for i in "${!TEST_SUFFIXES[@]}"; do
         algorithm.adv_estimator=grpo \
         data.train_files="$test_path" \
         data.val_files="$test_path" \
-        data.train_batch_size=16 \
+        data.train_batch_size=64 \
         data.val_batch_size=64 \
         data.max_prompt_length=8192 \
         data.max_response_length=4096 \
