@@ -2,7 +2,7 @@ set -x
 ENGINE=${1:-vllm}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
-export CUDA_LAUNCH_BLOCKING=1
+export CUDA_LAUNCH_BLOCKING=0
 
 # Evaluate reasoning RL checkpoint on full test set — split: date
 
