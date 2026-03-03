@@ -12,14 +12,12 @@ CP=${CP:-2}
 TP=${TP:-2}
 PP=${PP:-1}
 
-CKPT_DIR="checkpoints/tactile/qwen3vl_dapo_split_date_official"
-LATEST_STEP=$(tr -d '[:space:]' < "${CKPT_DIR}/latest_checkpointed_iteration.txt")
-MODEL_PATH="${CKPT_DIR}/global_step_${LATEST_STEP}/actor/huggingface"
+MODEL_PATH="/scratch/dvdai/qwen3vl_dapo_reasoning_split_date_2"
 echo "Evaluating model at: ${MODEL_PATH}"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_date_test.json"
 
-python3 -m verl.trainer.main_ppo --config-path=config \
+CUDA_VISIBLE_DEVICES=1,2,3,4 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
     algorithm.adv_estimator=grpo \
     data.train_files="$test_path" \
