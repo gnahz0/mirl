@@ -11,7 +11,7 @@ CP=${CP:-2}
 TP=${TP:-2}
 PP=${PP:-1}
 
-CKPT_DIR="checkpoints/tactile/qwen3vl_dapo_reasoning_split_task_2"
+CKPT_DIR="checkpoints/tactile/qwen3vl_dapo_split_task_official"
 LATEST_STEP=$(tr -d '[:space:]' < "${CKPT_DIR}/latest_checkpointed_iteration.txt")
 MODEL_PATH="${CKPT_DIR}/global_step_${LATEST_STEP}/actor/huggingface"
 echo "Evaluating model at: ${MODEL_PATH}"
