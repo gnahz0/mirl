@@ -1,3 +1,4 @@
+#!/bin/bash
 set -x
 
 # Evaluate vanilla Qwen3-VL-8B-Instruct on glove/question/task splits (baseline comparison)
