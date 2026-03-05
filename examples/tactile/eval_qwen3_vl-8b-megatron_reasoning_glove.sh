@@ -3,7 +3,7 @@ set -x
 
 # Evaluate reasoning RL checkpoint on full test set — split: glove
 
-CKPT_DIR="checkpoints/tactile/qwen3vl_dapo_reasoning_split_glove_official"
+CKPT_DIR="checkpoints/tactile/qwen3vl_dapo_split_glove"
 LATEST_STEP=$(tr -d '[:space:]' < "${CKPT_DIR}/latest_checkpointed_iteration.txt")
 MODEL_PATH="${CKPT_DIR}/global_step_${LATEST_STEP}/actor/huggingface"
 echo "Evaluating model at: ${MODEL_PATH}"
