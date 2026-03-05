@@ -18,6 +18,8 @@ echo "Evaluating model at: ${MODEL_PATH}"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_question_test.json"
 
+mkdir -p outputs/eval_qwen3vl_dapo_split_question
+
 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
     algorithm.adv_estimator=grpo \
@@ -84,4 +86,5 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
+    trainer.validation_data_dir=outputs/eval_qwen3vl_dapo_split_question \
     trainer.total_epochs=15 $@

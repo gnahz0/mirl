@@ -6,6 +6,8 @@ MODEL_PATH="/scratch/dvdai/qwen3vl_dapo_reasoning_split_date_2"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_date_test_no_video.json"
 
+mkdir -p outputs/eval_qwen3vl_dapo_reasoning_split_date_no_video
+
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$test_path" \
@@ -52,4 +54,5 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.val_only=True \
+    trainer.validation_data_dir=outputs/eval_qwen3vl_dapo_reasoning_split_date_no_video \
     trainer.total_epochs=15 $@

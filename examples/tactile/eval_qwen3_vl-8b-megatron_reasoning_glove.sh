@@ -10,6 +10,8 @@ echo "Evaluating model at: ${MODEL_PATH}"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_glove_test.json"
 
+mkdir -p outputs/eval_qwen3vl_dapo_reasoning_split_glove
+
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$test_path" \
@@ -57,4 +59,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.val_only=True \
+    trainer.validation_data_dir=outputs/eval_qwen3vl_dapo_reasoning_split_glove \
     trainer.total_epochs=15 $@

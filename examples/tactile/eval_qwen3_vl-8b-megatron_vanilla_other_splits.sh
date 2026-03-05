@@ -17,6 +17,7 @@ for i in "${!SPLITS[@]}"; do
     exp_name="eval_vanilla_qwen3vl_split_${split}"
 
     echo "=== [$((i+1))/${TOTAL}] Eval: ${exp_name} ==="
+    mkdir -p "outputs/${exp_name}"
 
     CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m verl.trainer.main_ppo \
         algorithm.adv_estimator=grpo \
@@ -64,6 +65,7 @@ for i in "${!SPLITS[@]}"; do
         trainer.save_freq=20 \
         trainer.test_freq=5 \
         trainer.val_only=True \
+        trainer.validation_data_dir="outputs/${exp_name}" \
         trainer.total_epochs=15 $@
 done
 

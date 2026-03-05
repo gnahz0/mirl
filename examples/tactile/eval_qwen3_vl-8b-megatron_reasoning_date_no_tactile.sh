@@ -15,6 +15,8 @@ MODEL_PATH="/scratch/dvdai/qwen3vl_dapo_reasoning_split_date_2"
 
 test_path="$HOME/scratch/raofu/3DHaptic/annotation_verl_split_date_test_no_tactile.json"
 
+mkdir -p outputs/eval_qwen3vl_dapo_reasoning_split_date_no_tactile
+
 CUDA_VISIBLE_DEVICES=0,3,4,7 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
     algorithm.adv_estimator=grpo \
@@ -81,4 +83,5 @@ CUDA_VISIBLE_DEVICES=0,3,4,7 python3 -m verl.trainer.main_ppo --config-path=conf
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
+    trainer.validation_data_dir=outputs/eval_qwen3vl_dapo_reasoning_split_date_no_tactile \
     trainer.total_epochs=15 $@
