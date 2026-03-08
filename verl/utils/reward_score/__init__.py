@@ -15,6 +15,43 @@
 
 from verl.utils.import_utils import deprecated
 
+_DATA_SOURCE_TO_GROUP = {}
+for _ds in [
+    "cremad", "chsimsv2", "meld_emotion", "meld_senti",
+    "mmpsy_anxiety", "mmpsy_depression", "mmsd",
+    "mosei_emotion", "mosei_senti", "ptsd_in_the_wild",
+    "tess", "urfunny",
+]:
+    _DATA_SOURCE_TO_GROUP[_ds] = "human_behaviour"
+for _ds in [
+    "chest_xray", "ct", "derm", "fundus", "mammo",
+    "mri", "pathology", "ultrasound",
+]:
+    _DATA_SOURCE_TO_GROUP[_ds] = "climb"
+for _ds in [
+    "verify", "initial_fingers", "highest_pressure", "more_deformable",
+    "deformation_type", "deformation_note", "objA_texture", "objB_texture",
+    "objA_notes", "objB_notes", "grasp_location", "contact_feature",
+    "local_shape", "grip_stability", "future_stability", "force_level",
+    "shear_direction", "object_motion", "fail_reason", "fail_improvement",
+    "description", "mat_description", "part_notes", "tactile_description",
+]:
+    _DATA_SOURCE_TO_GROUP[_ds] = "tactile"
+
+
+def _prefix_metrics(res, data_source):
+    """Add dataset-group-prefixed copies of metrics for per-dataset logging."""
+    if not isinstance(res, dict):
+        return res
+    group = _DATA_SOURCE_TO_GROUP.get(data_source)
+    if not group:
+        return res
+    prefixed = dict(res)
+    for key, value in res.items():
+        if isinstance(value, (int, float)):
+            prefixed[f"{group}/{key}"] = value
+    return prefixed
+
 
 def default_compute_score(
     data_source,
@@ -102,6 +139,22 @@ def default_compute_score(
 
         res = tactile.compute_score(solution_str, ground_truth)
     elif data_source in [
+        "cremad", "chsimsv2", "meld_emotion", "meld_senti",
+        "mmpsy_anxiety", "mmpsy_depression", "mmsd",
+        "mosei_emotion", "mosei_senti", "ptsd_in_the_wild",
+        "tess", "urfunny",
+    ]:
+        from . import human_behaviour
+
+        res = human_behaviour.compute_score(solution_str, ground_truth)
+    elif data_source in [
+        "chest_xray", "ct", "derm", "fundus", "mammo",
+        "mri", "pathology", "ultrasound",
+    ]:
+        from . import medical
+
+        res = medical.compute_score(solution_str, ground_truth)
+    elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",
         "searchR1_popqa",
@@ -118,7 +171,7 @@ def default_compute_score(
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
     if isinstance(res, dict):
-        return res
+        return _prefix_metrics(res, data_source)
     elif isinstance(res, int | float | bool):
         return float(res)
     else:
