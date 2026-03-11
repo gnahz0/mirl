@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,3
+export CUDA_VISIBLE_DEVICES=0,4
 export RAY_TMPDIR=/scratch/alecz/ray_tmp
 set -x
 ENGINE=${1:-vllm}

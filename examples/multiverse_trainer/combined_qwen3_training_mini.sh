@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,3
+export CUDA_VISIBLE_DEVICES=1,2
 export RAY_TMPDIR=/scratch/alecz/ray_tmp
 set -x
 ENGINE=${1:-vllm}
@@ -49,7 +49,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=3072 \
     actor_rollout_ref.rollout.n=3 \
+    actor_rollout_ref.rollout.max_model_len=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
