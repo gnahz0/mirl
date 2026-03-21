@@ -42,20 +42,25 @@ def acc_reward(pred_label: str, gt_label: str) -> float:
     return 1.0 if pred_label == gt_label else 0.0
 
 
-def similarity_reward(pred_label: str, gt_label: str) -> float:
-    """Combined token-level Jaccard + sequence-matching similarity."""
+def token_metrics(pred_label: str, gt_label: str) -> dict:
+    """Token-level precision, recall, F1, Jaccard, and blended similarity."""
     pred_tokens = set(pred_label.split())
     gt_tokens = set(gt_label.split())
 
     if not pred_tokens and not gt_tokens:
-        return 1.0
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "jaccard": 1.0, "similarity": 1.0}
     if not pred_tokens or not gt_tokens:
-        return 0.0
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "jaccard": 0.0, "similarity": 0.0}
 
+    tp = len(pred_tokens & gt_tokens)
+    precision = tp / len(pred_tokens)
+    recall = tp / len(gt_tokens)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     jaccard = len(pred_tokens & gt_tokens) / len(pred_tokens | gt_tokens)
     seq_ratio = SequenceMatcher(None, pred_label, gt_label).ratio()
+    similarity = max(0.0, min(1.0, 0.5 * jaccard + 0.5 * seq_ratio))
 
-    return max(0.0, min(1.0, 0.5 * jaccard + 0.5 * seq_ratio))
+    return {"precision": precision, "recall": recall, "f1": f1, "jaccard": jaccard, "similarity": similarity}
 
 
 def compute_score(
@@ -72,7 +77,11 @@ def compute_score(
         dict with keys:
             score: float      - the training reward
             acc: float        - exact-match accuracy (0 or 1)
-            similarity: float - token + sequence similarity
+            f1: float         - token-level F1
+            precision: float  - token-level precision
+            recall: float     - token-level recall
+            jaccard: float    - token-level Jaccard similarity
+            similarity: float - blended token Jaccard + sequence similarity
             format: float     - format compliance (0 or 1)
     """
     boxed = extract_boxed_answer(predict_str)
@@ -81,17 +90,17 @@ def compute_score(
 
     fmt = format_reward(predict_str)
     acc = acc_reward(pred_label, gt_label)
-    sim = similarity_reward(pred_label, gt_label)
+    metrics = token_metrics(pred_label, gt_label)
 
-    score = acc + format_weight * fmt + sim_weight * sim
+    score = acc + format_weight * fmt + sim_weight * metrics["similarity"]
 
     return {
         "score": score,
         "acc": acc,
-        "f1": 0.0,
-        "precision": 0.0,
-        "recall": 0.0,
-        "jaccard": 0.0,
-        "similarity": sim,
+        "f1": metrics["f1"],
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "jaccard": metrics["jaccard"],
+        "similarity": metrics["similarity"],
         "format": fmt,
     }

@@ -1,5 +1,8 @@
+MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export RAY_TMPDIR="${RAY_TMPDIR:-${MIRL_ROOT}/.ray_tmp}"
+mkdir -p "$RAY_TMPDIR"
+
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export RAY_TMPDIR=/scratch/alecz/ray_tmp
 set -x
 
 # Evaluate a trained checkpoint on the combined val set.
@@ -31,7 +34,7 @@ fi
 
 echo "Evaluating model at: ${MODEL_PATH}"
 
-VAL_FILE=/home/alecz/scratch/alecz/multiverse-test/mirl_tactile/data/combined_val.json
+VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_val.json}"
 OUTPUT_DIR="outputs/eval_${EXPERIMENT_NAME}"
 
 mkdir -p "$OUTPUT_DIR"

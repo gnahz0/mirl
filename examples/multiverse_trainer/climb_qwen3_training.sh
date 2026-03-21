@@ -1,12 +1,19 @@
+MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export RAY_TMPDIR="${RAY_TMPDIR:-${MIRL_ROOT}/.ray_tmp}"
+mkdir -p "$RAY_TMPDIR"
+
 export CUDA_VISIBLE_DEVICES=0,5,6,7
-export RAY_TMPDIR=/scratch/alecz/ray_tmp
 set -x
 ENGINE=${1:-vllm}
 
+CLIMB_TRAIN="${CLIMB_TRAIN:-${MIRL_ROOT}/data/climb/geom_train.jsonl}"
+CLIMB_VAL="${CLIMB_VAL:-${MIRL_ROOT}/data/climb/geom_valid.jsonl}"
+CLIMB_VALIDATION_DATA_DIR="${CLIMB_VALIDATION_DATA_DIR:-${MIRL_ROOT}/outputs}"
+
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/home/alecz/scratch/high_modality/geom_train.jsonl \
-    data.val_files=/home/alecz/scratch/high_modality/geom_valid.jsonl \
+    data.train_files="$CLIMB_TRAIN" \
+    data.val_files="$CLIMB_VAL" \
     data.train_batch_size=512 \
     data.val_batch_size=64 \
     data.max_prompt_length=4096 \
@@ -53,7 +60,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=1 \
     trainer.val_before_train=True \
-    trainer.validation_data_dir=/home/alecz/outputs \
+    trainer.validation_data_dir="$CLIMB_VALIDATION_DATA_DIR" \
     trainer.val_only=False \
     trainer.test_freq=5 \
     trainer.total_epochs=15 $@

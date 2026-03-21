@@ -1,12 +1,19 @@
+MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export RAY_TMPDIR="${RAY_TMPDIR:-${MIRL_ROOT}/.ray_tmp}"
+mkdir -p "$RAY_TMPDIR"
+
 export CUDA_VISIBLE_DEVICES=0,4
-export RAY_TMPDIR=/scratch/alecz/ray_tmp
 set -x
 ENGINE=${1:-vllm}
 
+HB_TRAIN_JSONL="${HB_TRAIN_JSONL:-${MIRL_ROOT}/data/hb/v5_train_upd.jsonl}"
+HB_VAL_JSONL="${HB_VAL_JSONL:-${MIRL_ROOT}/data/hb/v5_test_upd.jsonl}"
+HB_VALIDATION_DATA_DIR="${HB_VALIDATION_DATA_DIR:-${MIRL_ROOT}/outputs}"
+
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/scratch/keane/human_behaviour_data/v5_train_upd.jsonl \
-    data.val_files=/scratch/keane/human_behaviour_data/v5_test_upd.jsonl \
+    data.train_files="$HB_TRAIN_JSONL" \
+    data.val_files="$HB_VAL_JSONL" \
     data.train_batch_size=512 \
     data.val_batch_size=64 \
     data.max_prompt_length=4096 \
@@ -63,7 +70,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=1 \
     trainer.val_before_train=True \
-    trainer.validation_data_dir=/home/alecz/multimodal/outputs \
+    trainer.validation_data_dir="$HB_VALIDATION_DATA_DIR" \
     trainer.val_only=False \
     trainer.test_freq=2 \
     trainer.total_epochs=10 $@

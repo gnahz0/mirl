@@ -14,20 +14,24 @@ Output format per entry:
   "extra_info": { ... }
 }
 
-Usage:
-  python scripts/combine_datasets.py \
-      --hb /scratch/keane/human_behaviour_data/v5_test_upd.jsonl \
-      --hb-root /scratch/keane/human_behaviour_data \
-      --climb /home/alecz/scratch/high_modality/geom_valid_demo_only.jsonl \
-      --climb-root /home/alecz/scratch/high_modality \
-      --output combined_valid_demo_only.json
+Run: ``python scripts/combine_datasets.py`` (defaults use the path constants below
+for train demo). For val demo, override ``--hb``, ``--climb``, and ``--output``.
 """
 
 import argparse
 import json
 import os
 import sys
-from pathlib import Path
+
+# --- File paths (this node) ---
+HB_JSONL_TRAIN = "/scratch/keane/human_behaviour_data/v5_train_upd.jsonl"
+HB_JSONL_TEST = "/scratch/keane/human_behaviour_data/v5_test_upd.jsonl"
+HB_MEDIA_ROOT = "/scratch/keane/human_behaviour_data"
+CLIMB_JSONL_TRAIN_DEMO = "/orcd/compute/ppliang/001/high_modality/geom_train_demo_only.jsonl"
+CLIMB_JSONL_VAL_DEMO = "/orcd/compute/ppliang/001/high_modality/geom_valid_demo_only.jsonl"
+CLIMB_MEDIA_ROOT = "/orcd/compute/ppliang/001/high_modality"
+OUTPUT_COMBINED_TRAIN_DEMO = "/home/alecz/mirl/data/combined_train_demo_only.json"
+OUTPUT_COMBINED_VAL_DEMO = "/home/alecz/mirl/data/combined_valid_demo_only.json"
 
 HB_SYSTEM_PROMPT = (
     "You are an expert in analyzing human behaviour from multimodal signals "
@@ -182,12 +186,18 @@ def read_all(path: str, converter, root: str) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="Combine HB + CLIMB into unified format")
-    parser.add_argument("--hb", required=True, help="Path to human behaviour JSONL")
-    parser.add_argument("--hb-root", required=True, help="Base directory for HB media paths")
-    parser.add_argument("--climb", required=True, help="Path to CLIMB/medical JSONL")
-    parser.add_argument("--climb-root", required=True, help="Base directory for CLIMB media paths")
-    parser.add_argument("--output", required=True, help="Output .json path")
+    parser.add_argument("--hb", default=HB_JSONL_TRAIN, help="Path to human behaviour JSONL")
+    parser.add_argument("--hb-root", default=HB_MEDIA_ROOT, help="Base directory for HB media paths")
+    parser.add_argument("--climb", default=CLIMB_JSONL_TRAIN_DEMO, help="Path to CLIMB/medical JSONL")
+    parser.add_argument("--climb-root", default=CLIMB_MEDIA_ROOT, help="Base directory for CLIMB media paths")
+    parser.add_argument(
+        "--output",
+        default=OUTPUT_COMBINED_TRAIN_DEMO,
+        help="Output JSON path (newline-delimited JSON objects)",
+    )
     args = parser.parse_args()
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
 
     print(f"Reading HB: {args.hb}", file=sys.stderr)
     hb_entries = read_all(args.hb, convert_hb_entry, args.hb_root)

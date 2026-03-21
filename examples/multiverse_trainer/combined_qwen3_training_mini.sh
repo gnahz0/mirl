@@ -1,5 +1,8 @@
+MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export RAY_TMPDIR="${RAY_TMPDIR:-${MIRL_ROOT}/.ray_tmp}"
+mkdir -p "$RAY_TMPDIR"
+
 export CUDA_VISIBLE_DEVICES=1,7
-export RAY_TMPDIR=/scratch/alecz/ray_tmp
 export QWEN_VL_MAX_IMAGE_TOKENS=1024
 export VIDEO_MAX_FRAMES=4
 set -x
@@ -17,8 +20,9 @@ PROJECT_NAME='multiverse'
 EXPERIMENT_NAME='combined_mini_sanity_check'
 
 # Balanced 50/50 HB+CLIMB (create with: python scripts/create_balanced_sample.py --per-source 250 --data-dir data)
-TRAIN_FILE=/home/alecz/scratch/alecz/multiverse-test/mirl_tactile/data/combined_train_demo_only.json
-VAL_FILE=/home/alecz/scratch/alecz/multiverse-test/mirl_tactile/data/combined_valid_demo_only.json
+# Override with TRAIN_FILE / VAL_FILE if your data is not under ${MIRL_ROOT}/data/
+TRAIN_FILE="${TRAIN_FILE:-${MIRL_ROOT}/data/combined_train_demo_only.json}"
+VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_valid_demo_only.json}"
 
 mkdir -p "outputs/${EXPERIMENT_NAME}"
 

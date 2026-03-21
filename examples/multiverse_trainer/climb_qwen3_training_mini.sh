@@ -1,5 +1,8 @@
+MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export RAY_TMPDIR="${RAY_TMPDIR:-${MIRL_ROOT}/.ray_tmp}"
+mkdir -p "$RAY_TMPDIR"
+
 export CUDA_VISIBLE_DEVICES=0,3
-export RAY_TMPDIR=/scratch/alecz/ray_tmp
 set -x
 ENGINE=${1:-vllm}
 
@@ -12,8 +15,8 @@ ENGINE=${1:-vllm}
 PROJECT_NAME='multiverse'
 EXPERIMENT_NAME='climb_only_mini_grpo'
 
-TRAIN_FILE=/home/alecz/scratch/alecz/multiverse-test/mirl_tactile/data/combined_train.json
-VAL_FILE=/home/alecz/scratch/alecz/multiverse-test/mirl_tactile/data/combined_val.json
+TRAIN_FILE="${TRAIN_FILE:-${MIRL_ROOT}/data/combined_train.json}"
+VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_val.json}"
 
 mkdir -p "outputs/${EXPERIMENT_NAME}"
 
