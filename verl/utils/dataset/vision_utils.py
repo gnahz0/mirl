@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from io import BytesIO
 from typing import Optional
 
+_MAX_IMAGE_TOKENS = int(os.environ.get("QWEN_VL_MAX_IMAGE_TOKENS", "16384"))
+_VIDEO_MAX_FRAMES = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None  # 0 or unset = no cap
+
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
+
+# Allow loading truncated/corrupt image files (common in medical/clinical datasets)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Image.Image:
@@ -24,6 +31,10 @@ def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Imag
 
     if isinstance(image, Image.Image):
         return image.convert("RGB")
+
+    if isinstance(image, dict) and "max_pixels" not in image and _MAX_IMAGE_TOKENS < 16384:
+        image = dict(image)
+        image["max_pixels"] = _MAX_IMAGE_TOKENS * image_patch_size * image_patch_size
 
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
@@ -73,6 +84,7 @@ def process_video(
     fps_max_frames: Optional[int] = None,
     return_video_sample_fps: bool = False,
     return_video_metadata: bool = False,
+    max_frames_override: Optional[int] = None,
 ) -> torch.Tensor:
     """Converts a video dict into a [n_frames, 3, H, W] tensor
 
@@ -86,6 +98,13 @@ def process_video(
 
     # Shallow copy... since we might want to add some keys
     video = dict(video)
+
+    # Cap max_frames: explicit override > env VIDEO_MAX_FRAMES > no cap
+    cap = max_frames_override if max_frames_override is not None else _VIDEO_MAX_FRAMES
+    if cap is not None:
+        video.setdefault("max_frames", cap)
+        if video.get("max_frames", 768) > cap:
+            video["max_frames"] = cap
 
     contains_sampling_rules = "nframes" in video or "fps" in video
     if not contains_sampling_rules:

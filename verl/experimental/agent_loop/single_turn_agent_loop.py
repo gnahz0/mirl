@@ -62,6 +62,20 @@ class SingleTurnAgentLoop(AgentLoopBase):
         else:
             vllm_prompt_ids = prompt_ids
 
+        truncation = getattr(self.config.data, "truncation", "left")
+        if len(prompt_ids) > self.prompt_length:
+            if images or videos:
+                raise ValueError(
+                    f"Prompt length ({len(prompt_ids)}) exceeds prompt_length ({self.prompt_length}). "
+                    "With images/videos, truncation is not supported. Set data.filter_overlong_prompts=True."
+                )
+            if truncation == "left":
+                prompt_ids = prompt_ids[-self.prompt_length :]
+                vllm_prompt_ids = vllm_prompt_ids[-self.prompt_length :]
+            else:
+                prompt_ids = prompt_ids[: self.prompt_length]
+                vllm_prompt_ids = vllm_prompt_ids[: self.prompt_length]
+
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):

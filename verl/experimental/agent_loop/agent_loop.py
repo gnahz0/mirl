@@ -544,9 +544,29 @@ class AgentLoopWorker:
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
 
+    def _ensure_batch(self, ids):
+        """Ensure input_ids are in batch form for tokenizer.pad()."""
+        if not ids:
+            return [[]]
+        return [ids] if isinstance(ids[0], int) else ids
+
+    def _to_tensor(self, x):
+        """Convert pad output to tensor when it returns lists."""
+        if not isinstance(x, torch.Tensor):
+            return torch.tensor(x, dtype=torch.long)
+        return x
+
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+
+        prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
+        if len(output.prompt_ids) > prompt_length and self.processor is not None:
+            raise ValueError(
+                f"Prompt length ({len(output.prompt_ids)}) exceeds prompt_length ({prompt_length}). "
+                "With multimodal (images/videos), truncation is not supported. "
+                "Set data.filter_overlong_prompts=True to filter overlong prompts at dataset load time."
+            )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -571,35 +591,40 @@ class AgentLoopWorker:
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": self._ensure_batch(output.prompt_ids)},
             padding="max_length",
             max_length=self.config.actor_rollout_ref.rollout.prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
+        prompt_output["input_ids"] = self._to_tensor(prompt_output["input_ids"])
+        prompt_output["attention_mask"] = self._to_tensor(prompt_output["attention_mask"])
         if prompt_output["input_ids"].dim() == 1:
             prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": self._ensure_batch(output.response_ids)},
             padding="max_length",
             max_length=self.config.actor_rollout_ref.rollout.response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
+        response_output["input_ids"] = self._to_tensor(response_output["input_ids"])
+        response_output["attention_mask"] = self._to_tensor(response_output["attention_mask"])
         if response_output["input_ids"].dim() == 1:
             response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": self._ensure_batch(output.response_mask)},
             padding="max_length",
             max_length=self.config.actor_rollout_ref.rollout.response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
+        response_mask_output["input_ids"] = self._to_tensor(response_mask_output["input_ids"])
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 

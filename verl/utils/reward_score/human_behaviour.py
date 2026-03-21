@@ -88,6 +88,10 @@ def compute_score(
     return {
         "score": score,
         "acc": acc,
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "jaccard": 0.0,
         "similarity": sim,
         "format": fmt,
     }

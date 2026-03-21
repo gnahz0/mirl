@@ -512,6 +512,12 @@ class vLLMHttpServer:
                 f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
                 f"({self.config.max_model_len})."
             )
+        if max_possible_tokens < 1:
+            logger.warning(
+                "No space for generation (max_possible_tokens=%d). Returning empty TokenOutput.",
+                max_possible_tokens,
+            )
+            return TokenOutput(token_ids=[], log_probs=[])
 
         # Determine max_tokens from sampling_params or use configured response_length as default
         if "max_tokens" in sampling_params:
@@ -523,11 +529,11 @@ class vLLMHttpServer:
             # Default to a calculation that considers configured lengths
             max_tokens = self.config.response_length + self.config.prompt_length - len(prompt_ids)
 
-        # Clamp max_tokens to the valid range [0, max_possible_tokens]
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        # Clamp max_tokens to the valid range [1, max_possible_tokens]
+        max_tokens = min(max(max_tokens, 1), max_possible_tokens)
 
-        assert max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
+        assert max_tokens >= 1 and max_tokens <= max_possible_tokens, (
+            f"max_tokens {max_tokens} must be in [1, {max_possible_tokens}]"
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import json
 import logging
 import os
 import re
@@ -109,6 +110,10 @@ class RLHFDataset(Dataset):
         self.data_source_dir = os.path.dirname(os.path.abspath(data_files[0]))
         self.image_patch_size = config.get("image_patch_size", 14)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.max_video_frames = config.get(
+            "max_video_frames",
+            int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None,
+        )
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
@@ -194,7 +199,6 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         messages = self._build_messages(doc)
-                        # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = self.tool_schemas
@@ -202,28 +206,22 @@ class RLHFDataset(Dataset):
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
                         )
-                        if image_key in doc and doc[image_key]:
-                            images = [
-                                process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
-                            ]
-                        else:
-                            images = None
-
-                        if video_key in doc and doc[video_key]:
-                            videos, video_metadata = zip(
-                                *[
-                                    process_video(
-                                        video, image_patch_size=self.image_patch_size, return_video_metadata=True
-                                    )
-                                    for video in doc[video_key]
-                                ],
-                                strict=True,
-                            )
+                        images = (
+                            [process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]]
+                            if image_key in doc and doc[image_key]
+                            else None
+                        )
+                        videos = (
+                            [process_video(video, image_patch_size=self.image_patch_size, return_video_metadata=True, max_frames_override=self.max_video_frames) for video in doc[video_key]]
+                            if video_key in doc and doc[video_key]
+                            else None
+                        )
+                        if videos is not None:
+                            videos, video_metadata = zip(*videos, strict=True)
                             videos = list(videos)
                             video_metadata = list(video_metadata)
                             videos_kwargs = {"video_metadata": video_metadata, "do_sample_frames": False}
                         else:
-                            videos = None
                             videos_kwargs = {}
 
                         return len(
@@ -296,9 +294,8 @@ class RLHFDataset(Dataset):
             messages: List of messages with replaced placeholder.
         """
         messages: list = example[self.prompt_key]
-        # When concatenating image and video datasets, pop will return None for image or video sample
-        images = example.pop(self.image_key, None) or []
-        videos = example.pop(self.video_key, None) or []
+        images = example.get(self.image_key, None) or []
+        videos = example.get(self.video_key, None) or []
 
         image_offset, video_offset = 0, 0
         for message in messages:
@@ -332,6 +329,8 @@ class RLHFDataset(Dataset):
                     video = dict(videos[video_offset]) if isinstance(videos[video_offset], dict) else {"video": videos[video_offset]}
                     if "video" in video and not os.path.isabs(video["video"]):
                         video["video"] = os.path.join(self.data_source_dir, video["video"])
+                    if self.max_video_frames is not None:
+                        video["max_frames"] = min(video.get("max_frames", 768), self.max_video_frames)
                     content_list.append({"type": "video", **video})
                     video_offset += 1
                 else:
@@ -352,12 +351,23 @@ class RLHFDataset(Dataset):
         row_dict["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
 
         # add index for each prompt
-        if "extra_info" not in row_dict or row_dict["extra_info"] is None:
-            row_dict["extra_info"] = dict()
-        index = row_dict.get("extra_info", {}).get("index", 0)
-        tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
-        interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
-        need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
+        # extra_info can be a dict or a JSON string in the data; normalize to dict
+        extra_info = row_dict.get("extra_info")
+        if extra_info is None:
+            extra_info = {}
+        elif isinstance(extra_info, str):
+            try:
+                extra_info = json.loads(extra_info)
+            except (json.JSONDecodeError, TypeError):
+                extra_info = {}
+        elif not isinstance(extra_info, dict):
+            extra_info = {}
+        row_dict["extra_info"] = extra_info
+
+        index = extra_info.get("index", 0)
+        tools_kwargs = extra_info.get("tools_kwargs", {})
+        interaction_kwargs = extra_info.get("interaction_kwargs", {})
+        need_tools_kwargs = extra_info.get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
@@ -395,6 +405,19 @@ class RLHFDataset(Dataset):
             videos: List of videos, each video is a tuple of (video_tensor, video_metadata).
         """
         from qwen_vl_utils import process_vision_info
+
+        # Cap max_frames on all video content before qwen_vl_utils sees it
+        max_vf = config.get("max_video_frames") if config else None
+        if max_vf is None:
+            max_vf = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None
+        if max_vf is not None:
+            for msg in messages:
+                content = msg.get("content") or []
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "video":
+                        item["max_frames"] = min(item.get("max_frames", 768), max_vf)
 
         images, videos = process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True)
         return images, videos
