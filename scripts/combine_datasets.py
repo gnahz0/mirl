@@ -14,9 +14,11 @@ Output format per entry:
   "extra_info": { ... }
 }
 
-Run: ``python scripts/combine_datasets.py`` (defaults use the path constants below
-for train demo). For val/test demo, override ``--hb`` / ``--hb-unified``, ``--climb``,
-``--tactile``, and ``--output``.
+Run: ``python scripts/combine_datasets.py`` (defaults target MIB: keane HB scratch,
+``$HOME/scratch/high_modality`` and ``$HOME/scratch/raofu/3DHaptic``, outputs under
+this repo's ``data/``). Override with env (``HB_MEDIA_ROOT``, ``CLIMB_MEDIA_ROOT``,
+``TACTILE_MEDIA_ROOT``, ``OUTPUT_COMBINED_TRAIN_DEMO``, …) or ``--hb`` / ``--hb-unified``,
+``--climb``, ``--tactile``, ``--output``.
 
 Pre-filtered HB (unified JSONL from ``filter_by_token_limit --hb-only``)::
 
@@ -38,19 +40,43 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-# --- File paths (this node) ---
-HB_MEDIA_ROOT = "/scratch/keane/human_behaviour/human_behaviour_data"
-HB_JSONL_TRAIN = f"{HB_MEDIA_ROOT}/v5_train_upd.jsonl"
-HB_JSONL_TEST = f"{HB_MEDIA_ROOT}/v5_test_upd.jsonl"
-CLIMB_JSONL_TRAIN_DEMO = "/orcd/compute/ppliang/001/high_modality/geom_train_demo_only.jsonl"
-CLIMB_JSONL_VAL_DEMO = "/orcd/compute/ppliang/001/high_modality/geom_valid_demo_only.jsonl"
-CLIMB_MEDIA_ROOT = "/orcd/compute/ppliang/001/high_modality"
-TACTILE_JSON_TRAIN = "/orcd/compute/ppliang/001/raofu/3DHaptic/annotation_verl_split_date_train.json"
-TACTILE_JSON_TEST = "/orcd/compute/ppliang/001/raofu/3DHaptic/annotation_verl_split_date_test.json"
-TACTILE_MEDIA_ROOT = "/orcd/compute/ppliang/001/raofu/3DHaptic"
-OUTPUT_COMBINED_TRAIN_DEMO = "/home/alecz/mirl/data/combined_train_demo_only_filtered_8192.json"
-OUTPUT_COMBINED_VAL_DEMO = "/home/alecz/mirl/data/combined_valid_demo_only_filtered_8192.json"
+# --- Default file paths (MIB / alecz scratch). Override with env or CLI flags. ---
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+HB_MEDIA_ROOT = os.environ.get("HB_MEDIA_ROOT", "/scratch/keane/human_behaviour_data")
+HB_JSONL_TRAIN = os.environ.get("HB_JSONL_TRAIN", os.path.join(HB_MEDIA_ROOT, "v5_train_upd.jsonl"))
+HB_JSONL_TEST = os.environ.get("HB_JSONL_TEST", os.path.join(HB_MEDIA_ROOT, "v5_test_upd.jsonl"))
+
+CLIMB_MEDIA_ROOT = os.environ.get("CLIMB_MEDIA_ROOT", "/home/alecz/scratch/high_modality")
+CLIMB_JSONL_TRAIN_DEMO = os.environ.get(
+    "CLIMB_JSONL_TRAIN_DEMO",
+    os.path.join(CLIMB_MEDIA_ROOT, "geom_train_demo_only.jsonl"),
+)
+CLIMB_JSONL_VAL_DEMO = os.environ.get(
+    "CLIMB_JSONL_VAL_DEMO",
+    os.path.join(CLIMB_MEDIA_ROOT, "geom_valid_demo_only.jsonl"),
+)
+
+TACTILE_MEDIA_ROOT = os.environ.get("TACTILE_MEDIA_ROOT", "/home/alecz/scratch/raofu/3DHaptic")
+TACTILE_JSON_TRAIN = os.environ.get(
+    "TACTILE_JSON_TRAIN",
+    os.path.join(TACTILE_MEDIA_ROOT, "annotation_verl_split_date_train.json"),
+)
+TACTILE_JSON_TEST = os.environ.get(
+    "TACTILE_JSON_TEST",
+    os.path.join(TACTILE_MEDIA_ROOT, "annotation_verl_split_date_test.json"),
+)
+
+OUTPUT_COMBINED_TRAIN_DEMO = os.environ.get(
+    "OUTPUT_COMBINED_TRAIN_DEMO",
+    str(_REPO_ROOT / "data" / "combined_train_demo_only_filtered_8192.json"),
+)
+OUTPUT_COMBINED_VAL_DEMO = os.environ.get(
+    "OUTPUT_COMBINED_VAL_DEMO",
+    str(_REPO_ROOT / "data" / "combined_valid_demo_only_filtered_8192.json"),
+)
 
 HB_SYSTEM_PROMPT = (
     "You are an expert in analyzing human behaviour from multimodal signals "

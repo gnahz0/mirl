@@ -3,8 +3,13 @@
 import json
 import os
 import sys
+from pathlib import Path
 
-COMBINED_TRAIN_DEMO_JSON = "/home/alecz/mirl/data/combined_train_demo_only.json"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+COMBINED_TRAIN_DEMO_JSON = os.environ.get(
+    "COMBINED_TRAIN_DEMO_JSON",
+    str(_REPO_ROOT / "data" / "combined_train_demo_only.json"),
+)
 
 
 def main():
