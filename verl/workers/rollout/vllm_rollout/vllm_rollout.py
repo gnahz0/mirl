@@ -95,11 +95,7 @@ class ServerAdapter(BaseRollout):
 
         self.device_uuid = get_device_uuid(get_device_id())
         self.zmq_context = zmq.Context()
-        # Per-user socket dir to avoid conflicts with other users' stale sockets
-        uid = os.getuid()
-        zmq_dir = f"/tmp/verl-zmq-{uid}"
-        os.makedirs(zmq_dir, exist_ok=True)
-        self.zmq_handle = f"ipc://{zmq_dir}/rl-colocate-zmq-{self.device_uuid}.sock"
+        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:

@@ -1,4 +1,4 @@
-"""Convert and combine HB + CLIMB datasets into the unified annotation format.
+"""Convert and combine HB + CLIMB + Tactile datasets into the unified annotation format.
 
 Output format per entry:
 {
@@ -15,7 +15,23 @@ Output format per entry:
 }
 
 Run: ``python scripts/combine_datasets.py`` (defaults use the path constants below
-for train demo). For val demo, override ``--hb``, ``--climb``, and ``--output``.
+for train demo). For val/test demo, override ``--hb`` / ``--hb-unified``, ``--climb``,
+``--tactile``, and ``--output``.
+
+Pre-filtered HB (unified JSONL from ``filter_by_token_limit --hb-only``)::
+
+  python scripts/combine_datasets.py \\
+    --hb-unified data/hb_only_filtered_8192_checkpoint_combined_train_demo_only.json \\
+    --output data/combined_train_demo_only_filtered_8192.json
+
+To drop overlong Human Behaviour rows only (keep CLIMB/tactile unchanged) and train
+with ``data.filter_overlong_prompts=False``, run on the **combined** JSON lines::
+
+  python scripts/filter_by_token_limit.py --only-check-hb --max-tokens 8192 --max-video-frames 4
+
+HB-only filtered JSONL (no combined ``*_filtered_*`` files): add ``--hb-only`` (writes
+``data/hb_only_filtered_8192.json``). The filter defaults to 2 workers; use ``--workers 1``
+if you hit OOM / BrokenProcessPool. It falls back to sequential if the process pool dies.
 """
 
 import argparse
@@ -24,14 +40,17 @@ import os
 import sys
 
 # --- File paths (this node) ---
-HB_JSONL_TRAIN = "/scratch/keane/human_behaviour_data/v5_train_upd.jsonl"
-HB_JSONL_TEST = "/scratch/keane/human_behaviour_data/v5_test_upd.jsonl"
-HB_MEDIA_ROOT = "/scratch/keane/human_behaviour_data"
+HB_MEDIA_ROOT = "/scratch/keane/human_behaviour/human_behaviour_data"
+HB_JSONL_TRAIN = f"{HB_MEDIA_ROOT}/v5_train_upd.jsonl"
+HB_JSONL_TEST = f"{HB_MEDIA_ROOT}/v5_test_upd.jsonl"
 CLIMB_JSONL_TRAIN_DEMO = "/orcd/compute/ppliang/001/high_modality/geom_train_demo_only.jsonl"
 CLIMB_JSONL_VAL_DEMO = "/orcd/compute/ppliang/001/high_modality/geom_valid_demo_only.jsonl"
 CLIMB_MEDIA_ROOT = "/orcd/compute/ppliang/001/high_modality"
-OUTPUT_COMBINED_TRAIN_DEMO = "/home/alecz/mirl/data/combined_train_demo_only.json"
-OUTPUT_COMBINED_VAL_DEMO = "/home/alecz/mirl/data/combined_valid_demo_only.json"
+TACTILE_JSON_TRAIN = "/orcd/compute/ppliang/001/raofu/3DHaptic/annotation_verl_split_date_train.json"
+TACTILE_JSON_TEST = "/orcd/compute/ppliang/001/raofu/3DHaptic/annotation_verl_split_date_test.json"
+TACTILE_MEDIA_ROOT = "/orcd/compute/ppliang/001/raofu/3DHaptic"
+OUTPUT_COMBINED_TRAIN_DEMO = "/home/alecz/mirl/data/combined_train_demo_only_filtered_8192.json"
+OUTPUT_COMBINED_VAL_DEMO = "/home/alecz/mirl/data/combined_valid_demo_only_filtered_8192.json"
 
 HB_SYSTEM_PROMPT = (
     "You are an expert in analyzing human behaviour from multimodal signals "
@@ -172,6 +191,20 @@ def convert_climb_entry(entry: dict, idx: int, root: str) -> dict:
     return out
 
 
+def convert_tactile_entry(entry: dict, idx: int, root: str) -> dict:
+    """Pass through a tactile entry, resolving relative video paths."""
+    out = {
+        "data_source": entry["data_source"],
+        "prompt": entry["prompt"],
+        "images": [],
+        "videos": resolve_video_paths(entry.get("videos", []), root),
+        "audios": [],
+        "reward_model": entry["reward_model"],
+        "extra_info": json.dumps(entry["extra_info"]) if isinstance(entry.get("extra_info"), dict) else entry.get("extra_info", "{}"),
+    }
+    return out
+
+
 def read_all(path: str, converter, root: str) -> list[dict]:
     """Read and convert all entries from a JSONL file."""
     entries = []
@@ -184,12 +217,56 @@ def read_all(path: str, converter, root: str) -> list[dict]:
     return entries
 
 
+def interleave(sources: list[list[dict]]) -> list[dict]:
+    """Round-robin interleave multiple lists proportionally."""
+    total = sum(len(s) for s in sources)
+    if total == 0:
+        return []
+    indices = [0] * len(sources)
+    lengths = [len(s) for s in sources]
+    result = []
+    while len(result) < total:
+        for i, src in enumerate(sources):
+            if indices[i] < lengths[i]:
+                frac_emitted = indices[i] / lengths[i] if lengths[i] else 1.0
+                frac_overall = len(result) / total
+                if frac_emitted <= frac_overall or all(
+                    indices[j] >= lengths[j] for j in range(len(sources)) if j != i
+                ):
+                    result.append(src[indices[i]])
+                    indices[i] += 1
+                    break
+    return result
+
+
+def read_unified_jsonl(path: str) -> list[dict]:
+    """Load JSONL where each line is already in unified verl format (no conversion)."""
+    entries = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Combine HB + CLIMB into unified format")
-    parser.add_argument("--hb", default=HB_JSONL_TRAIN, help="Path to human behaviour JSONL")
+    parser = argparse.ArgumentParser(description="Combine HB + CLIMB + Tactile into unified format")
+    parser.add_argument(
+        "--hb-unified",
+        default=None,
+        help=(
+            "HB JSONL already in unified format (e.g. data/hb_only_filtered_8192_checkpoint_*.json from "
+            "filter_by_token_limit --hb-only). If set, used instead of raw --hb + convert_hb_entry."
+        ),
+    )
+    parser.add_argument("--hb", default=HB_JSONL_TRAIN, help="Path to human behaviour JSONL (raw v5 schema)")
     parser.add_argument("--hb-root", default=HB_MEDIA_ROOT, help="Base directory for HB media paths")
     parser.add_argument("--climb", default=CLIMB_JSONL_TRAIN_DEMO, help="Path to CLIMB/medical JSONL")
     parser.add_argument("--climb-root", default=CLIMB_MEDIA_ROOT, help="Base directory for CLIMB media paths")
+    parser.add_argument("--tactile", default=TACTILE_JSON_TRAIN, help="Path to tactile JSON")
+    parser.add_argument("--tactile-root", default=TACTILE_MEDIA_ROOT, help="Base directory for tactile video paths")
     parser.add_argument(
         "--output",
         default=OUTPUT_COMBINED_TRAIN_DEMO,
@@ -199,33 +276,51 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
 
-    print(f"Reading HB: {args.hb}", file=sys.stderr)
-    hb_entries = read_all(args.hb, convert_hb_entry, args.hb_root)
-    print(f"  => {len(hb_entries):,} HB entries", file=sys.stderr)
+    all_sources = []
 
-    print(f"Reading CLIMB: {args.climb}", file=sys.stderr)
-    climb_entries = read_all(args.climb, convert_climb_entry, args.climb_root)
-    print(f"  => {len(climb_entries):,} CLIMB entries", file=sys.stderr)
+    if args.hb_unified and os.path.isfile(args.hb_unified):
+        print(f"Reading HB (unified / pre-filtered): {args.hb_unified}", file=sys.stderr)
+        hb_entries = read_unified_jsonl(args.hb_unified)
+        print(f"  => {len(hb_entries):,} HB entries", file=sys.stderr)
+        all_sources.append(hb_entries)
+    elif args.hb and os.path.isfile(args.hb):
+        print(f"Reading HB: {args.hb}", file=sys.stderr)
+        hb_entries = read_all(args.hb, convert_hb_entry, args.hb_root)
+        print(f"  => {len(hb_entries):,} HB entries", file=sys.stderr)
+        all_sources.append(hb_entries)
+    else:
+        print(f"Skipping HB (use --hb-unified or raw --hb; not found: {args.hb})", file=sys.stderr)
 
-    # Interleave so PyArrow sees both column types (list<string> for images
-    # and audios) in its first inference batch. Without this, empty lists []
-    # get typed as list<null> and later batches with actual paths fail to cast.
+    if args.climb and os.path.isfile(args.climb):
+        print(f"Reading CLIMB: {args.climb}", file=sys.stderr)
+        climb_entries = read_all(args.climb, convert_climb_entry, args.climb_root)
+        print(f"  => {len(climb_entries):,} CLIMB entries", file=sys.stderr)
+        all_sources.append(climb_entries)
+    else:
+        print(f"Skipping CLIMB (not found: {args.climb})", file=sys.stderr)
+
+    if args.tactile and os.path.isfile(args.tactile):
+        print(f"Reading Tactile: {args.tactile}", file=sys.stderr)
+        tactile_entries = read_all(args.tactile, convert_tactile_entry, args.tactile_root)
+        print(f"  => {len(tactile_entries):,} Tactile entries", file=sys.stderr)
+        all_sources.append(tactile_entries)
+    else:
+        print(f"Skipping Tactile (not found: {args.tactile})", file=sys.stderr)
+
+    if not all_sources:
+        print("ERROR: no source datasets found, nothing to write.", file=sys.stderr)
+        sys.exit(1)
+
+    # Interleave so PyArrow sees all column types (list<string> for images,
+    # audios, etc.) in its first inference batch.
     print("Interleaving and writing...", file=sys.stderr)
-    n_hb, n_climb = len(hb_entries), len(climb_entries)
-    total = n_hb + n_climb
+    merged = interleave(all_sources)
+    total = len(merged)
     with open(args.output, "w") as out:
-        hi, ci, written = 0, 0, 0
-        # Ratio-based interleave: emit entries at their natural frequency
-        while hi < n_hb or ci < n_climb:
-            if hi < n_hb and (ci >= n_climb or hi / n_hb <= ci / n_climb):
-                out.write(json.dumps(hb_entries[hi], ensure_ascii=False) + "\n")
-                hi += 1
-            else:
-                out.write(json.dumps(climb_entries[ci], ensure_ascii=False) + "\n")
-                ci += 1
-            written += 1
-            if written % 200_000 == 0:
-                print(f"  ... written {written:,}/{total:,}", file=sys.stderr)
+        for i, entry in enumerate(merged):
+            out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            if (i + 1) % 200_000 == 0:
+                print(f"  ... written {i + 1:,}/{total:,}", file=sys.stderr)
 
     print(f"Total: {total:,} entries -> {args.output}", file=sys.stderr)
 

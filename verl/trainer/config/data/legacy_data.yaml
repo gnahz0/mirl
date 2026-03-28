@@ -81,6 +81,15 @@ filter_overlong_prompts: False
 # Use multiprocessing to speed up. Default is 1.
 filter_overlong_prompts_workers: 1
 
+# HF datasets filter() internal batch size. Use 1 so progress bars advance during slow multimodal doc2len.
+filter_overlong_prompts_filter_batch_size: 1
+
+# Multimodal overlong filter parallel workers (HF datasets). Default 1 is safest; try 4–8 on large-RAM nodes.
+filter_overlong_prompts_multimodal_num_proc: 1
+
+# If True, HF datasets may reuse a cached filter result (can look like filtering "does nothing" after config changes).
+filter_overlong_prompts_load_from_cache_file: false
+
 # Truncate the input_ids or prompt if they exceed max_prompt_length.
 # Options: 'error', 'left', 'right', 'middle'. Default is 'error'.
 truncation: error

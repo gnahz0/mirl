@@ -34,7 +34,7 @@ fi
 
 echo "Evaluating model at: ${MODEL_PATH}"
 
-VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_val.json}"
+VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_valid_demo_only_filtered_8192.json}"
 OUTPUT_DIR="outputs/eval_${EXPERIMENT_NAME}"
 
 mkdir -p "$OUTPUT_DIR"
@@ -47,7 +47,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_batch_size=64 \
     data.max_prompt_length=4096 \
     data.max_response_length=4096 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.truncation='left' \
     data.image_key=images \
     data.video_key=videos \
@@ -71,6 +71,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.max_model_len=8192 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

@@ -10,14 +10,20 @@ ENGINE=${1:-vllm}
 # Uses default_compute_score dispatch (no custom_reward_function needed)
 # Data is in the new unified format with data_source + prompt + reward_model
 #
+# Prefilter (HB token-checked, CLIMB/tactile pass through):
+#   python scripts/filter_by_token_limit.py --max-tokens 8192 --max-video-frames 4
+#   -> data/combined_{train,valid}_demo_only_filtered_8192.json
+# HB-only filter (--hb-only): use TRAIN_FILE/VAL_FILE pointing at hb_only_filtered_8192*.json
+# (e.g. per-split checkpoints: hb_only_filtered_8192_checkpoint_combined_train_demo_only.json).
+#
 # Checkpoints saved to: checkpoints/multiverse/combined_hb_climb_qwen3_grpo/
 # Validation outputs:   outputs/combined_hb_climb_qwen3_grpo/
 
 PROJECT_NAME='multiverse'
 EXPERIMENT_NAME='combined_hb_climb_qwen3_grpo'
 
-TRAIN_FILE="${TRAIN_FILE:-${MIRL_ROOT}/data/combined_train.json}"
-VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_val.json}"
+TRAIN_FILE="${TRAIN_FILE:-${MIRL_ROOT}/data/combined_train_demo_only_filtered_8192.json}"
+VAL_FILE="${VAL_FILE:-${MIRL_ROOT}/data/combined_valid_demo_only_filtered_8192.json}"
 
 mkdir -p "outputs/${EXPERIMENT_NAME}"
 
@@ -29,7 +35,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_batch_size=64 \
     data.max_prompt_length=4096 \
     data.max_response_length=4096 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.truncation='left' \
     data.image_key=images \
     data.video_key=videos \
@@ -54,6 +60,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.max_model_len=8192 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \

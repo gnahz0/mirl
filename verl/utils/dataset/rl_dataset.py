@@ -37,6 +37,21 @@ from verl.utils.import_utils import load_extern_object
 logger = logging.getLogger(__name__)
 
 
+def _extra_info_as_dict(doc: dict) -> dict:
+    """Parse row ``extra_info`` (dict or JSON string)."""
+    ei = doc.get("extra_info")
+    if ei is None:
+        return {}
+    if isinstance(ei, dict):
+        return ei
+    if isinstance(ei, str):
+        try:
+            return json.loads(ei)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
 def collate_fn(data_list: list[dict]) -> dict:
     """
     Collate a batch of sample dicts into batched tensors and arrays.
@@ -146,6 +161,20 @@ class RLHFDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
 
+        self.filter_overlong_prompts_load_from_cache_file = bool(
+            config.get("filter_overlong_prompts_load_from_cache_file", False)
+        )
+
+        # HF Dataset.filter defaults to batch_size=1000; progress only advances after a
+        # full batch. For slow multimodal doc2len, use 1 so the tqdm bar updates often.
+        _fbs = config.get("filter_overlong_prompts_filter_batch_size", 1)
+        self.filter_overlong_prompts_filter_batch_size = max(1, int(_fbs) if _fbs is not None else 1)
+
+        # Multimodal doc2len loads video + processor; HF datasets multiprocess filter
+        # spawns N full copies and workers get OOM-killed ("subprocess abruptly died").
+        _mnp = config.get("filter_overlong_prompts_multimodal_num_proc", 1)
+        self.filter_overlong_prompts_multimodal_num_proc = max(1, int(_mnp) if _mnp is not None else 1)
+
         self._download()
         self._read_files_and_tokenize()
 
@@ -187,11 +216,24 @@ class RLHFDataset(Dataset):
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
         if self.filter_overlong_prompts:
+            n_rows_before = len(dataframe)
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+
+            filter_num_proc = (
+                self.filter_overlong_prompts_multimodal_num_proc
+                if processor is not None
+                else self.num_workers
+            )
+            if processor is not None and self.num_workers is not None and filter_num_proc != self.num_workers:
+                print(
+                    f"Overlong multimodal filter: num_proc={filter_num_proc} "
+                    f"(filter_overlong_prompts_workers={self.num_workers} ignored for multimodal; "
+                    "raise data.filter_overlong_prompts_multimodal_num_proc on large-memory nodes if needed)"
+                )
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -199,6 +241,7 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         messages = self._build_messages(doc)
+                        # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = self.tool_schemas
@@ -206,22 +249,31 @@ class RLHFDataset(Dataset):
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
                         )
-                        images = (
-                            [process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]]
-                            if image_key in doc and doc[image_key]
-                            else None
-                        )
-                        videos = (
-                            [process_video(video, image_patch_size=self.image_patch_size, return_video_metadata=True, max_frames_override=self.max_video_frames) for video in doc[video_key]]
-                            if video_key in doc and doc[video_key]
-                            else None
-                        )
-                        if videos is not None:
-                            videos, video_metadata = zip(*videos, strict=True)
+                        if image_key in doc and doc[image_key]:
+                            images = [
+                                process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
+                            ]
+                        else:
+                            images = None
+
+                        if video_key in doc and doc[video_key]:
+                            videos, video_metadata = zip(
+                                *[
+                                    process_video(
+                                        video,
+                                        image_patch_size=self.image_patch_size,
+                                        return_video_metadata=True,
+                                        max_frames_override=self.max_video_frames,
+                                    )
+                                    for video in doc[video_key]
+                                ],
+                                strict=True,
+                            )
                             videos = list(videos)
                             video_metadata = list(video_metadata)
                             videos_kwargs = {"video_metadata": video_metadata, "do_sample_frames": False}
                         else:
+                            videos = None
                             videos_kwargs = {}
 
                         return len(
@@ -252,11 +304,17 @@ class RLHFDataset(Dataset):
 
             dataframe = dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
-                num_proc=self.num_workers,
+                num_proc=filter_num_proc,
+                batch_size=self.filter_overlong_prompts_filter_batch_size,
+                load_from_cache_file=self.filter_overlong_prompts_load_from_cache_file,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
 
-            print(f"filter dataset len: {len(dataframe)}")
+            n_rows_after = len(dataframe)
+            print(
+                f"filter dataset len: {n_rows_after} "
+                f"(removed {n_rows_before - n_rows_after} over-long or error rows of {n_rows_before})"
+            )
         return dataframe
 
     def resume_dataset_state(self):
@@ -351,17 +409,7 @@ class RLHFDataset(Dataset):
         row_dict["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
 
         # add index for each prompt
-        # extra_info can be a dict or a JSON string in the data; normalize to dict
-        extra_info = row_dict.get("extra_info")
-        if extra_info is None:
-            extra_info = {}
-        elif isinstance(extra_info, str):
-            try:
-                extra_info = json.loads(extra_info)
-            except (json.JSONDecodeError, TypeError):
-                extra_info = {}
-        elif not isinstance(extra_info, dict):
-            extra_info = {}
+        extra_info = _extra_info_as_dict(row_dict)
         row_dict["extra_info"] = extra_info
 
         index = extra_info.get("index", 0)
@@ -406,7 +454,6 @@ class RLHFDataset(Dataset):
         """
         from qwen_vl_utils import process_vision_info
 
-        # Cap max_frames on all video content before qwen_vl_utils sees it
         max_vf = config.get("max_video_frames") if config else None
         if max_vf is None:
             max_vf = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None
