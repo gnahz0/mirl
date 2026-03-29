@@ -112,5 +112,6 @@ def compute_score(
         "f1": f1,
         "precision": precision,
         "recall": recall,
+        "similarity": jacc,
         "format": fmt,
     }

@@ -957,6 +957,9 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        prev = set(merged_meta_info.get(k, []))
+                        merged_meta_info[k] = sorted(prev | set(v))
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys

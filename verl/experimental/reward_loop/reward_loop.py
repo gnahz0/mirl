@@ -328,10 +328,10 @@ class RewardLoopManager:
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
         reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = sorted({k for info in reward_extra_infos for k in info})
         non_tensor_batch = {}
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key, 0.0) for info in reward_extra_infos])
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()

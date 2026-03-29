@@ -801,11 +801,11 @@ class AgentLoopWorker:
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
             non_tensor_batch.update(input_non_tensor_batch)
 
-        # add reward_extra_info to non_tensor_batch
+        # add reward_extra_info to non_tensor_batch (union of keys; missing → 0.0)
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = sorted({k for info in reward_extra_infos for k in info})
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key, 0.0) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
