@@ -13,6 +13,7 @@
 # limitations under the License.
 import ctypes
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +66,17 @@ def get_device_uuid(device_id: int) -> str:
             return f"NPU-{device_id}"
     else:
         return current_platform.get_device_uuid(device_id)
+
+
+def get_rollout_zmq_ipc_uri(device_uuid: str) -> str:
+    """ipc:// path for trainer ↔ vLLM weight sync.
+
+    Uses a short hashed path so it doesn't collide with other users' stale sockets
+    and stays within Unix socket path limits.
+    """
+    suffix = os.environ.get("VERL_ZMQ_IPC_SUFFIX", "")
+    digest = hashlib.sha256(f"{device_uuid}\0{suffix}".encode()).hexdigest()[:32]
+    return f"ipc:///tmp/verl-rzmq-{digest}.sock"
 
 
 def get_vllm_max_lora_rank(lora_rank: int):
@@ -311,7 +323,7 @@ class vLLMColocateWorkerExtension:
         """Get ZMQ handle for communication."""
         if not hasattr(self, "device_uuid") or not self.device_uuid:
             self.device_uuid = get_device_uuid(self.device.index)
-        return f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
+        return get_rollout_zmq_ipc_uri(self.device_uuid)
 
 
 class SuppressSignalInThread:

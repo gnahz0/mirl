@@ -29,6 +29,7 @@ When working with Megatron:
 import gc
 import logging
 import os
+import pathlib
 import time
 from typing import Any, Generator, Optional
 
@@ -45,7 +46,7 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device, 
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.utils import ensure_async_iterator
-from verl.workers.rollout.vllm_rollout.utils import TensorMetadata, get_device_uuid
+from verl.workers.rollout.vllm_rollout.utils import TensorMetadata, get_device_uuid, get_rollout_zmq_ipc_uri
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -95,7 +96,7 @@ class ServerAdapter(BaseRollout):
 
         self.device_uuid = get_device_uuid(get_device_id())
         self.zmq_context = zmq.Context()
-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
+        self.zmq_handle = get_rollout_zmq_ipc_uri(self.device_uuid)
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
@@ -165,6 +166,8 @@ class ServerAdapter(BaseRollout):
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         bucket_size = int(bucket_size_mb) << 20
         s = self.zmq_context.socket(zmq.REQ)
+        ipc_path = self.zmq_handle.removeprefix("ipc://")
+        pathlib.Path(ipc_path).unlink(missing_ok=True)
         s.bind(self.zmq_handle)
 
         buffer, shm = None, None

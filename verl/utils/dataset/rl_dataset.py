@@ -387,6 +387,11 @@ class RLHFDataset(Dataset):
                     video = dict(videos[video_offset]) if isinstance(videos[video_offset], dict) else {"video": videos[video_offset]}
                     if "video" in video and not os.path.isabs(video["video"]):
                         video["video"] = os.path.join(self.data_source_dir, video["video"])
+                    # JSON null → Python None; qwen_vl_utils uses ele.get("min_frames", default) which
+                    # still returns None if the key exists, breaking smart_nframes / ceil_by_factor.
+                    for _k in ("min_frames", "max_frames", "fps", "nframes"):
+                        if video.get(_k) is None:
+                            video.pop(_k, None)
                     if self.max_video_frames is not None:
                         video["max_frames"] = min(video.get("max_frames", 768), self.max_video_frames)
                     content_list.append({"type": "video", **video})
@@ -457,13 +462,16 @@ class RLHFDataset(Dataset):
         max_vf = config.get("max_video_frames") if config else None
         if max_vf is None:
             max_vf = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None
-        if max_vf is not None:
-            for msg in messages:
-                content = msg.get("content") or []
-                if not isinstance(content, list):
-                    continue
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "video":
+        for msg in messages:
+            content = msg.get("content") or []
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "video":
+                    for _k in ("min_frames", "max_frames", "fps", "nframes"):
+                        if item.get(_k) is None:
+                            item.pop(_k, None)
+                    if max_vf is not None:
                         item["max_frames"] = min(item.get("max_frames", 768), max_vf)
 
         images, videos = process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True)
