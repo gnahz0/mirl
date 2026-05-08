@@ -24,6 +24,9 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Optional
 
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 import datasets
 import numpy as np
 import torch
@@ -160,6 +163,7 @@ class RLHFDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
+        self.balanced_sampling_key = config.get("balanced_sampling_key", None)
 
         self.filter_overlong_prompts_load_from_cache_file = bool(
             config.get("filter_overlong_prompts_load_from_cache_file", False)
@@ -202,16 +206,47 @@ class RLHFDataset(Dataset):
         print(f"dataset len: {len(self.dataframe)}")
 
         if self.max_samples > 0 and self.max_samples < total:
-            if self.shuffle:
+            if self.balanced_sampling_key:
+                self.dataframe = self._stratified_sample(self.dataframe, self.max_samples)
+            elif self.shuffle:
                 rngs_args = (self.seed,) if self.seed is not None else ()
                 rng = np.random.default_rng(*rngs_args)
                 indices = rng.choice(total, size=self.max_samples, replace=False)
+                self.dataframe = self.dataframe.select(indices.tolist())
+                print(f"selected {self.max_samples} random samples out of {total}")
             else:
                 indices = np.arange(self.max_samples)
-            self.dataframe = self.dataframe.select(indices.tolist())
-            print(f"selected {self.max_samples} random samples out of {total}")
+                self.dataframe = self.dataframe.select(indices.tolist())
+                print(f"selected first {self.max_samples} samples out of {total}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+
+    def _stratified_sample(self, dataframe: "datasets.Dataset", n: int) -> "datasets.Dataset":
+        """Sample n items with equal representation from each group defined by balanced_sampling_key."""
+        key = self.balanced_sampling_key
+        rng = np.random.default_rng(self.seed if self.seed is not None else None)
+
+        groups = defaultdict(list)
+        for i, row in enumerate(dataframe):
+            groups[row.get(key, "__unknown__")].append(i)
+
+        n_groups = len(groups)
+        per_group = n // n_groups
+        remainder = n % n_groups
+
+        selected_indices = []
+        for gname, indices in sorted(groups.items()):
+            arr = np.array(indices)
+            rng.shuffle(arr)
+            take = min(per_group + (1 if remainder > 0 else 0), len(arr))
+            if remainder > 0:
+                remainder -= 1
+            selected_indices.extend(arr[:take].tolist())
+
+        rng.shuffle(selected_indices)
+        result = dataframe.select(selected_indices)
+        print(f"stratified sample: {len(selected_indices)} from {len(dataframe)} ({n_groups} groups by '{key}')")
+        return result
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
@@ -387,6 +422,9 @@ class RLHFDataset(Dataset):
                     video = dict(videos[video_offset]) if isinstance(videos[video_offset], dict) else {"video": videos[video_offset]}
                     if "video" in video and not os.path.isabs(video["video"]):
                         video["video"] = os.path.join(self.data_source_dir, video["video"])
+                    for _k in ("min_frames", "max_frames", "fps", "nframes"):
+                        if video.get(_k) is None:
+                            video.pop(_k, None)
                     if self.max_video_frames is not None:
                         video["max_frames"] = min(video.get("max_frames", 768), self.max_video_frames)
                     content_list.append({"type": "video", **video})
@@ -453,18 +491,34 @@ class RLHFDataset(Dataset):
             videos: List of videos, each video is a tuple of (video_tensor, video_metadata).
         """
         from qwen_vl_utils import process_vision_info
+        import qwen_vl_utils.vision_process as _vp
+        _vp.MAX_RATIO = 999
 
         max_vf = config.get("max_video_frames") if config else None
         if max_vf is None:
             max_vf = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None
-        if max_vf is not None:
-            for msg in messages:
-                content = msg.get("content") or []
-                if not isinstance(content, list):
-                    continue
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "video":
+        max_image_tokens = int(os.environ.get("QWEN_VL_MAX_IMAGE_TOKENS", "16384"))
+        if max_image_tokens < 16384:
+            image_factor = image_patch_size * 2  # spatial_merge_size
+            max_pixels = max_image_tokens * image_factor * image_factor
+        else:
+            max_pixels = None
+
+        for msg in messages:
+            content = msg.get("content") or []
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "video":
+                    for _k in ("min_frames", "max_frames", "fps", "nframes"):
+                        if item.get(_k) is None:
+                            item.pop(_k, None)
+                    if max_vf is not None:
                         item["max_frames"] = min(item.get("max_frames", 768), max_vf)
+                    if max_pixels is not None:
+                        item["max_pixels"] = min(item.get("max_pixels", max_pixels), max_pixels)
+                if isinstance(item, dict) and item.get("type") == "image" and max_pixels is not None:
+                    item["max_pixels"] = min(item.get("max_pixels", max_pixels), max_pixels)
 
         images, videos = process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True)
         return images, videos

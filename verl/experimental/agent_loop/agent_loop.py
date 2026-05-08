@@ -53,6 +53,153 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _count_vision_blocks(ids, attention_mask, processor):
+    """Count complete image and video blocks in token sequence (ignoring padding)."""
+    vision_start_id = processor.vision_start_token_id
+    image_token_id = processor.image_token_id
+    video_token_id = processor.video_token_id
+
+    flat = ids.flatten()
+    if attention_mask is not None:
+        flat = flat[attention_mask.flatten() == 1]
+
+    n_images, n_videos = 0, 0
+    ids_list = flat.tolist()
+    for i, tok in enumerate(ids_list):
+        if tok == vision_start_id and i + 1 < len(ids_list):
+            next_tok = ids_list[i + 1]
+            if next_tok == image_token_id:
+                n_images += 1
+            elif next_tok == video_token_id:
+                n_videos += 1
+    return n_images, n_videos
+
+
+def _trim_multi_modal_inputs_tensor(input_ids, attention_mask, multi_modal_inputs, processor):
+    """Trim pixel_values/grid_thw in multi_modal_inputs to match surviving vision blocks."""
+    n_images, n_videos = _count_vision_blocks(input_ids, attention_mask, processor)
+
+    image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+    if image_grid_thw is not None and n_images < image_grid_thw.shape[0]:
+        if n_images == 0:
+            multi_modal_inputs.pop("image_grid_thw", None)
+            multi_modal_inputs.pop("pixel_values", None)
+            multi_modal_inputs.pop("images_seqlens", None)
+        else:
+            keep_thw = image_grid_thw[-n_images:]
+            multi_modal_inputs["image_grid_thw"] = keep_thw
+            keep_pixels = keep_thw[:, 1] * keep_thw[:, 2] * (keep_thw[:, 0])
+            total_keep = int(keep_pixels.sum().item())
+            pv = multi_modal_inputs.get("pixel_values")
+            if pv is not None:
+                multi_modal_inputs["pixel_values"] = pv[-total_keep:]
+            seqlens = multi_modal_inputs.get("images_seqlens")
+            if seqlens is not None:
+                new_seqlens = torch.repeat_interleave(
+                    keep_thw[:, 1] * keep_thw[:, 2], keep_thw[:, 0]
+                )
+                multi_modal_inputs["images_seqlens"] = new_seqlens
+
+    video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+    if video_grid_thw is not None and n_videos < video_grid_thw.shape[0]:
+        if n_videos == 0:
+            multi_modal_inputs.pop("video_grid_thw", None)
+            multi_modal_inputs.pop("pixel_values_videos", None)
+        else:
+            keep_thw = video_grid_thw[-n_videos:]
+            multi_modal_inputs["video_grid_thw"] = keep_thw
+            keep_pixels = keep_thw[:, 1] * keep_thw[:, 2] * (keep_thw[:, 0])
+            total_keep = int(keep_pixels.sum().item())
+            pvv = multi_modal_inputs.get("pixel_values_videos")
+            if pvv is not None:
+                multi_modal_inputs["pixel_values_videos"] = pvv[-total_keep:]
+
+    return multi_modal_inputs
+
+
+def _trim_multimodal_after_left_truncation(
+    prompt_ids: list[int],
+    multi_modal_data: dict[str, Any],
+    processor: "AutoProcessor",
+) -> list[int]:
+    """After left-truncation, ensure multi_modal_data matches surviving vision tokens.
+
+    Left-truncation may remove image/video tokens from the beginning of prompt_ids.
+    This function:
+    1. Counts surviving complete vision blocks (vision_start + image/video token).
+    2. Trims multi_modal_data images (1 block = 1 image) and videos (N blocks = N frames
+       per video, so we trim at frame granularity within video tensors).
+    3. Removes orphaned vision-pad tokens from partially-cut vision blocks.
+    """
+    vision_start_id = processor.vision_start_token_id
+    image_token_id = processor.image_token_id
+    video_token_id = processor.video_token_id
+
+    n_surviving_image_blocks = 0
+    n_surviving_video_frame_blocks = 0
+    first_vision_start_pos = None
+
+    for i, tok in enumerate(prompt_ids):
+        if tok == vision_start_id:
+            if first_vision_start_pos is None:
+                first_vision_start_pos = i
+            if i + 1 < len(prompt_ids):
+                next_tok = prompt_ids[i + 1]
+                if next_tok == image_token_id:
+                    n_surviving_image_blocks += 1
+                elif next_tok == video_token_id:
+                    n_surviving_video_frame_blocks += 1
+
+    # Trim images: each image = 1 vision block
+    images = multi_modal_data.get("images")
+    if images is not None:
+        if n_surviving_image_blocks == 0:
+            multi_modal_data.pop("images", None)
+        elif n_surviving_image_blocks < len(images):
+            multi_modal_data["images"] = images[-n_surviving_image_blocks:]
+
+    # Trim videos: each video has multiple frame blocks
+    videos = multi_modal_data.get("videos")
+    if videos is not None:
+        total_original_frames = sum(
+            v[0].shape[0] if isinstance(v, tuple) else v.shape[0] for v in videos
+        )
+        if n_surviving_video_frame_blocks == 0:
+            multi_modal_data.pop("videos", None)
+        elif n_surviving_video_frame_blocks < total_original_frames:
+            remaining = n_surviving_video_frame_blocks
+            trimmed_videos = []
+            for v in reversed(videos):
+                if remaining <= 0:
+                    break
+                v_tensor = v[0] if isinstance(v, tuple) else v
+                v_meta = v[1] if isinstance(v, tuple) else {}
+                n_frames = v_tensor.shape[0]
+                if remaining >= n_frames:
+                    trimmed_videos.append(v)
+                    remaining -= n_frames
+                else:
+                    trimmed_tensor = v_tensor[-remaining:]
+                    trimmed_videos.append((trimmed_tensor, v_meta))
+                    remaining = 0
+            trimmed_videos.reverse()
+            multi_modal_data["videos"] = trimmed_videos if trimmed_videos else None
+            if not multi_modal_data.get("videos"):
+                multi_modal_data.pop("videos", None)
+
+    # Remove orphaned vision-pad tokens before the first complete vision block.
+    if first_vision_start_pos is not None and first_vision_start_pos > 0:
+        has_orphans = any(
+            t in (image_token_id, video_token_id) for t in prompt_ids[:first_vision_start_pos]
+        )
+        if has_orphans:
+            prompt_ids = prompt_ids[first_vision_start_pos:]
+    elif first_vision_start_pos is None:
+        prompt_ids = [t for t in prompt_ids if t not in (image_token_id, video_token_id)]
+
+    return prompt_ids
+
+
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides

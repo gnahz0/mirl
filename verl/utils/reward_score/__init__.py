@@ -111,6 +111,10 @@ def default_compute_score(
         from . import human_behaviour
 
         res = human_behaviour.compute_score(solution_str, ground_truth)
+    elif data_source in ["smellnet_base", "smellnet_mixture"]:
+        from . import smellnet
+
+        res = smellnet.compute_score(solution_str, ground_truth)
     elif data_source in [
         "chest_xray", "ct", "derm", "fundus", "mammo",
         "mri", "pathology", "ultrasound",

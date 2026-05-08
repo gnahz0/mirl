@@ -13,6 +13,7 @@
 # limitations under the License.
 import ctypes
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -50,6 +51,16 @@ def set_death_signal():
     libc.prctl(1, signal.SIGKILL)
     if os.getppid() == 1:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+def get_rollout_zmq_ipc_uri(device_uuid: str) -> str:
+    """ipc:// path for trainer ↔ vLLM weight sync.
+
+    Short hashed path avoids collisions with other users' stale sockets and stays within Unix path limits.
+    """
+    suffix = os.environ.get("VERL_ZMQ_IPC_SUFFIX", "")
+    digest = hashlib.sha256(f"{device_uuid}\0{suffix}".encode()).hexdigest()[:32]
+    return f"ipc:///tmp/verl-rzmq-{digest}.sock"
 
 
 def get_device_uuid(device_id: int) -> str:
@@ -311,7 +322,7 @@ class vLLMColocateWorkerExtension:
         """Get ZMQ handle for communication."""
         if not hasattr(self, "device_uuid") or not self.device_uuid:
             self.device_uuid = get_device_uuid(self.device.index)
-        return f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
+        return get_rollout_zmq_ipc_uri(self.device_uuid)
 
 
 class SuppressSignalInThread:

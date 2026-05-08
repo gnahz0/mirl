@@ -16,29 +16,19 @@ import os
 from io import BytesIO
 from typing import Optional
 
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 _MAX_IMAGE_TOKENS = int(os.environ.get("QWEN_VL_MAX_IMAGE_TOKENS", "16384"))
 _VIDEO_MAX_FRAMES = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None  # 0 or unset = no cap
 
-# qwen_vl_utils: torchvision's read_video() decodes the entire clip, then subsamples to max_frames
-# (slow / high RAM for long files). decord/torchcodec fetch only the sampled indices.
-# Install decord: pip install decord. Override with FORCE_QWENVL_VIDEO_READER=torchvision|torchcodec|decord.
+# torchcodec is recommended for Qwen3-VL (avoids decord hangs on some MP4s).
+# Override with FORCE_QWENVL_VIDEO_READER=torchvision|torchcodec|decord.
 if "FORCE_QWENVL_VIDEO_READER" not in os.environ:
-    os.environ["FORCE_QWENVL_VIDEO_READER"] = "decord"
-# Long or messy H.264/MP4 (e.g. web rips) can exceed decord's default EOF retries and fall back to
-# full-file torchvision. Raise if you see "Unable to handle EOF ... DECORD_EOF_RETRY_MAX=1024".
-if "DECORD_EOF_RETRY_MAX" not in os.environ:
-    os.environ["DECORD_EOF_RETRY_MAX"] = "20480"
-# If 1/true: on string video paths, do not use qwen_vl_utils's torchvision fallback when the primary
-# backend fails—raise so callers can skip the sample (see filter_by_token_limit.py setdefault).
-_VERL_SKIP_QWENVL_TV_FALLBACK = os.environ.get(
-    "VERL_SKIP_QWENVL_VIDEO_TORCHVISION_FALLBACK", "0"
-).lower() in ("1", "true", "yes")
+    os.environ["FORCE_QWENVL_VIDEO_READER"] = "torchcodec"
 
 import torch
-from PIL import Image, ImageFile
-
-# Allow loading truncated/corrupt image files (common in medical/clinical datasets)
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+from PIL import Image
 
 
 def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Image.Image:
@@ -90,72 +80,6 @@ eg.
 """
 
 
-def _qwen_video_string_path_no_torchvision_fallback(
-    ele: dict,
-    image_patch_size: int,
-    return_video_sample_fps: bool,
-    return_video_metadata: bool,
-):
-    """Same as qwen_vl_utils.fetch_video for string paths, but no torchvision fallback on read errors."""
-    import qwen_vl_utils.vision_process as vp
-    from torchvision import transforms
-    from torchvision.transforms import InterpolationMode
-
-    image_factor = image_patch_size * vp.SPATIAL_MERGE_SIZE
-    video_frame_min_pixels = vp.VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
-    video_frame_max_pixels = vp.VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
-
-    backend = vp.get_video_reader_backend()
-    try:
-        video, video_metadata, sample_fps = vp.VIDEO_READER_BACKENDS[backend](ele)
-    except Exception as e:
-        raise RuntimeError(
-            f"Video backend {backend!r} failed (torchvision fallback disabled via "
-            f"VERL_SKIP_QWENVL_VIDEO_TORCHVISION_FALLBACK): {e}"
-        ) from e
-
-    nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", video_frame_min_pixels)
-    total_pixels = ele.get("total_pixels", vp.MODEL_SEQ_LEN * image_factor * image_factor * 0.9)
-    max_pixels = max(
-        min(video_frame_max_pixels, total_pixels / nframes * vp.FRAME_FACTOR),
-        int(min_pixels * 1.05),
-    )
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
-    if max_pixels_supposed > max_pixels:
-        vp.logger.warning(
-            "The given max_pixels[%s] exceeds limit[%s].",
-            max_pixels_supposed,
-            max_pixels,
-        )
-    max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in ele and "resized_width" in ele:
-        resized_height, resized_width = vp.smart_resize(
-            ele["resized_height"],
-            ele["resized_width"],
-            factor=image_factor,
-        )
-    else:
-        resized_height, resized_width = vp.smart_resize(
-            height,
-            width,
-            factor=image_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-    video = transforms.functional.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
-
-    final_video = (video, video_metadata) if return_video_metadata else video
-    if return_video_sample_fps:
-        return final_video, sample_fps
-    return final_video
-
-
 def process_video(
     video: dict,
     image_patch_size: int = 14,
@@ -178,6 +102,11 @@ def process_video(
     # Shallow copy... since we might want to add some keys
     video = dict(video)
 
+    # Cap per-frame resolution using the same token budget as images
+    if "max_pixels" not in video and _MAX_IMAGE_TOKENS < 16384:
+        image_factor = image_patch_size * 2  # spatial_merge_size = 2
+        video["max_pixels"] = _MAX_IMAGE_TOKENS * image_factor * image_factor
+
     # Cap max_frames: explicit override > env VIDEO_MAX_FRAMES > no cap
     cap = max_frames_override if max_frames_override is not None else _VIDEO_MAX_FRAMES
     if cap is not None:
@@ -195,14 +124,6 @@ def process_video(
                 video["min_frames"] = fps_min_frames
             if fps_max_frames is not None:
                 video["max_frames"] = fps_max_frames
-
-    if _VERL_SKIP_QWENVL_TV_FALLBACK and isinstance(video.get("video"), str):
-        return _qwen_video_string_path_no_torchvision_fallback(
-            video,
-            image_patch_size,
-            return_video_sample_fps,
-            return_video_metadata,
-        )
 
     from qwen_vl_utils import fetch_video
 
