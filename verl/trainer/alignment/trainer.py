@@ -57,12 +57,31 @@ def _resolve_dtype(name: str) -> torch.dtype:
             "fp16": torch.float16, "float16": torch.float16}[name.lower()]
 
 
+def _wandb_has_credentials() -> bool:
+    """True if wandb can authenticate -- WANDB_API_KEY env var, ~/.netrc, or
+    XDG_CONFIG_HOME/wandb/settings written by ``wandb login``."""
+    if "WANDB_API_KEY" in os.environ:
+        return True
+    for path in (
+        os.path.expanduser("~/.netrc"),
+        os.path.expanduser("~/.config/wandb/settings"),
+    ):
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    if "api.wandb.ai" in f.read():
+                        return True
+        except OSError:
+            pass
+    return False
+
+
 def _maybe_init_wandb(cfg: DictConfig):
     """Initialize a W&B run if enabled in config. Returns the run handle or ``None``.
 
     Robust to:
         * ``wandb`` not installed -> warn and continue without it.
-        * No API key on the machine -> falls back to ``WANDB_MODE=offline``.
+        * No API key on the machine (env var *or* ~/.netrc) -> falls back to ``WANDB_MODE=offline``.
         * ``cfg.wandb.mode`` explicitly set to ``"disabled"`` / ``"offline"`` / ``"online"``.
     """
     wcfg = cfg.get("wandb", {}) or {}
@@ -75,13 +94,13 @@ def _maybe_init_wandb(cfg: DictConfig):
         logger.warning("wandb not installed; continuing without it (`pip install wandb` to enable)")
         return None
 
-    # If user set WANDB_API_KEY env, online mode works. Otherwise fall back to offline.
+    # Explicit cfg mode wins; otherwise auto-detect credentials.
     if wcfg.get("mode"):
         os.environ.setdefault("WANDB_MODE", str(wcfg.get("mode")))
-    elif "WANDB_API_KEY" not in os.environ and os.environ.get("WANDB_MODE") not in ("offline", "disabled"):
+    elif not _wandb_has_credentials() and os.environ.get("WANDB_MODE") not in ("offline", "disabled"):
         logger.warning(
-            "WANDB_API_KEY not set; defaulting to WANDB_MODE=offline. "
-            "Run `wandb login` (or set WANDB_API_KEY) to log online."
+            "No wandb credentials found (WANDB_API_KEY env var nor ~/.netrc); "
+            "defaulting to WANDB_MODE=offline. Run `wandb login` (or set WANDB_API_KEY) to log online."
         )
         os.environ["WANDB_MODE"] = "offline"
 
