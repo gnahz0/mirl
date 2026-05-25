@@ -202,6 +202,20 @@ class MultimodalAlignmentModel(nn.Module):
             pixel_values, image_grid_thw, visual=self.frozen_visual, no_grad=True
         )
 
+    # Videos use the *same* Qwen3-VL visual tower; the only thing that changes is
+    # ``grid_thw[:, 0] > 1`` (multiple frames per clip). We keep these as separate
+    # methods so the trainer reads more naturally and we have a hook point if we
+    # ever want video-specific pooling.
+    def encode_videos_trainable(self, pixel_values_videos, video_grid_thw) -> torch.Tensor:
+        return self._encode_qwen_branch(
+            pixel_values_videos, video_grid_thw, visual=self.trainable_visual, no_grad=False
+        )
+
+    def encode_videos_frozen(self, pixel_values_videos, video_grid_thw) -> torch.Tensor:
+        return self._encode_qwen_branch(
+            pixel_values_videos, video_grid_thw, visual=self.frozen_visual, no_grad=True
+        )
+
     @torch.no_grad()
     def encode_text(self, texts: list[str], device: torch.device, max_length: int = 77) -> torch.Tensor:
         if not texts:

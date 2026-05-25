@@ -33,9 +33,9 @@ import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -57,48 +57,158 @@ def _resolve_dtype(name: str) -> torch.dtype:
             "fp16": torch.float16, "float16": torch.float16}[name.lower()]
 
 
-def _qwen_process_batch(processor, pil_list, device, dtype):
-    """Run the Qwen3-VL processor on a list of PIL images. The processor expects a
-    matching ``text=`` argument; we use a single ``<image>``-padded prompt per image so
-    grid_thw is computed correctly."""
+def _maybe_init_wandb(cfg: DictConfig):
+    """Initialize a W&B run if enabled in config. Returns the run handle or ``None``.
+
+    Robust to:
+        * ``wandb`` not installed -> warn and continue without it.
+        * No API key on the machine -> falls back to ``WANDB_MODE=offline``.
+        * ``cfg.wandb.mode`` explicitly set to ``"disabled"`` / ``"offline"`` / ``"online"``.
+    """
+    wcfg = cfg.get("wandb", {}) or {}
+    if not wcfg.get("enable", False):
+        logger.info("W&B disabled in config; skipping init")
+        return None
+    try:
+        import wandb
+    except ImportError:
+        logger.warning("wandb not installed; continuing without it (`pip install wandb` to enable)")
+        return None
+
+    # If user set WANDB_API_KEY env, online mode works. Otherwise fall back to offline.
+    if wcfg.get("mode"):
+        os.environ.setdefault("WANDB_MODE", str(wcfg.get("mode")))
+    elif "WANDB_API_KEY" not in os.environ and os.environ.get("WANDB_MODE") not in ("offline", "disabled"):
+        logger.warning(
+            "WANDB_API_KEY not set; defaulting to WANDB_MODE=offline. "
+            "Run `wandb login` (or set WANDB_API_KEY) to log online."
+        )
+        os.environ["WANDB_MODE"] = "offline"
+
+    try:
+        run = wandb.init(
+            project=str(wcfg.get("project", "mirl-alignment")),
+            name=str(wcfg.get("name", "stage1")),
+            entity=str(wcfg.get("entity")) if wcfg.get("entity") else None,
+            tags=list(wcfg.get("tags", []) or []),
+            notes=str(wcfg.get("notes", "")) if wcfg.get("notes") else None,
+            group=str(wcfg.get("group")) if wcfg.get("group") else None,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        logger.info("W&B run initialized: %s (mode=%s)",
+                    run.url if hasattr(run, "url") else "?", os.environ.get("WANDB_MODE", "online"))
+        return run
+    except Exception as e:  # noqa: BLE001
+        logger.warning("wandb init failed (%s); continuing without it", e)
+        return None
+
+
+def _process_images(processor, pil_list, device, dtype):
+    """Run the Qwen3-VL processor on a list of PIL images."""
     if not pil_list:
         return None
-    text = ["<image>"] * len(pil_list)
-    out = processor(images=pil_list, text=text, return_tensors="pt", padding=True)
+    out = processor(
+        images=pil_list,
+        text=["<image>"] * len(pil_list),
+        return_tensors="pt",
+        padding=True,
+    )
     return {
         "pixel_values": out["pixel_values"].to(device=device, dtype=dtype),
         "image_grid_thw": out["image_grid_thw"].to(device=device),
     }
 
 
+def _process_videos(processor, video_list, device, dtype):
+    """Run the Qwen3-VL processor on a list of ``(video_tensor, video_metadata)`` pairs.
+
+    ``video_list`` matches the format returned by ``vision_utils.process_video(...,
+    return_video_metadata=True)`` -- i.e. each entry is ``(tensor[n_frames, 3, H, W], meta)``.
+    """
+    if not video_list:
+        return None
+    tensors, metas = zip(*video_list, strict=True)
+    out = processor(
+        videos=list(tensors),
+        text=["<video>"] * len(tensors),
+        return_tensors="pt",
+        padding=True,
+        videos_kwargs={"video_metadata": list(metas), "do_sample_frames": False},
+    )
+    return {
+        "pixel_values_videos": out["pixel_values_videos"].to(device=device, dtype=dtype),
+        "video_grid_thw": out["video_grid_thw"].to(device=device),
+    }
+
+
+def _encode_branch(
+    model: MultimodalAlignmentModel,
+    processor,
+    images_pil,
+    videos,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Encode one branch (img or ts) that may contain both images and videos.
+
+    Returns ``(z_trainable, z_frozen)`` with shape ``[B_total, qwen_hidden]`` where rows are
+    ordered ``[image_rows..., video_rows...]``. Either side may be ``None`` if the branch
+    is empty.
+    """
+    img_in = _process_images(processor, images_pil, device, dtype)
+    vid_in = _process_videos(processor, videos, device, dtype)
+    if img_in is None and vid_in is None:
+        return None, None
+
+    train_parts: list[torch.Tensor] = []
+    frozen_parts: list[torch.Tensor] = []
+
+    if img_in is not None:
+        t = model.encode_images_trainable(img_in["pixel_values"], img_in["image_grid_thw"])
+        f = model.encode_images_frozen(img_in["pixel_values"], img_in["image_grid_thw"])
+        train_parts.append(t)
+        frozen_parts.append(f)
+    if vid_in is not None:
+        t = model.encode_videos_trainable(vid_in["pixel_values_videos"], vid_in["video_grid_thw"])
+        f = model.encode_videos_frozen(vid_in["pixel_values_videos"], vid_in["video_grid_thw"])
+        train_parts.append(t)
+        frozen_parts.append(f)
+
+    return torch.cat(train_parts, dim=0), torch.cat(frozen_parts, dim=0)
+
+
 def _compute_losses(
     model: MultimodalAlignmentModel,
-    img_inputs,
-    img_text,
-    ts_inputs,
-    ts_text,
+    batch: dict,
     cfg: DictConfig,
     device: torch.device,
+    visual_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, dict]:
     metrics: dict[str, float] = {}
 
-    z_img = z_ts = z_ref_img = z_ref_ts = z_text_img = z_text_ts = None
+    # Branch encodings (images + videos concatenated, in that order).
+    feat_img, feat_ref_img = _encode_branch(
+        model, model.qwen_processor,
+        batch["img_image_pil"], batch["img_video"], device, visual_dtype,
+    )
+    feat_ts, feat_ref_ts = _encode_branch(
+        model, model.qwen_processor,
+        batch["ts_image_pil"], batch["ts_video"], device, visual_dtype,
+    )
 
-    if img_inputs is not None:
-        feat_img = model.encode_images_trainable(img_inputs["pixel_values"], img_inputs["image_grid_thw"])
-        feat_ref_img = model.encode_images_frozen(img_inputs["pixel_values"], img_inputs["image_grid_thw"])
-        z_img = model.project(model.proj_img, feat_img)
-        z_ref_img = model.project(model.proj_ref, feat_ref_img)
-        clip_feat_img = model.encode_text(img_text, device=device)
-        z_text_img = model.project(model.proj_text, clip_feat_img.float())
+    img_text = list(batch["img_image_text"]) + list(batch["img_video_text"])
+    ts_text = list(batch["ts_image_text"]) + list(batch["ts_video_text"])
 
-    if ts_inputs is not None:
-        feat_ts = model.encode_images_trainable(ts_inputs["pixel_values"], ts_inputs["image_grid_thw"])
-        feat_ref_ts = model.encode_images_frozen(ts_inputs["pixel_values"], ts_inputs["image_grid_thw"])
-        z_ts = model.project(model.proj_ts_img, feat_ts)
-        z_ref_ts = model.project(model.proj_ref_ts, feat_ref_ts)
-        clip_feat_ts = model.encode_text(ts_text, device=device)
-        z_text_ts = model.project(model.proj_text, clip_feat_ts.float())
+    z_img = model.project(model.proj_img, feat_img) if feat_img is not None else None
+    z_ref_img = model.project(model.proj_ref, feat_ref_img) if feat_ref_img is not None else None
+    z_ts = model.project(model.proj_ts_img, feat_ts) if feat_ts is not None else None
+    z_ref_ts = model.project(model.proj_ref_ts, feat_ref_ts) if feat_ref_ts is not None else None
+
+    z_text_img = z_text_ts = None
+    if z_img is not None and img_text:
+        z_text_img = model.project(model.proj_text, model.encode_text(img_text, device=device).float())
+    if z_ts is not None and ts_text:
+        z_text_ts = model.project(model.proj_text, model.encode_text(ts_text, device=device).float())
 
     total = torch.zeros((), device=device, dtype=torch.float32)
     w = cfg.loss_weights
@@ -178,6 +288,9 @@ def train(cfg: DictConfig) -> None:
         max_samples=int(cfg.data.get("max_train_samples", -1)),
         balanced_sampling_key=cfg.data.get("balanced_sampling_key"),
         seed=int(cfg.train.get("seed", 42)),
+        enable_videos=bool(cfg.data.get("enable_videos", True)),
+        max_video_frames=cfg.data.get("max_video_frames"),
+        image_patch_size=int(cfg.data.get("image_patch_size", 14)),
     )
     logger.info("train dataset: %d image-bearing samples", len(train_ds))
     train_loader = DataLoader(
@@ -228,17 +341,7 @@ def train(cfg: DictConfig) -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # ---- Optional W&B ----
-    wandb_run = None
-    if cfg.get("wandb", {}).get("enable", False):
-        try:
-            import wandb
-            wandb_run = wandb.init(
-                project=str(cfg.wandb.get("project", "mirl-alignment")),
-                name=str(cfg.wandb.get("name", "stage1")),
-                config=OmegaConf.to_container(cfg, resolve=True),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("wandb init failed (%s); continuing without it", e)
+    wandb_run = _maybe_init_wandb(cfg)
 
     # ---- Train ----
     model.train()
@@ -262,16 +365,14 @@ def train(cfg: DictConfig) -> None:
     done = False
     while not done:
         for batch in train_loader:
-            img_inputs = _qwen_process_batch(model.qwen_processor, batch["img_pil"], device, visual_dtype)
-            ts_inputs = _qwen_process_batch(model.qwen_processor, batch["ts_pil"], device, visual_dtype)
-
-            if img_inputs is None and ts_inputs is None:
+            # Skip empty batches (rare, can happen if every sample failed to load).
+            n_img = len(batch["img_image_pil"]) + len(batch["img_video"])
+            n_ts = len(batch["ts_image_pil"]) + len(batch["ts_video"])
+            if n_img == 0 and n_ts == 0:
                 continue
 
             with autocast_ctx:
-                loss, metrics = _compute_losses(
-                    model, img_inputs, batch["img_text"], ts_inputs, batch["ts_text"], cfg, device,
-                )
+                loss, metrics = _compute_losses(model, batch, cfg, device, visual_dtype)
 
             if not torch.isfinite(loss):
                 logger.warning("non-finite loss at step %d (%s); skipping", step, loss.item())
@@ -293,14 +394,22 @@ def train(cfg: DictConfig) -> None:
             if step % log_every == 0:
                 elapsed = time.time() - t0
                 lr_now = optimizer.param_groups[0]["lr"]
+                counts = {
+                    "n/img_image": len(batch["img_image_pil"]),
+                    "n/img_video": len(batch["img_video"]),
+                    "n/ts_image": len(batch["ts_image_pil"]),
+                    "n/ts_video": len(batch["ts_video"]),
+                }
                 msg = (
                     f"step {step:6d} | lr {lr_now:.2e} | "
                     + " ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-                    + f" | n_img={len(batch['img_pil'])} n_ts={len(batch['ts_pil'])} | {elapsed:.1f}s"
+                    + " | "
+                    + " ".join(f"{k}={v}" for k, v in counts.items())
+                    + f" | {elapsed:.1f}s"
                 )
                 logger.info(msg)
                 if wandb_run is not None:
-                    wandb_run.log({**metrics, "lr": lr_now, "step": step})
+                    wandb_run.log({**metrics, **counts, "lr": lr_now, "step": step})
 
             if step > 0 and step % ckpt_every == 0:
                 _save_checkpoint(model, out_dir / f"step_{step}", cfg)

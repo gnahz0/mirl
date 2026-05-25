@@ -27,8 +27,16 @@ unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
 export QWEN_VL_MAX_IMAGE_TOKENS="${QWEN_VL_MAX_IMAGE_TOKENS:-1024}"
+export VIDEO_MAX_FRAMES="${VIDEO_MAX_FRAMES:-8}"
 export TOKENIZERS_PARALLELISM=false
 export HYDRA_FULL_ERROR=1
+
+# Forward W&B env so the trainer can pick up creds without touching the YAML.
+# Set WANDB_API_KEY before launching to log online; otherwise the trainer falls back
+# to WANDB_MODE=offline and writes runs to ./wandb/.
+export WANDB_PROJECT="${WANDB_PROJECT:-mirl-alignment}"
+export WANDB_DIR="${WANDB_DIR:-${MIRL_ROOT}/outputs/alignment_stage1/wandb}"
+mkdir -p "${WANDB_DIR}"
 
 CONFIG="${MIRL_ROOT}/verl/trainer/alignment/config/stage1_qwen3vl_clip.yaml"
 

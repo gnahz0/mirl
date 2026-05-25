@@ -19,6 +19,9 @@ data:
     - smellnet_base
     - smellnet_mixture
   text_for_clip: ground_truth   # ground_truth | question | question_plus_gt
+  enable_videos: true           # also feed video-bearing samples through the trainable VE
+  max_video_frames: 8           # cap frames per video (decoding cost + memory)
+  image_patch_size: 14          # passed to process_image/process_video; Qwen3-VL default
 
 model:
   qwen3_vl_path: Qwen/Qwen3-VL-8B-Instruct
@@ -58,3 +61,11 @@ wandb:
   enable: true
   project: mirl-alignment
   name: stage1_qwen3vl_clip
+  # mode: online            # "online" | "offline" | "disabled". Defaults to online if WANDB_API_KEY is set.
+  # entity: gnahz0          # set explicitly if you don't want the default
+  # group: stage1
+  tags:
+    - stage1
+    - qwen3vl
+    - clip-vit-large-patch14
+  notes: "Stage 1 multimodal alignment: trainable Qwen3-VL VE vs frozen ref + CLIP text"

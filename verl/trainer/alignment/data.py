@@ -11,12 +11,14 @@ Reuses the repo's existing JSONL schema (no schema changes):
     extra_info: dict or JSON string
 
 Routing logic:
-    * If ``data_source`` is in ``cfg.data.ts_data_sources`` AND ``images`` is non-empty,
-      we treat the first image as a *rendered time-series image* (z_ts_img path).
-    * Otherwise if ``images`` is non-empty, we treat the first image as a *normal image*
-      (z_img path).
-    * Otherwise (video-only / audio-only / text-only) the sample is currently skipped --
-      see TODO(stage2) below for adding video frame sampling and audio support.
+    * If ``data_source`` is in ``cfg.data.ts_data_sources``     -> ``branch="ts"``  (z_ts_img path).
+    * Otherwise                                                 -> ``branch="img"`` (z_img path).
+    * If the sample has an image entry, we use the first image  (``media_kind="image"``).
+    * Else if the sample has a video entry, we use the first video frame-tensor
+      (``media_kind="video"``, decoded via ``verl/utils/dataset/vision_utils.process_video``).
+    * Else                                                       -> dropped.
+
+Audio inputs are still TODO(stage2). Stage 1 only handles visual modalities.
 """
 
 from __future__ import annotations
@@ -105,22 +107,44 @@ def _load_image_path_or_dict(img_entry) -> Optional[Image.Image]:
     return None
 
 
-class AlignmentDataset(Dataset):
-    """Yields per-sample dicts with PIL images on the CPU; the trainer's collate runs the
-    Qwen processor + CLIP tokenizer in batched mode for efficiency.
+def _load_video_entry(
+    video_entry: dict,
+    image_patch_size: int = 14,
+    max_frames_override: Optional[int] = None,
+):
+    """Returns ``(video_tensor [n_frames, 3, H, W], video_metadata)`` or ``None``.
 
-    Each ``__getitem__`` returns ::
+    Uses the repo's ``process_video`` so caps and torchcodec fallbacks are consistent
+    with the veRL training path.
+    """
+    try:
+        from verl.utils.dataset.vision_utils import process_video
+        return process_video(
+            video_entry,
+            image_patch_size=image_patch_size,
+            return_video_metadata=True,
+            max_frames_override=max_frames_override,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("video load failed (%s): %s", e, video_entry)
+        return None
+
+
+class AlignmentDataset(Dataset):
+    """Yields per-sample dicts whose media is loaded lazily on ``__getitem__``.
+
+    Each entry has::
 
         {
-            "branch":     "img" | "ts" | "none",
-            "image":      Optional[PIL.Image],         # the single chosen image
-            "text":       str,                          # text fed to CLIP
+            "branch":      "img" | "ts" | "none",
+            "media_kind":  "image" | "video" | "none",
+            "media":       PIL.Image  OR  (video_tensor, video_metadata)  OR  None,
+            "text":        str,            # text fed to CLIP
             "data_source": str,
-            "index":      int,
+            "index":       int,
         }
 
-    Samples with ``branch == "none"`` are filtered out at index-time so the DataLoader
-    never sees them.
+    Samples with ``branch == "none"`` are dropped by the collator.
     """
 
     def __init__(
@@ -131,12 +155,18 @@ class AlignmentDataset(Dataset):
         max_samples: int = -1,
         balanced_sampling_key: Optional[str] = None,
         seed: Optional[int] = 42,
+        enable_videos: bool = True,
+        max_video_frames: Optional[int] = 8,
+        image_patch_size: int = 14,
     ):
         if isinstance(data_files, str):
             data_files = [data_files]
         self.ts_sources = set(ts_data_sources or [])
         self.text_for_clip_mode = text_for_clip
         self.seed = seed
+        self.enable_videos = enable_videos
+        self.max_video_frames = max_video_frames
+        self.image_patch_size = image_patch_size
 
         rows: list[dict] = []
         for path in data_files:
@@ -153,16 +183,28 @@ class AlignmentDataset(Dataset):
                 else:
                     raise ValueError(f"unsupported data file: {path}")
 
-        # Pre-filter rows that have at least one image (Stage 1 supports image-bearing samples only).
-        # TODO(stage2): support video frame sampling and audio inputs here.
-        rows = [r for r in rows if r.get("images")]
+        def _has_media(r: dict) -> bool:
+            if r.get("images"):
+                return True
+            if self.enable_videos and r.get("videos"):
+                return True
+            return False
+
+        rows = [r for r in rows if _has_media(r)]
         if not rows:
-            raise RuntimeError(f"no image-bearing samples found in {data_files}")
+            raise RuntimeError(
+                f"no image/video-bearing samples found in {data_files} "
+                f"(enable_videos={self.enable_videos})"
+            )
 
         if max_samples and max_samples > 0:
             rows = self._maybe_stratified_sample(rows, max_samples, balanced_sampling_key)
 
         self.rows = rows
+        logger.info(
+            "AlignmentDataset: %d rows from %d files (videos=%s, max_video_frames=%s)",
+            len(self.rows), len(data_files), self.enable_videos, self.max_video_frames,
+        )
 
     def _maybe_stratified_sample(
         self, rows: list[dict], n: int, key: Optional[str]
@@ -190,44 +232,94 @@ class AlignmentDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
+    def _none_item(self, idx: int, ds: str) -> dict:
+        return {
+            "branch": "none", "media_kind": "none", "media": None,
+            "text": "", "data_source": ds, "index": idx,
+        }
+
     def __getitem__(self, idx: int) -> dict:
         sample = self.rows[idx]
         ds = sample.get("data_source", "")
-        images_meta = sample.get("images") or []
-        if not images_meta:
-            return {"branch": "none", "image": None, "text": "",
-                    "data_source": ds, "index": idx}
-
-        pil = _load_image_path_or_dict(images_meta[0])
-        if pil is None:
-            return {"branch": "none", "image": None, "text": "",
-                    "data_source": ds, "index": idx}
-
         branch = "ts" if ds in self.ts_sources else "img"
-        return {
-            "branch": branch,
-            "image": pil,
-            "text": _text_for_clip(sample, self.text_for_clip_mode),
-            "data_source": ds,
-            "index": idx,
-        }
+
+        # 1. Prefer images (cheaper, deterministic).
+        images_meta = sample.get("images") or []
+        if images_meta:
+            pil = _load_image_path_or_dict(images_meta[0])
+            if pil is not None:
+                return {
+                    "branch": branch, "media_kind": "image", "media": pil,
+                    "text": _text_for_clip(sample, self.text_for_clip_mode),
+                    "data_source": ds, "index": idx,
+                }
+
+        # 2. Fall back to videos.
+        # NOTE: smellnet samples are image-only in the existing JSONL, so the ts branch is
+        # effectively image-only. Tactile / HB / CLIMB video subsets feed the img branch.
+        videos_meta = sample.get("videos") or []
+        if self.enable_videos and videos_meta:
+            loaded = _load_video_entry(
+                videos_meta[0],
+                image_patch_size=self.image_patch_size,
+                max_frames_override=self.max_video_frames,
+            )
+            if loaded is not None:
+                return {
+                    "branch": branch, "media_kind": "video", "media": loaded,
+                    "text": _text_for_clip(sample, self.text_for_clip_mode),
+                    "data_source": ds, "index": idx,
+                }
+
+        return self._none_item(idx, ds)
 
 
 def collate_alignment(batch: list[dict]) -> dict:
-    """Group per-sample dicts into a single batch dict, keeping ``"img"`` and ``"ts"``
-    branches separate so each can be processed independently by the Qwen processor."""
-    img_pil, ts_pil = [], []
-    img_text, ts_text = [], []
-    img_meta, ts_meta = [], []
-    for item in batch:
-        if item["branch"] == "img" and item["image"] is not None:
-            img_pil.append(item["image"]); img_text.append(item["text"])
-            img_meta.append({"data_source": item["data_source"], "index": item["index"]})
-        elif item["branch"] == "ts" and item["image"] is not None:
-            ts_pil.append(item["image"]); ts_text.append(item["text"])
-            ts_meta.append({"data_source": item["data_source"], "index": item["index"]})
-        # branch == "none" is silently dropped
-    return {
-        "img_pil": img_pil, "img_text": img_text, "img_meta": img_meta,
-        "ts_pil": ts_pil,   "ts_text": ts_text,   "ts_meta": ts_meta,
+    """Split per-sample dicts into 4 buckets keyed by (branch, media_kind).
+
+    Returned dict::
+
+        {
+          "img_image_pil":   [PIL.Image, ...],     "img_image_text":   [str, ...],
+          "img_video":       [(tensor, meta), ...],"img_video_text":   [str, ...],
+          "ts_image_pil":    [PIL.Image, ...],     "ts_image_text":    [str, ...],
+          "ts_video":        [(tensor, meta), ...],"ts_video_text":    [str, ...],
+          "img_meta":        [{data_source, index, kind}, ...]  # in (images, videos) order
+          "ts_meta":         [...]
+        }
+
+    Note: text order within each branch is ``[image_texts..., video_texts...]`` so the
+    trainer can concatenate per-branch embeddings in the same order.
+    """
+    out = {
+        "img_image_pil": [], "img_image_text": [],
+        "img_video":     [], "img_video_text": [],
+        "ts_image_pil":  [], "ts_image_text":  [],
+        "ts_video":      [], "ts_video_text":  [],
+        "img_meta":      [], "ts_meta":        [],
     }
+    # First pass: images.
+    for item in batch:
+        if item["branch"] not in ("img", "ts"):
+            continue
+        if item["media_kind"] != "image" or item["media"] is None:
+            continue
+        prefix = item["branch"]
+        out[f"{prefix}_image_pil"].append(item["media"])
+        out[f"{prefix}_image_text"].append(item["text"])
+        out[f"{prefix}_meta"].append({
+            "data_source": item["data_source"], "index": item["index"], "kind": "image",
+        })
+    # Second pass: videos (appended after images in the per-branch order).
+    for item in batch:
+        if item["branch"] not in ("img", "ts"):
+            continue
+        if item["media_kind"] != "video" or item["media"] is None:
+            continue
+        prefix = item["branch"]
+        out[f"{prefix}_video"].append(item["media"])
+        out[f"{prefix}_video_text"].append(item["text"])
+        out[f"{prefix}_meta"].append({
+            "data_source": item["data_source"], "index": item["index"], "kind": "video",
+        })
+    return out
