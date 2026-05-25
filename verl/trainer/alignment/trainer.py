@@ -310,6 +310,8 @@ def train(cfg: DictConfig) -> None:
         enable_videos=bool(cfg.data.get("enable_videos", True)),
         max_video_frames=cfg.data.get("max_video_frames"),
         image_patch_size=int(cfg.data.get("image_patch_size", 14)),
+        video_load_timeout=int(cfg.data.get("video_load_timeout", 30)),
+        video_suppress_stderr=bool(cfg.data.get("video_suppress_stderr", True)),
     )
     logger.info("train dataset: %d image-bearing samples", len(train_ds))
     train_loader = DataLoader(

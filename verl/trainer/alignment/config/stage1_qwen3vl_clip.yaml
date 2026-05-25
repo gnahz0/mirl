@@ -22,6 +22,8 @@ data:
   enable_videos: true           # also feed video-bearing samples through the trainable VE
   max_video_frames: 8           # cap frames per video (decoding cost + memory)
   image_patch_size: 14          # passed to process_image/process_video; Qwen3-VL default
+  video_load_timeout: 30        # seconds; aborts a hanging video decode and drops the sample
+  video_suppress_stderr: true   # mute C-level torchcodec / ffmpeg "Could not open input file" spam
 
 model:
   qwen3_vl_path: Qwen/Qwen3-VL-8B-Instruct

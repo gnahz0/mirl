@@ -28,6 +28,9 @@ unset HIP_VISIBLE_DEVICES
 
 export QWEN_VL_MAX_IMAGE_TOKENS="${QWEN_VL_MAX_IMAGE_TOKENS:-1024}"
 export VIDEO_MAX_FRAMES="${VIDEO_MAX_FRAMES:-8}"
+# Match the rest of the repo: prefer torchcodec, mute torchcodec's internal logs.
+export FORCE_QWENVL_VIDEO_READER="${FORCE_QWENVL_VIDEO_READER:-torchcodec}"
+export TORCHCODEC_LOG_LEVEL="${TORCHCODEC_LOG_LEVEL:-0}"
 export TOKENIZERS_PARALLELISM=false
 export HYDRA_FULL_ERROR=1
 

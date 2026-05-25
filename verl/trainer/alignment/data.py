@@ -23,11 +23,13 @@ Audio inputs are still TODO(stage2). Stage 1 only handles visual modalities.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import random
 import re
+import signal
 from typing import Optional
 
 import numpy as np
@@ -36,6 +38,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+# Match scripts/diagnose_skipped_videos.py: torchcodec is the preferred backend
+# (avoids decord hangs on some MP4s) and we want it on in *all* processes including
+# DataLoader workers, so set it at import time before qwen_vl_utils is touched.
+os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
+os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 
 
 _PLACEHOLDER_RE = re.compile(r"<image>|<video>|<audio>")
@@ -107,27 +115,95 @@ def _load_image_path_or_dict(img_entry) -> Optional[Image.Image]:
     return None
 
 
+class _VideoTimeout(Exception):
+    pass
+
+
+def _video_timeout_handler(signum, frame):  # noqa: ARG001
+    raise _VideoTimeout()
+
+
+@contextlib.contextmanager
+def _suppress_fd_stderr():
+    """Redirect file descriptor 2 to /dev/null while inside this context.
+
+    Catches *C-level* writes from torchcodec / ffmpeg (``Could not open input file...``)
+    that Python-level logging silencing can't reach. Falls through silently if the
+    fd dance isn't possible (some sandboxed environments).
+    """
+    try:
+        old_fd = os.dup(2)
+    except OSError:
+        yield
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        try:
+            os.dup2(old_fd, 2)
+        finally:
+            os.close(devnull)
+            os.close(old_fd)
+
+
 def _load_video_entry(
     video_entry: dict,
     image_patch_size: int = 14,
     max_frames_override: Optional[int] = None,
+    timeout_sec: int = 30,
+    suppress_stderr: bool = True,
 ):
     """Returns ``(video_tensor [n_frames, 3, H, W], video_metadata)`` or ``None``.
 
-    Uses the repo's ``process_video`` so caps and torchcodec fallbacks are consistent
-    with the veRL training path.
+    Defensive wrapper around ``verl/utils/dataset/vision_utils.process_video``:
+
+    * Sets a SIGALRM timeout (default 30s) so a malformed MP4 cannot hang the
+      DataLoader. Matches the pattern from ``scripts/diagnose_skipped_videos.py``.
+    * Suppresses C-level stderr from torchcodec / ffmpeg by default so unreadable
+      files don't flood the console (the dataset already drops them silently).
+    * Falls back to a plain ``process_video`` call if SIGALRM isn't usable in this
+      thread / OS.
+
+    Returns ``None`` on any failure (timeout, missing file, decode error) so the
+    caller can route the sample to ``branch="none"`` and the collator drops it.
     """
+    from verl.utils.dataset.vision_utils import process_video
+
+    old_handler = None
+    alarm_set = False
     try:
-        from verl.utils.dataset.vision_utils import process_video
-        return process_video(
-            video_entry,
-            image_patch_size=image_patch_size,
-            return_video_metadata=True,
-            max_frames_override=max_frames_override,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.debug("video load failed (%s): %s", e, video_entry)
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _video_timeout_handler)
+            signal.alarm(int(timeout_sec))
+            alarm_set = True
+        except (ValueError, OSError):
+            # SIGALRM unavailable (non-main thread, Windows, etc.); continue without timeout.
+            pass
+
+        ctx = _suppress_fd_stderr() if suppress_stderr else contextlib.nullcontext()
+        with ctx:
+            return process_video(
+                video_entry,
+                image_patch_size=image_patch_size,
+                return_video_metadata=True,
+                max_frames_override=max_frames_override,
+            )
+    except _VideoTimeout:
+        logger.warning("video decode timed out after %ds: %s", timeout_sec, video_entry)
         return None
+    except Exception as e:  # noqa: BLE001
+        logger.debug("video decode failed (%s): %s", type(e).__name__, str(e)[:160])
+        return None
+    finally:
+        if alarm_set:
+            try:
+                signal.alarm(0)
+                if old_handler is not None:
+                    signal.signal(signal.SIGALRM, old_handler)
+            except (ValueError, OSError):
+                pass
 
 
 class AlignmentDataset(Dataset):
@@ -158,6 +234,8 @@ class AlignmentDataset(Dataset):
         enable_videos: bool = True,
         max_video_frames: Optional[int] = 8,
         image_patch_size: int = 14,
+        video_load_timeout: int = 30,
+        video_suppress_stderr: bool = True,
     ):
         if isinstance(data_files, str):
             data_files = [data_files]
@@ -167,6 +245,8 @@ class AlignmentDataset(Dataset):
         self.enable_videos = enable_videos
         self.max_video_frames = max_video_frames
         self.image_patch_size = image_patch_size
+        self.video_load_timeout = int(video_load_timeout)
+        self.video_suppress_stderr = bool(video_suppress_stderr)
 
         rows: list[dict] = []
         for path in data_files:
@@ -263,6 +343,8 @@ class AlignmentDataset(Dataset):
                 videos_meta[0],
                 image_patch_size=self.image_patch_size,
                 max_frames_override=self.max_video_frames,
+                timeout_sec=self.video_load_timeout,
+                suppress_stderr=self.video_suppress_stderr,
             )
             if loaded is not None:
                 return {
