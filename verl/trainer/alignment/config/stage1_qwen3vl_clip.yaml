@@ -1,0 +1,60 @@
+# Stage 1 multimodal alignment config (single GPU, debug-friendly).
+#
+# Routing:
+#   * smellnet (both base and mixture) -> "ts" branch (rendered TS image -> trainable Qwen3-VL VE)
+#   * everything else with non-empty `images[]` -> "img" branch (normal image -> trainable Qwen3-VL VE)
+#   * everything (both branches) -> frozen reference Qwen3-VL VE for MSE distillation
+#   * CLIP text input per sample = reward_model.ground_truth string (the label / answer)
+
+log_level: INFO
+
+data:
+  train_files:
+    - ${oc.env:MIRL_ROOT,/home/alecz/mirl}/data/combined_train_full.json
+  val_files:
+    - ${oc.env:MIRL_ROOT,/home/alecz/mirl}/data/combined_valid_mini.json
+  max_train_samples: 50000      # set -1 to use everything
+  balanced_sampling_key: data_source
+  ts_data_sources:
+    - smellnet_base
+    - smellnet_mixture
+  text_for_clip: ground_truth   # ground_truth | question | question_plus_gt
+
+model:
+  qwen3_vl_path: Qwen/Qwen3-VL-8B-Instruct
+  clip_text_path: openai/clip-vit-large-patch14
+  trainable_visual_dtype: bf16
+  attn_impl: sdpa
+
+projection:
+  shared_dim: 512
+  hidden_dim: 1024
+  dropout: 0.0
+
+loss_weights:
+  img_text: 1.0
+  ts_text: 1.0
+  img_ts: 0.0        # off by default: default JSONL has no paired image<->ts samples
+  distill_img: 0.1
+  distill_ts: 0.1
+  distill_kl: 0.0    # set > 0 to enable similarity-row KL distillation
+
+train:
+  seed: 42
+  batch_size: 16          # per-step micro-batch
+  grad_accum_steps: 4     # effective batch = batch_size * grad_accum_steps = 64
+  num_workers: 4
+  lr: 1.0e-5
+  weight_decay: 0.05
+  warmup_steps: 200
+  total_steps: 5000
+  grad_clip: 1.0
+  amp_dtype: bf16
+  log_every: 10
+  ckpt_every: 500
+  output_dir: ${oc.env:MIRL_ROOT,/home/alecz/mirl}/outputs/alignment_stage1
+
+wandb:
+  enable: true
+  project: mirl-alignment
+  name: stage1_qwen3vl_clip
