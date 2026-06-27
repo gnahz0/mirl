@@ -28,8 +28,10 @@ import datasets
 import numpy as np
 import torch
 from omegaconf import DictConfig, ListConfig
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import Dataset
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.utils.import_utils import load_extern_object
@@ -459,9 +461,50 @@ class RLHFDataset(Dataset):
         """
         from qwen_vl_utils import process_vision_info
 
+        from verl.utils.dataset.vision_utils import install_robust_video_reader
+
+        # Use the torchcodec->decord fallback chain instead of letting qwen_vl_utils pick a single
+        # backend (decord can hang for tens of minutes on long/corrupt web-rip H.264).
+        install_robust_video_reader()
+
         max_vf = config.get("max_video_frames") if config else None
         if max_vf is None:
             max_vf = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None
+
+        # Optional cheap pre-filter: skip videos whose file is larger than this many bytes *before*
+        # attempting any decode. 0/None disables it. Pathologically large files are the most likely
+        # to be slow/OOM; dropping them keeps the rollout snappy without a decode attempt.
+        max_video_bytes = config.get("max_video_bytes") if config else None
+        if not max_video_bytes:
+            max_video_bytes = int(os.environ.get("MAX_VIDEO_BYTES", "0")) or None
+
+        # Cap image resolution in the *rollout* path. Images here go straight through
+        # qwen_vl_utils.process_vision_info, which never consults verl's process_image, so an
+        # uncapped high-res image expands to qwen's default ~16384 visual tokens and overflows
+        # rollout.max_model_len ("Prompt length (16337) exceeds ..."). The cap must come from the
+        # config (Ray workers don't inherit the driver env, so QWEN_VL_MAX_IMAGE_TOKENS is unset
+        # here). Units match verl's process_image: patch-14 tokens, model tokens ~= value / 4.
+        # The cap is adaptive: a per-image ceiling (max_image_tokens), but for multi-image prompts
+        # each image is also bounded by total_budget / n_images so the combined visual tokens fit
+        # max_model_len (e.g. CLIMB has up to 4 images/sample).
+        max_it = config.get("max_image_tokens") if config else None
+        if max_it is None:
+            max_it = int(os.environ.get("QWEN_VL_MAX_IMAGE_TOKENS", "0")) or None
+        total_it = (config.get("max_image_tokens_total") if config else None) or (
+            (max_it * 4) if max_it else None
+        )
+        n_images = sum(
+            1
+            for msg in messages
+            if isinstance(msg.get("content"), list)
+            for item in msg["content"]
+            if isinstance(item, dict) and item.get("type") == "image"
+        )
+        per_image_it = max_it
+        if max_it and total_it and n_images > 1:
+            per_image_it = min(max_it, max(1, total_it // n_images))
+        max_image_pixels = per_image_it * image_patch_size * image_patch_size if per_image_it else None
+
         for msg in messages:
             content = msg.get("content") or []
             if not isinstance(content, list):
@@ -474,8 +517,77 @@ class RLHFDataset(Dataset):
                     if max_vf is not None:
                         item["max_frames"] = min(item.get("max_frames", 768), max_vf)
 
-        images, videos = process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True)
+        # Pre-validate media: drop corrupt/truncated images and oversized videos (dropping a video
+        # item also drops its <video> placeholder, keeping the prompt and processor consistent).
+        for msg in messages:
+            content = msg.get("content") or []
+            if not isinstance(content, list):
+                continue
+            keep = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image":
+                    try:
+                        src = item.get("image", "")
+                        if isinstance(src, str) and src:
+                            img = Image.open(src)
+                            img.load()
+                            img.close()
+                    except Exception as e:
+                        logger.warning("Skipping corrupt/truncated image %s: %s", item.get("image", "?"), e)
+                        continue
+                    if max_image_pixels is not None and "max_pixels" not in item:
+                        item["max_pixels"] = max_image_pixels
+                elif max_video_bytes and isinstance(item, dict) and item.get("type") == "video":
+                    src = item.get("video", "")
+                    try:
+                        if isinstance(src, str) and src and os.path.getsize(src) > max_video_bytes:
+                            logger.warning(
+                                "Skipping oversized video %s (%.0f MB > %.0f MB cap)",
+                                src,
+                                os.path.getsize(src) / 1e6,
+                                max_video_bytes / 1e6,
+                            )
+                            continue
+                    except OSError:
+                        pass
+                keep.append(item)
+            msg["content"] = keep
+
+        try:
+            images, videos = process_vision_info(
+                messages, image_patch_size=image_patch_size, return_video_metadata=True
+            )
+        except Exception as e:
+            # A video failed to decode with every backend (torchcodec + decord). Rather than crash
+            # the whole rollout batch, drop the undecodable video item(s) from the messages (which
+            # also drops their <video> placeholder so the processor stays consistent) and retry so
+            # the sample survives as text/images only.
+            logger.warning("process_vision_info failed (%s); dropping undecodable videos and retrying", e)
+            cls._drop_undecodable_videos(messages, image_patch_size)
+            images, videos = process_vision_info(
+                messages, image_patch_size=image_patch_size, return_video_metadata=True
+            )
         return images, videos
+
+    @staticmethod
+    def _drop_undecodable_videos(messages: list[dict], image_patch_size) -> None:
+        """Remove video items that fail to decode (in-place) so a bad clip can't crash the sample."""
+        from qwen_vl_utils import fetch_video
+
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            keep = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "video":
+                    try:
+                        fetch_video(dict(item), image_patch_size=image_patch_size, return_video_metadata=True)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Dropping undecodable video %s: %s", item.get("video", "?"), e)
+                        continue
+                keep.append(item)
+            msg["content"] = keep
 
     def split(self, num_splits: int):
         """

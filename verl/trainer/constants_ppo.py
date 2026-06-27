@@ -24,6 +24,12 @@ PPO_RAY_RUNTIME_ENV = {
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        # Cap decord's EOF-retry loop low so a corrupt/long H.264 fails fast instead of grinding for
+        # tens of minutes in uninterruptible C++ and stalling the rollout. The torchcodec->decord
+        # chain (verl.utils.dataset.vision_utils.install_robust_video_reader) handles long web-rips
+        # via torchcodec, so decord only ever sees short clips that need ~0 retries. Set from process
+        # start so decord picks it up before the first VideoReader is created.
+        "DECORD_EOF_RETRY_MAX": "50",
         # To prevent hanging or crash during synchronization of weights between actor and rollout
         # in disaggregated mode. See:
         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues

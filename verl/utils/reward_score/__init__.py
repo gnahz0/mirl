@@ -118,6 +118,18 @@ def default_compute_score(
         from . import medical
 
         res = medical.compute_score(solution_str, ground_truth)
+    elif data_source in ["smellnet_base", "smellnet_mixture"]:
+        from . import smellnet
+
+        res = smellnet.compute_score(solution_str, ground_truth)
+    elif data_source == "ecg":
+        from . import ecg
+
+        res = ecg.compute_score(solution_str, ground_truth)
+    elif data_source == "haptic_tactile":
+        from . import haptic_ts
+
+        res = haptic_ts.compute_score(solution_str, ground_truth)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

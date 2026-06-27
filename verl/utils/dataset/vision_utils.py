@@ -19,15 +19,63 @@ from typing import Optional
 _MAX_IMAGE_TOKENS = int(os.environ.get("QWEN_VL_MAX_IMAGE_TOKENS", "16384"))
 _VIDEO_MAX_FRAMES = int(os.environ.get("VIDEO_MAX_FRAMES", "0")) or None  # 0 or unset = no cap
 
-# qwen_vl_utils: torchvision's read_video() decodes the entire clip, then subsamples to max_frames
-# (slow / high RAM for long files). decord/torchcodec fetch only the sampled indices.
-# Install decord: pip install decord. Override with FORCE_QWENVL_VIDEO_READER=torchvision|torchcodec|decord.
-if "FORCE_QWENVL_VIDEO_READER" not in os.environ:
-    os.environ["FORCE_QWENVL_VIDEO_READER"] = "decord"
-# Long or messy H.264/MP4 (e.g. web rips) can exceed decord's default EOF retries and fall back to
-# full-file torchvision. Raise if you see "Unable to handle EOF ... DECORD_EOF_RETRY_MAX=1024".
+# Video decoding strategy (see install_robust_video_reader below). qwen_vl_utils otherwise picks a
+# SINGLE backend and raises if it fails:
+#   torchcodec (indexed seek; fast + safe on long/messy web-rips where decord otherwise grinds for
+#               tens of minutes in an uninterruptible C++ EOF-retry loop and stalls the rollout)
+#   -> decord  (handles short clips such as MELD dia*_utt*.mp4 that torchcodec's stream scan rejects)
+# torchvision is intentionally NOT in the chain: read_video() full-decodes the whole clip, which is
+# slow / OOM-prone on long videos.
+#
+# decord's retry loop is uninterruptible from Python (a SIGALRM/thread timeout cannot break a C++
+# call), so we keep the EOF-retry cap LOW: a corrupt file fails fast instead of hanging the batch.
+# Only files torchcodec already rejected ever reach decord, and valid short clips need ~0 retries.
 if "DECORD_EOF_RETRY_MAX" not in os.environ:
-    os.environ["DECORD_EOF_RETRY_MAX"] = "20480"
+    os.environ["DECORD_EOF_RETRY_MAX"] = "50"
+
+
+def install_robust_video_reader():
+    """Register a torchcodec->decord fallback chain as the qwen_vl_utils video reader backend.
+
+    Idempotent and safe to call from every Ray worker / both the dataloader and rollout paths.
+    qwen_vl_utils caches the chosen backend (lru_cache) and reads FORCE_QWENVL_VIDEO_READER as a
+    module global at import time, so we set the global directly and clear the cache rather than
+    relying on an env var that may be read too late. If the user explicitly sets
+    FORCE_QWENVL_VIDEO_READER we respect it and do nothing.
+    """
+    if os.environ.get("FORCE_QWENVL_VIDEO_READER"):
+        return
+    try:
+        import qwen_vl_utils.vision_process as vp
+    except Exception:
+        return
+    if getattr(vp, "_verl_robust_reader_installed", False):
+        return
+
+    originals = dict(vp.VIDEO_READER_BACKENDS)
+
+    def _robust_reader(ele):
+        errors = []
+        for backend in ("torchcodec", "decord"):
+            fn = originals.get(backend)
+            if fn is None:
+                continue
+            try:
+                return fn(ele)
+            except Exception as e:  # noqa: BLE001 - try the next backend
+                errors.append(f"{backend}={type(e).__name__}: {str(e)[:120]}")
+        raise RuntimeError("all video readers failed (" + " | ".join(errors) + ")")
+
+    vp.VIDEO_READER_BACKENDS["verl_robust"] = _robust_reader
+    vp.FORCE_QWENVL_VIDEO_READER = "verl_robust"
+    try:
+        vp.get_video_reader_backend.cache_clear()
+    except Exception:
+        pass
+    vp._verl_robust_reader_installed = True
+
+
+install_robust_video_reader()
 # If 1/true: on string video paths, do not use qwen_vl_utils's torchvision fallback when the primary
 # backend fails—raise so callers can skip the sample (see filter_by_token_limit.py setdefault).
 _VERL_SKIP_QWENVL_TV_FALLBACK = os.environ.get(

@@ -1,5 +1,6 @@
 MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export RAY_TMPDIR="${RAY_TMPDIR:-${MIRL_ROOT}/.ray_tmp}"
+# Ray plasma sockets are AF_UNIX; full path must be <= 107 bytes — use a short scratch dir, not repo/.ray_tmp.
+export RAY_TMPDIR="${RAY_TMPDIR:-/scratch/${USER}/ray_tmp}"
 mkdir -p "$RAY_TMPDIR"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3

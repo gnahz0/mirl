@@ -61,6 +61,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -164,21 +165,48 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def __del__(self):
+    @staticmethod
+    def _safe_finish(logger_instance, *args, **kwargs):
+        try:
+            logger_instance.finish(*args, **kwargs)
+        except Exception:
+            # Best-effort cleanup only. Some backends, notably wandb during interpreter
+            # shutdown, may already have torn down their transport before __del__ runs.
+            pass
+
+    @staticmethod
+    def _safe_teardown(logger_instance, *args, **kwargs):
+        teardown = getattr(logger_instance, "teardown", None)
+        if teardown is None:
+            return
+        try:
+            teardown(*args, **kwargs)
+        except Exception:
+            pass
+
+    def finish(self):
+        if self._finished:
+            return
+        self._finished = True
+
         if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
+            self._safe_finish(self.logger["wandb"], exit_code=0)
+            self._safe_teardown(self.logger["wandb"], exit_code=0)
         if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
+            self._safe_finish(self.logger["swanlab"])
         if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
+            self._safe_finish(self.logger["vemlp_wandb"], exit_code=0)
         if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
+            self._safe_finish(self.logger["tensorboard"])
         if "clearml" in self.logger:
-            self.logger["clearml"].finish()
+            self._safe_finish(self.logger["clearml"])
         if "trackio" in self.logger:
-            self.logger["trackio"].finish()
+            self._safe_finish(self.logger["trackio"])
         if "file" in self.logger:
-            self.logger["file"].finish()
+            self._safe_finish(self.logger["file"])
+
+    def __del__(self):
+        self.finish()
 
 
 class ClearMLLogger:
