@@ -616,7 +616,81 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        # Dataset-level macro-F1 for ECG (logging-only; does not affect training reward).
+        metric_dict.update(self._compute_ecg_macro_f1(sample_outputs, sample_gts, data_sources))
+        return metric_dict
+
+    def _compute_ecg_macro_f1(self, sample_outputs, sample_gts, data_sources):
+        """Confusion-matrix classification metrics over the entire ECG validation set.
+
+        The per-sample reward metrics (acc/f1/jaccard/...) collapse to accuracy because
+        ECG is single-label with disjoint category word-sets, so a mean-of-per-sample
+        reduction cannot express macro-F1. Here we pool every ECG rollout into one
+        confusion matrix and report per-class F1/precision/recall/support plus
+        macro/weighted/micro summaries, which exposes minority-class collapse (e.g.
+        "always predict Normal") that accuracy hides.
+
+        Note: micro-F1 == accuracy for single-label multiclass (kept for completeness).
+        Logging only -- this never touches the training reward.
+        """
+        import re as _re
+
+        from verl.utils.reward_score import ecg
+
+        preds, gts = [], []
+        for out, gt, ds in zip(sample_outputs, sample_gts, data_sources):
+            if ds != "ecg" or gt is None:
+                continue
+            boxed = ecg.extract_boxed_answer(out)
+            search = boxed if boxed is not None else out
+            pred_cat = ecg._predicted_category(search)
+            preds.append(ecg._norm(pred_cat) if pred_cat is not None else None)
+            gts.append(ecg._norm(gt))
+
+        if not gts:
+            return {}
+
+        total = len(gts)
+        # Report/average over the classes that actually appear in the ground truth.
+        labels = sorted(set(gts))
+        metrics = {}
+        f1s, precs, recs, supports = [], [], [], []
+        weighted_f1 = 0.0
+        for c in labels:
+            tp = sum(1 for p, g in zip(preds, gts) if g == c and p == c)
+            fp = sum(1 for p, g in zip(preds, gts) if g != c and p == c)
+            fn = sum(1 for p, g in zip(preds, gts) if g == c and p != c)
+            support = tp + fn
+            prec = tp / (tp + fp) if (tp + fp) else 0.0
+            rec = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+            f1s.append(f1)
+            precs.append(prec)
+            recs.append(rec)
+            supports.append(support)
+            weighted_f1 += f1 * support
+            key = _re.sub(r"[^a-z0-9]+", "_", c).strip("_")
+            metrics[f"val-aux/ecg/per_class/{key}/f1"] = float(f1)
+            metrics[f"val-aux/ecg/per_class/{key}/precision"] = float(prec)
+            metrics[f"val-aux/ecg/per_class/{key}/recall"] = float(rec)
+            metrics[f"val-aux/ecg/per_class/{key}/support"] = float(support)
+
+        n = len(labels)
+        accuracy = sum(1 for p, g in zip(preds, gts) if p == g) / total
+        metrics.update(
+            {
+                "val-core/ecg/macro_f1": float(sum(f1s) / n),
+                "val-aux/ecg/macro_precision": float(sum(precs) / n),
+                "val-aux/ecg/macro_recall": float(sum(recs) / n),
+                "val-aux/ecg/weighted_f1": float(weighted_f1 / total),
+                "val-aux/ecg/micro_f1": float(accuracy),  # == accuracy for single-label
+                "val-aux/ecg/accuracy": float(accuracy),
+                "val-aux/ecg/n_classes": float(n),
+                "val-aux/ecg/n_samples": float(total),
+            }
+        )
+        return metrics
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
