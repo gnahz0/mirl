@@ -1,0 +1,180 @@
+# Stage 1 Qwen3.5 multimodal alignment config (single GPU, debug-friendly).
+#
+# Routing (CONTENT-based: a row with a non-empty `signals[]` field -> "ts" branch):
+#   * ts branch -- raw signals converted directly to Qwen3.5's flattened patch layout
+#     (no plots, PIL, or separate TS encoder). Hybrid representation:
+#       - SmellNet CSV                       -> unified direct-value channel raster
+#       - ECG .pt (8x2500, format=ts_pt)     -> same direct-value channel raster
+#       - tactile .pt dict (T,16,16)         -> native 32x32 pseudo-video frames
+#     ts text = reward_model.ground_truth, encoded by frozen SigLIP2-SO400M text;
+#     InfoNCE against the ts embedding.
+#   * everything else with non-empty `images[]`/`videos[]` -> "img" branch
+#     (trainable VE AND frozen reference VE; cosine distillation preserves image
+#     understanding). Haptic video rows feed this branch, so each
+#     haptic recording contributes to BOTH distillation (video) and contrastive (tactile).
+
+log_level: INFO
+
+data:
+  # Verified per-family Parquet indexes under /work; their media paths point to /scratch.
+  # ts families (smellnet + ecg + haptic_ts) are kept IN FULL; img/video families
+  # (climb + human_behaviour + tactile) are stratify-capped via max_img_samples.
+  train_files:
+    # --- time-series (all kept; ~25% of the run) ---
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/smellnet_train_clean.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/ecg_train_nan_filtered.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/haptic_ts_train.parquet
+    # --- img/video (~75%) ---
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/climb_train.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/human_behaviour_train.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/tactile_train.parquet
+  val_files:
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/smellnet_valid_clean.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/ecg_valid_nan_filtered.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/haptic_ts_valid.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/climb_valid.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/human_behaviour_valid.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/tactile_valid.parquet
+  max_train_samples: 100000     # (IGNORED when include_all_ts=true; kept for reference)
+  max_val_samples: 100000        # >= total cleaned valid (~51.7k) -> keeps ALL valid rows in the
+                                 # pool (shuffled/balanced); raise train.val_batches to eval more of it.
+  balanced_sampling_key: data_source
+  # Use the full 42,212-row unique training TS pool: SmellNet 1,192 + ECG 39,445 +
+  # haptic tactile 1,575. Cap the image/video pool at 3x TS so TS is ~25%.
+  # Each batch is then ~25% ts (~16 ts/batch @ bs64) for the InfoNCE while distillation gets
+  # a large, diverse preservation anchor.
+  include_all_ts: true
+  max_img_samples: 126636
+  # NOTE: branch routing is now CONTENT-based (a row with non-empty `signals` -> ts branch;
+  # else img/video). `ts_data_sources` below is ONLY the set of *small* ts sources to
+  # OVERSAMPLE (replicate Nx). ECG is large (~39k train) and deliberately not listed.
+  # replicated.
+  ts_data_sources:
+    - smellnet_base
+    - smellnet_mixture
+    - haptic_tactile
+  text_for_label: ground_truth  # ground_truth | question | question_plus_gt
+  enable_videos: true           # also feed video-bearing samples through the trainable VE
+  max_video_frames: 12          # frames sampled per clip (subsampled across the whole video);
+                                # dominant activation cost -> lower = less memory, faster steps.
+                                # Raised 8->12 now that gradient checkpointing (model.gradient_
+                                # checkpointing) recomputes VE activations in backward, which frees
+                                # the activation memory that previously capped frames at 8.
+  image_patch_size: 16          # Qwen3.5 native spatial patch size
+  video_load_timeout: 30        # seconds; aborts a hanging video decode and drops the sample
+  video_suppress_stderr: true   # mute C-level torchcodec / ffmpeg "Could not open input file" spam
+  # --- raw time-series (ts branch) ---
+  # Preserve native SmellNet channels/lengths and all 2500 ECG points. Padding occurs only
+  # inside the merger-aware renderer, where every boundary is a 32px merger-cell boundary.
+  ts_in_channels: null
+  ts_seq_len: null
+  ts_pt_target_len: null
+  tactile_max_frames: 256       # keep native 30-FPS frames when T<=256 (76.5% of records);
+                                # uniformly cover longer clips. Two adjacent 32x32 cells
+                                # carry tactile + force, yielding ~one output token per frame.
+  ts_oversample: 1       # 1 = off, so "all ts = 25%" holds with each ts sample appearing once
+                         # (ECG dominates ts at ~96%). To make the small rich-text sources
+                         # (smellnet ~1.2k + haptic_tactile ~1.6k, in ts_data_sources) more
+                         # visible against ECG, raise to 2-3 -- this nudges ts slightly above
+                         # 25% and mildly overfits the repeated signals (10 overfit badly).
+
+model:
+  # Use the exact final model.visual tensors from this Qwen3.5 checkpoint for BOTH
+  # the trainable student and frozen distillation anchor. The loader reads only the
+  # visual shard, so it does not materialize the 9B language tower.
+  qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  # Qwen3.5's visual tower is SigLIP2-SO400M-derived. Use the paired frozen text
+  # tower for labels; learned projections account for Qwen's subsequent VL training.
+  siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
+  trainable_visual_dtype: bf16
+  attn_impl: sdpa
+  # hybrid: one unified direct-value pseudo-image grammar for scalar-channel
+  # SmellNet/ECG; native pseudo-video only for tactile, whose observations are
+  # already spatial frames.
+  # Set "video" for the all-video ablation.
+  ts_representation: hybrid
+  gradient_checkpointing: true  # recompute VE block activations in backward instead of
+                                # storing them: large activation-memory saving (frees room
+                                # for more video frames / bigger batch) at ~20-30% slower
+                                # steps. Trainable VE only; frozen VE runs under no_grad.
+                                # Note: HF's built-in toggle is a no-op for this tower, so
+                                # we patch the blocks directly (see model.py).
+
+projection:
+  shared_dim: 512
+  hidden_dim: 1024
+  dropout: 0.0
+
+loss_weights:
+  # Two losses. ts_text teaches the VE the new modality; distill_img keeps it from
+  # forgetting images (raw-feature cosine distance vs the frozen VE -- exactly the features the
+  # LM tower will consume in Stage 2). Their ratio is the learn-vs-preserve knob.
+  # NOTE: ts_oversample (data.ts_oversample) controls how many ts samples land per
+  # batch -- the InfoNCE term needs >=2 ts samples in a batch to fire at all.
+  ts_text: 1.0       # InfoNCE: raw-signal embedding <-> text label
+  distill_img: 1.0   # cosine distance (1 - cos): trainable VE <-> frozen VE raw features on
+                     # images/videos. Now O(1) and comparable to InfoNCE (the old F.mse_loss
+                     # averaged over the ~4096-dim feature -> ~1e-5, effectively no gradient).
+                     # Tune up if images regress, down if it smothers ts learning.
+
+train:
+  seed: 42
+  batch_size: 64          # per-GPU micro-batch @ 12 frames WITH gradient checkpointing.
+                          # ts is now ~25% of the pool -> E[ts/batch] ~16, so the per-rank
+                          # InfoNCE (computed on each rank's LOCAL batch) has plenty of
+                          # negatives and fires every step. bs64 peak ~76 GiB of 140 -> safe.
+                          # DDP shards PER rank -> global batch = batch_size * grad_accum * NUM_GPUS.
+  grad_accum_steps: 1     # 1 because real batch beats accumulation for contrastive negatives
+                          # (each micro-batch computes its own InfoNCE; accumulation adds none).
+                          # global effective batch = 64 * 1 * NUM_GPUS.
+  num_workers: 8          # measured GPU-BOUND at bs64/12-frames (~11.7 s/step was identical at
+                          # 4 vs 12 workers): the step cost is encoding ~56 twelve-frame videos
+                          # through BOTH the trainable VE (w/ ckpt recompute) + frozen ref VE.
+                          # 8 workers keep decode comfortably ahead; more doesn't speed it up.
+  prefetch_factor: 4      # batches each worker preloads ahead (deeper queue hides decode spikes).
+  mp_context: spawn       # "spawn" is required when CUDA is initialized in the parent;
+                          # "fork" deadlocks. Use 0 workers if spawn pickling fails.
+  lr: 1.0e-5                # base LR for the pretrained Qwen3.5 ViT (trainable_visual)
+  head_lr: 1.0e-4           # higher LR for from-scratch modules (projection heads);
+                            # cosine schedule scales both tiers proportionally.
+  weight_decay: 0.05
+  # ``warmup_steps`` and ``total_steps`` are counted in OPTIMIZER STEPS (not
+  # micro-batches). One optimizer step = ``grad_accum_steps`` micro-batches.
+  warmup_steps: 264
+  total_steps: 7914       # ~3 single-GPU epochs over 168,848 rows (2,638 full steps/epoch @ bs64).
+                          # COLD start (resume_from=null) for a clean new VE that learns the
+                          # full modality set incl. the new ECG + haptic-tactile time series.
+                          # Single cosine schedule: warmup 264 -> decay to 0 at step 7914.
+  grad_clip: 1.0
+  resume_from: null          # cold start from the exact Qwen3.5 VE. Set to a
+                             # checkpoint dir (e.g. outputs/alignment_stage1/final) to instead
+                             # warm-start trainable weights (a cosine RESTART: only weights are
+                             # restored, not the optimizer/LR schedule).
+  amp_dtype: bf16         # forward/backward activation dtype via torch.autocast.
+                          # Master weights (trainable params) are always upcast to fp32
+                          # in the trainer to avoid the bf16-mantissa underflow that
+                          # froze ~25% of params on the previous run.
+  log_every: 10           # in optimizer steps (terminal log; W&B logs every step)
+  ckpt_every: 500         # in optimizer steps
+  val_every: 50           # run validation every N opt steps (0 disables)
+  val_batches: 32         # number of val batches per eval call
+  best_metric: val/acc/ts_text  # save outputs/.../best whenever this val metric (higher=better)
+                                # improves -> overfit-proof checkpoint to use for Stage 2.
+  val_batch_size: 64      # forward-only -> fits much larger batches than training.
+                          # 64 x 32 batches = ~2048 samples per eval. Also gives the
+                          # val InfoNCE/acc more negatives per batch than train, so
+                          # val metrics are a slightly HARDER test than train metrics.
+  output_dir: ${oc.env:MIRL_ROOT,/home/alecz/mirl}/outputs/alignment_stage1
+
+wandb:
+  enable: true
+  project: mirl-alignment
+  name: stage1_qwen35_siglip2_unified_grayscale_clean
+  # mode: online            # "online" | "offline" | "disabled". Defaults to online if WANDB_API_KEY is set.
+  # entity: gnahz0          # set explicitly if you don't want the default
+  # group: stage1
+  tags:
+    - stage1
+    - qwen35
+    - siglip2-so400m
+  notes: "Stage 1: exact trainable/frozen Qwen3.5 vision towers + SigLIP2 label text"

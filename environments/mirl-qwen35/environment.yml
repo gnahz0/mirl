@@ -1,0 +1,18 @@
+name: alec-mv
+channels:
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12.13
+  - pip=26.1.1
+  - setuptools=80.9.0
+  - wheel=0.47.0
+  - cmake=4.2.3
+  - cuda-nvcc=12.9.86
+  - cuda-cudart-dev=12.9.79
+  - cuda-nvrtc-dev=12.9.86
+  - libcublas-dev=12.9.1.4
+  - gcc_linux-64=14.3.0
+  - gxx_linux-64=14.3.0
+  - ffmpeg=7.1.1

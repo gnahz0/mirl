@@ -25,6 +25,15 @@ verl is a flexible, efficient and production-ready RL training library for large
 
 verl is the open-source version of **[HybridFlow: A Flexible and Efficient RLHF Framework](https://arxiv.org/abs/2409.19256v2)** paper.
 
+> **MIRL Qwen3.5 worktree:** this branch ports the MIRL multimodal GRPO
+> pipeline to Qwen3.5 while keeping MIRL behavior in extensions except for one
+> tested Qwen3.5 timestamped-video MRoPE compatibility fix. Start with the
+> [MIRL Qwen3.5 overview](docs/mirl/README.md) for the architecture, environment,
+> data contract, and smoke-test command. The detailed historical disposition is
+> in the [migration ledger](docs/mirl/qwen35-migration-ledger.md). Agents
+> resuming the work should start with the current
+> [continuation handoff](docs/mirl/CONTINUATION.md).
+
 verl is flexible and easy to use with:
 
 - **Easy extension of diverse RL algorithms**: The hybrid-controller programming model enables flexible representation and efficient execution of complex post-training dataflows. Build RL dataflows such as GRPO, PPO in a few lines of code.

@@ -1,0 +1,90 @@
+# Smoke-test config for the Stage 1 alignment trainer.
+#
+# Exercises the whole pipeline on a stratified 48-row sample from the real indexes:
+# all 3 ts signal formats (smellnet CSV, ECG ts_pt, haptic tactile_pt) + images + video,
+# both losses (ts InfoNCE + img distill), backward + optimizer step, validation, and a
+# checkpoint save. Uses the exact Qwen3.5 VE (+ frozen ref) and SigLIP2 text encoder, so a
+# pass here means the real run is wired correctly. Cold start, no W&B, a handful of steps.
+#
+#   PYTHONPATH=. python -m mirl_ext.alignment.trainer \
+#       --config mirl_ext/alignment/config/stage1_smoke.yaml
+
+log_level: INFO
+
+data:
+  train_files:
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/smellnet_train_clean.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/ecg_train_nan_filtered.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/haptic_ts_train.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/climb_train.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/human_behaviour_train.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/tactile_train.parquet
+  val_files:
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/smellnet_valid_clean.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/ecg_valid_nan_filtered.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/haptic_ts_valid.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/climb_valid.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/human_behaviour_valid.parquet
+    - ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}/tactile_valid.parquet
+  max_train_samples: 48
+  max_val_samples: 24
+  balanced_sampling_key: data_source
+  include_all_ts: false
+  max_img_samples: 0
+  ts_data_sources:
+    - smellnet_base
+    - smellnet_mixture
+    - haptic_tactile
+  text_for_label: ground_truth
+  enable_videos: true
+  max_video_frames: 4            # low -> fast video decode in smoke
+  image_patch_size: 16
+  video_load_timeout: 30
+  video_suppress_stderr: true
+  ts_in_channels: null
+  ts_seq_len: null
+  ts_pt_target_len: null
+  tactile_max_frames: 64        # deliberately smaller than production's 256 for a fast smoke
+  ts_oversample: 1
+
+model:
+  qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
+  trainable_visual_dtype: bf16
+  attn_impl: sdpa
+  ts_representation: hybrid
+  gradient_checkpointing: true
+
+projection:
+  shared_dim: 512
+  hidden_dim: 1024
+  dropout: 0.0
+
+loss_weights:
+  ts_text: 1.0
+  distill_img: 1.0
+
+train:
+  seed: 42
+  batch_size: 8
+  grad_accum_steps: 1
+  num_workers: 0                 # avoid spawn/pickle in the smoke test
+  mp_context: spawn
+  lr: 1.0e-5
+  head_lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_steps: 2
+  total_steps: 6
+  grad_clip: 1.0
+  resume_from: null             # cold start from the exact Qwen3.5 VE
+  amp_dtype: bf16
+  log_every: 1
+  ckpt_every: 3
+  val_every: 3
+  val_batches: 2
+  best_metric: val/acc/ts_text
+  val_batch_size: 8
+  output_dir: ${oc.env:MIRL_ROOT,/home/alecz/mirl}/outputs/alignment_smoke
+
+wandb:
+  enable: false

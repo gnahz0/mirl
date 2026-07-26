@@ -78,6 +78,59 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def _grid_aligned_mm_token_types(
+    input_ids: torch.Tensor,
+    image_token_id: int | None,
+    video_token_id: int | None,
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Label only visual-token runs backed by grids and expand timestamped videos.
+
+    Qwen3-VL's current video processor renders every temporal patch as a
+    separate timestamped ``video_token`` run, while returning one
+    ``video_grid_thw=[T,H,W]`` row for the whole video.  ``get_rope_index``
+    consumes one grid row per contiguous visual run, so passing the grid
+    through unchanged raises ``StopIteration`` for every video with ``T>1``.
+
+    Expand such grids to ``T`` rows of ``[1,H,W]``.  Limiting labels to the
+    number of grid-backed runs also prevents a generated visual special token
+    in the response from being mistaken for another media input.
+    """
+
+    token_types = torch.zeros_like(input_ids)
+
+    def mark_runs(token_id: int | None, modality: int, max_runs: int) -> int:
+        if token_id is None or max_runs <= 0:
+            return 0
+        mask = input_ids.eq(token_id)
+        run_starts = mask & ~torch.nn.functional.pad(mask[:, :-1], (1, 0), value=False)
+        run_ids = run_starts.cumsum(dim=1)
+        backed = mask & run_ids.le(max_runs)
+        token_types[backed] = modality
+        return int(run_starts.sum().item())
+
+    image_runs = int(image_grid_thw.shape[0]) if image_grid_thw is not None else 0
+    mark_runs(image_token_id, 1, image_runs)
+
+    position_video_grid = video_grid_thw
+    if video_grid_thw is not None:
+        video_count = int(video_grid_thw.shape[0])
+        temporal_count = int(video_grid_thw[:, 0].sum().item())
+        available_runs = mark_runs(video_token_id, 2, temporal_count)
+        if temporal_count > video_count and available_runs >= temporal_count:
+            expanded = []
+            for grid in video_grid_thw:
+                for _ in range(int(grid[0].item())):
+                    expanded.append(torch.stack((grid.new_tensor(1), grid[1], grid[2])))
+            position_video_grid = torch.stack(expanded)
+        else:
+            # Legacy Qwen2/2.5 prompts use one contiguous run per video.
+            mark_runs(video_token_id, 2, video_count)
+
+    return token_types, position_video_grid
+
+
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 
@@ -909,20 +962,22 @@ class AgentLoopWorker:
         if self.processor is None or not hasattr(self.processor, "get_rope_index"):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
-        multi_modal_kwargs = {
-            "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
-            "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
-        }
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+        multi_modal_kwargs = {"image_grid_thw": image_grid_thw, "video_grid_thw": video_grid_thw}
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
-            mm_token_type_ids = torch.zeros_like(input_ids)
             image_token_id = get_processor_token_id(self.processor, "image")
             video_token_id = get_processor_token_id(self.processor, "video")
-            if image_token_id is not None:
-                mm_token_type_ids[0][input_ids[0] == image_token_id] = 1
-            if video_token_id is not None:
-                mm_token_type_ids[0][input_ids[0] == video_token_id] = 2
+            mm_token_type_ids, position_video_grid = _grid_aligned_mm_token_types(
+                input_ids,
+                image_token_id,
+                video_token_id,
+                image_grid_thw,
+                video_grid_thw,
+            )
             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
+            multi_modal_kwargs["video_grid_thw"] = position_video_grid
 
         # Model's get_rope_index has been dynamically bind to the processor.
         vision_position_ids, _ = self.processor.get_rope_index(
