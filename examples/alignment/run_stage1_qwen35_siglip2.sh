@@ -24,7 +24,7 @@ set -e
 # name (e.g. `NUM_GPUS=1 ./run_...sh`).
 : "${NUM_GPUS:=2}"                       # GPUs to shard across (1 = single-GPU, >1 = torchrun DDP)
 : "${QWEN_VL_MAX_IMAGE_TOKENS:=512}"     # per-image visual tokens (1024 OOMs on H200)
-: "${VIDEO_MAX_FRAMES:=12}"              # frames sampled per video
+: "${VIDEO_MAX_FRAMES:=8}"               # frames sampled per video (8 = standard; faster steps)
 # CUDA_VISIBLE_DEVICES: leave unset to auto-pick 0..NUM_GPUS-1, or pin explicitly.
 # ===========================================================================
 

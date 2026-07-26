@@ -46,7 +46,7 @@ export WANDB_API_KEY="$(cat /work/mit/ppliang_mit/alecz/.wandb_key)"
 export WANDB_ENTITY="aleczhang-massachusetts-institute-of-technology"
 # New lineage for the unified SmellNet/ECG raster + NaN-filtered ECG population.
 # Do not append these metrics to an older pseudo-video run.
-export WANDB_RUN_ID="stage1-qwen35-siglip2-unified-grayscale-clean-v1"
+export WANDB_RUN_ID="stage1-qwen35-siglip2-standard-hparams-v2"
 export WANDB_RESUME="allow"
 
 # --- env ---
@@ -59,7 +59,7 @@ cd /work/mit/ppliang_mit/alecz/mirl-qwen35
 # 4-GPU DDP. YAML has 7,914 single-GPU optimizer steps for ~3 epochs over 168,848
 # rows at batch 64. Divide steps/warmup by four to preserve the sample budget.
 export NUM_GPUS=4
-CKPT=/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_siglip2_unified_grayscale_clean_v1
+CKPT=/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_siglip2_standard_hparams_v2
 mkdir -p "$CKPT"
 
 echo "==================================================================="
@@ -70,6 +70,6 @@ echo "==================================================================="
 
 bash examples/alignment/run_stage1_qwen35_siglip2.sh \
   train.total_steps=1977 \
-  train.warmup_steps=66 \
+  train.warmup_steps=100 \
   train.ckpt_every=250 \
   train.output_dir="$CKPT"

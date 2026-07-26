@@ -55,7 +55,7 @@ data:
     - haptic_tactile
   text_for_label: ground_truth  # ground_truth | question | question_plus_gt
   enable_videos: true           # also feed video-bearing samples through the trainable VE
-  max_video_frames: 12          # frames sampled per clip (subsampled across the whole video);
+  max_video_frames: 8           # frames sampled per clip (subsampled across the whole video);
                                 # dominant activation cost -> lower = less memory, faster steps.
                                 # Raised 8->12 now that gradient checkpointing (model.gradient_
                                 # checkpointing) recomputes VE activations in backward, which frees
@@ -145,7 +145,8 @@ train:
                           # COLD start (resume_from=null) for a clean new VE that learns the
                           # full modality set incl. the new ECG + haptic-tactile time series.
                           # Single cosine schedule: warmup 264 -> decay to 0 at step 7914.
-  grad_clip: 1.0
+  grad_clip: 5.0         # observed grad-norm runs ~5-7, so clip=1.0 throttled EVERY step ~5-7x.
+                         # 5.0 clips only true spikes (standard intent) and lets the VE actually move.
   resume_from: null          # cold start from the exact Qwen3.5 VE. Set to a
                              # checkpoint dir (e.g. outputs/alignment_stage1/final) to instead
                              # warm-start trainable weights (a cosine RESTART: only weights are

@@ -500,8 +500,13 @@ class MultimodalAlignmentModel(nn.Module):
         centered = x - median
         mad = centered.abs().median(dim=-1, keepdim=True).values / 0.6745
         std = x.std(dim=-1, keepdim=True, unbiased=False)
-        scale = (0.5 * mad + 0.5 * std).clamp_min(1e-6)
-        return torch.tanh(centered / (4.0 * scale))
+        # MAD-weighted blend: the whole point of MAD is outlier resistance, so weight it
+        # over std (0.7/0.3) instead of an even split that re-injects the std's spike sensitivity.
+        scale = (0.7 * mad + 0.3 * std).clamp_min(1e-6)
+        # 2.0 (was 4.0) uses more of the [-1,1] range: a +/-1 sigma sample now maps to
+        # tanh(0.5)~=0.46 instead of tanh(0.25)~=0.245, so the pseudo-image has real contrast
+        # while tanh still saturates genuine outliers.
+        return torch.tanh(centered / (2.0 * scale))
 
     @staticmethod
     def _pad_to(value: int, unit: int) -> int:
