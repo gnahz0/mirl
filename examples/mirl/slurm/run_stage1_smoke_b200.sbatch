@@ -1,37 +1,36 @@
 #!/bin/bash
-# Six-step end-to-end gate for the full Stage-1 B200 job.  The stratified
-# smoke dataset has 48 rows at batch size 8, so six steps exercise every row
-# (including scalar time series and tactile/video) once.
-# The production submission should depend on this job with --dependency=afterok:<jobid>.
+# Four-B200 mixed-media memory gate for the production batch shape.
 #SBATCH --job-name=mirl_s1_smoke
 #SBATCH --partition=b200-batch
 #SBATCH --account=ppliang_mit
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
-#SBATCH --time=01:00:00
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=512G
+#SBATCH --time=00:30:00
+#SBATCH --exclude=b0028,b0024,b0012
 #SBATCH --chdir=/tmp
-#SBATCH --output=/work/mit/ppliang_mit/alecz/logs/align_stage1_smoke_%j.out
-#SBATCH --error=/work/mit/ppliang_mit/alecz/logs/align_stage1_smoke_%j.out
+#SBATCH --output=/work/mit/ppliang_mit/alecz/mirl-qwen35/logs/stage1_smoke_%j.out
+#SBATCH --error=/work/mit/ppliang_mit/alecz/mirl-qwen35/logs/stage1_smoke_%j.out
 
 set -eo pipefail
 
-ROOT=/work/mit/ppliang_mit/alecz
-cd "$ROOT/mirl-qwen35"
-
-export HF_HOME="$ROOT/hf_cache"
+MIRL_CLUSTER_ROOT=/work/mit/ppliang_mit/alecz
+cd "$MIRL_CLUSTER_ROOT/mirl-qwen35"
+export HF_HOME="$MIRL_CLUSTER_ROOT/hf_cache"
 export HF_HUB_OFFLINE=1
-export PYTHONPATH="$ROOT/mirl-qwen35:${PYTHONPATH:-}"
-export QWEN_VL_MAX_IMAGE_TOKENS=512
-export VIDEO_MAX_FRAMES=4
-export TOKENIZERS_PARALLELISM=false
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TRANSFORMERS_OFFLINE=1
+export PYTHONNOUSERSITE=1
+export WANDB_MODE=disabled
+export TMPDIR=/scratch/dvdai_mit/alecz/tmp
+export TRITON_CACHE_DIR="$MIRL_CLUSTER_ROOT/.cache/triton"
+export TORCHINDUCTOR_CACHE_DIR="$MIRL_CLUSTER_ROOT/.cache/inductor"
+export MIRL_OUTPUT_DIR="/scratch/dvdai_mit/alecz/checkpoints/alignment_smoke_${SLURM_JOB_ID}"
+mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$MIRL_OUTPUT_DIR"
 
 source /home/dvdai_mit/miniconda3/etc/profile.d/conda.sh
-conda activate "$ROOT/envs/alec-mv"
+conda activate "$MIRL_CLUSTER_ROOT/envs/alec-mv"
 
-python -u -m mirl_ext.alignment.trainer \
-  --config mirl_ext/alignment/config/stage1_smoke.yaml \
-  train.val_every=0 \
-  train.output_dir=/scratch/dvdai_mit/alecz/checkpoints/alignment_smoke_unified_grayscale_clean_prelaunch_20260725
+CONFIG="$PWD/mirl_ext/alignment/config/stage1_smoke.yaml" \
+NUM_GPUS=4 \
+bash examples/alignment/run_stage1_qwen35_siglip2.sh

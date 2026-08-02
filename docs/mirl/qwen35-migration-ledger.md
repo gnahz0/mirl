@@ -137,7 +137,7 @@ count remains reproducible.
 | `examples/multiverse_trainer/combined_qwen3_eval.sh` | advanced phase (Stage 4) | Carry useful override semantics into the Qwen3.5 launcher. |
 | `examples/multiverse_trainer/combined_qwen3_training.sh` | advanced phase (Stage 4) | Carry the active six-family settings, image/token A/B mode, SP, offload, and bounded context settings. |
 | `verl/models/transformers/qwen3_vl.py` | superseded upstream | Audit the dummy-visual-forward fix against native Qwen3.5; do not copy it. |
-| `verl/trainer/ppo/ray_trainer.py` | advanced phase (Stage 3) | Generalize the dirty ECG macro-F1 implementation and test a hand-computed confusion matrix. |
+| `verl/trainer/ppo/ray_trainer.py` | advanced phase (Stage 3) | Generalize the dirty ECG macro-F1 implementation and test it on hand-computed predictions. |
 | `verl/utils/reward_score/ecg.py` | advanced phase (Stage 3) | Preserve corrected parsing/scoring behavior in extension tests. |
 
 Other untracked baseline inputs are also accounted for: `data` is a retired
@@ -170,9 +170,9 @@ path is **advanced phase (Stage 5)**; none is copied into upstream internals.
 ## Stage-1 alignment inventory
 
 The 22 unique paths touched between `origin/engaging_hb_climb_tact` and
-`origin/trained-ve` are all **advanced phase (Stage 5)**.  Alignment code will
-move below `mirl_ext.alignment`; the old `verl/trainer/alignment` subtree will
-not be restored.
+`origin/trained-ve` were originally classified as **advanced phase (Stage 5)**.
+The runnable Qwen3.5 port now lives below `mirl_ext.alignment`; the old
+`verl/trainer/alignment` subtree remains intentionally retired.
 
 | Historical Stage-1 path | Stage-5 target |
 |---|---|

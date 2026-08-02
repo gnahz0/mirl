@@ -29,10 +29,10 @@ historical Qwen3-VL fork to Qwen3.5. It is based on official verl commit
   stack. Temporary files, pip downloads, Ray sockets, and compiler caches live
   on `/scratch`, while source, logs, and Parquet indexes remain on `/work`.
 
-The default pipeline uses the existing image/video representation for all six
-families. The raw-signal actor-input path and Stage-1 visual alignment remain a
-separate migration phase; their historical Slurm files are preserved but are
-not runnable yet.
+The default GRPO pipeline still uses the existing image/video representation for
+all six families. Raw-signal Stage-1 visual alignment is now runnable as a
+separate Qwen3.5 pipeline under `mirl_ext.alignment`; exporting its trained visual
+tower into a full Qwen checkpoint for SFT/RL remains the next handoff step.
 
 Qwen3.5-9B interleaves Gated Delta Net and full-attention layers. The launcher
 therefore keeps padding removal and Ulysses sequence parallelism disabled, in
@@ -46,6 +46,7 @@ training sharding.
 | `mirl_ext/data/dataset.py` | Current verl dataset adapter and media limits |
 | `mirl_ext/data/build_smoke.py` | Deterministic eight-row fixture from real MIRL data |
 | `mirl_ext/rewards/` | Six reward implementations and combined dispatcher |
+| `mirl_ext/alignment/` | Qwen3.5 vision/SigLIP2 raw-signal alignment pipeline |
 | `examples/mirl/multiverse/run_qwen35_grpo.sh` | Local/allocation launcher |
 | `examples/mirl/slurm/run_combined_b200.sbatch` | Two-B200 one-step smoke submission |
 | `environments/mirl-qwen35/` | Rebuild script, verifier, and exact environment records |

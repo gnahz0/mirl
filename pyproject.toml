@@ -112,3 +112,6 @@ verl = [
   "trainer/config/*/*.yaml",
   "experimental/*/config/*.yaml",
 ]
+mirl_ext = [
+  "alignment/config/*.yaml",
+]

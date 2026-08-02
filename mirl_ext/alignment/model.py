@@ -1,38 +1,5 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Multimodal alignment model wrapper.
-
-Holds:
-    - ``trainable_visual``  : the exact Qwen3.5 ``model.visual`` tower (trainable).
-    - ``frozen_visual``     : an identical frozen copy (image-distillation teacher).
-    - ``label_text_model``  : the frozen SigLIP2-SO400M text tower used to encode labels.
-    - ``proj_visual`` / ``proj_text`` : heads into the shared contrastive dim (ts <-> text).
-    - ``log_logit_scale``  : learnable contrastive temperature.
-
-Losses (two):
-    - ``ts_text``     : InfoNCE between proj(trainable VE on signal pixels) and
-                        proj(SigLIP2 label text). This teaches the VE the new modality.
-    - ``distill_img`` : cosine distance between normalized raw VE features
-                        on images/videos -- no projection heads involved, so it directly
-                        anchors the VE outputs the LM tower will consume in Stage 2.
-
-Vision encoding details:
-    Qwen3.5's ``model.visual(pixel_values, grid_thw=image_grid_thw)`` returns a
-    ``BaseModelOutputWithPooling``. ``last_hidden_state`` contains the 1152-D
-    pre-merger patch states, while ``pooler_output`` contains the 4096-D post-merger
-    tokens that are injected into the language model. Alignment and distillation use
-    ``pooler_output``.
-    ``image_grid_thw`` rows are the processor's PRE-merge ``(t, h, w)``, so each
-    sample's row count is ``t * h * w / spatial_merge_size**2``. We split on those
-    counts and mean-pool per sample to ``[B, hidden]``.
-
-Time-series encoding:
-    Raw signals become merger-aligned pseudo-images or pseudo-videos in the exact
-    flattened layout of Qwen3.5's processor. There is no line plot, PIL conversion,
-    or separate time-series encoder.
-
-TODO(stage2): export the trained ``trainable_visual.state_dict()`` back into a full
-Qwen3.5 HF checkpoint and point veRL's ``actor_rollout_ref.model.path`` at it.
-"""
+"""Qwen3.5 vision alignment model with a frozen SigLIP2 text tower."""
 
 from __future__ import annotations
 
@@ -40,6 +7,7 @@ import copy
 import json
 import logging
 import math
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -48,9 +16,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .projection import ProjectionHead
+from .projection import GCMSProjectionHead, ProjectionHead
 
 logger = logging.getLogger(__name__)
+
+
+def temporal_crop(
+    signal: torch.Tensor | dict[str, torch.Tensor],
+    family: str,
+    steps: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    """Crop scalar signals randomly and tactile signals around peak pressure."""
+    steps = int(steps)
+    if family == "tactile":
+        length = int(signal["tactile"].shape[0])
+    else:
+        length = int(signal.shape[-1])
+    crop = min(steps, length)
+    max_start = length - crop
+
+    if family == "tactile":
+        pressure = torch.nan_to_num(signal["tactile"].float()).clamp_min(0)
+        peak = int(pressure.flatten(1).sum(dim=1).argmax())
+        start = min(max(0, peak - crop // 2), max_start)
+    else:
+        start = int(torch.randint(max_start + 1, (), generator=generator))
+
+    if isinstance(signal, dict):
+        return {key: value[start : start + crop] for key, value in signal.items()}
+    return signal[:, start : start + crop]
 
 
 def _resolve_snapshot(path_or_repo: str) -> Path:
@@ -69,14 +64,7 @@ def _load_exact_qwen35_visual(
     dtype: torch.dtype,
     attn_impl: str,
 ) -> nn.Module:
-    """Load only the native Qwen3.5 ``model.visual`` tensors.
-
-    Loading ``Qwen3_5ForConditionalGeneration`` just to retain ``model.visual`` would
-    temporarily materialize the entire 9B model. This loader instantiates the same
-    ``Qwen3_5VisionModel`` class and strictly loads the ``model.visual.*`` tensors from
-    the Qwen3.5 checkpoint. Strict loading is deliberate: an architecture or checkpoint
-    mismatch must fail instead of silently constructing a merely similar SigLIP tower.
-    """
+    """Load the native Qwen3.5 vision tower without materializing the 9B LM."""
     from safetensors import safe_open
     from transformers import AutoConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
@@ -90,9 +78,7 @@ def _load_exact_qwen35_visual(
     index_path = root / "model.safetensors.index.json"
     if index_path.exists():
         weight_map = json.loads(index_path.read_text())["weight_map"]
-        filenames = sorted(
-            {name for key, name in weight_map.items() if key.startswith("model.visual.")}
-        )
+        filenames = sorted({name for key, name in weight_map.items() if key.startswith("model.visual.")})
     elif (root / "model.safetensors").exists():
         filenames = ["model.safetensors"]
     else:
@@ -104,11 +90,6 @@ def _load_exact_qwen35_visual(
             for key in handle.keys():
                 if key.startswith("model.visual."):
                     state_dict[key.removeprefix("model.visual.")] = handle.get_tensor(key)
-                elif key.startswith("visual."):
-                    state_dict[key.removeprefix("visual.")] = handle.get_tensor(key)
-
-    if not state_dict:
-        raise RuntimeError(f"no model.visual tensors found in {root}")
     visual.load_state_dict(state_dict, strict=True)
     return visual
 
@@ -137,46 +118,8 @@ def _load_exact_siglip2_text(path_or_repo: str, *, dtype: torch.dtype) -> nn.Mod
             for key in handle.keys():
                 if key.startswith("text_model."):
                     state_dict[key] = handle.get_tensor(key)
-    if not state_dict:
-        raise RuntimeError(f"no text_model tensors found in {root}")
     text_model.load_state_dict(state_dict, strict=True)
     return text_model
-
-
-def _enable_block_checkpointing(visual: nn.Module) -> int:
-    """Wrap each vision transformer block's forward in non-reentrant activation
-    checkpointing and return the number of blocks wrapped.
-
-    Qwen3.5's vision ``forward`` loops over ``self.blocks`` directly and never
-    consults ``self.gradient_checkpointing``, so HF's built-in
-    ``gradient_checkpointing_enable()`` is a no-op for this tower. We patch the
-    bound ``forward`` on each block instead -- this adds NO submodules, so every
-    parameter name is preserved and existing checkpoints stay loadable. The
-    wrapper only checkpoints while the block is in training mode (auto-disabled
-    during eval/validation, where there is no backward pass to trade against).
-    """
-    import torch.utils.checkpoint as cp
-
-    blocks = getattr(visual, "blocks", None)
-    if blocks is None:
-        return 0
-    n = 0
-    for blk in blocks:
-        if getattr(blk, "_ckpt_wrapped", False):
-            continue
-        orig_forward = blk.forward
-
-        def make(orig, module):
-            def fwd(*args, **kwargs):
-                if module.training:
-                    return cp.checkpoint(orig, *args, use_reentrant=False, **kwargs)
-                return orig(*args, **kwargs)
-            return fwd
-
-        blk.forward = make(orig_forward, blk)
-        blk._ckpt_wrapped = True
-        n += 1
-    return n
 
 
 def _split_and_pool(
@@ -184,14 +127,7 @@ def _split_and_pool(
     grid_thw: torch.Tensor,
     merge_unit: int,
 ) -> torch.Tensor:
-    """flat_embeds: [sum_i n_i / merge_unit, hidden] -- the VE output is POST-merger,
-    so each sample contributes ``t*h*w / merge_unit`` rows (``grid_thw`` rows are the
-    processor's PRE-merge ``(t, h, w)``).
-
-    Returns: [B, hidden] mean-pooled per sample.
-    """
-    if flat_embeds.numel() == 0 or grid_thw is None or grid_thw.numel() == 0:
-        return flat_embeds.new_zeros((0, flat_embeds.shape[-1] if flat_embeds.ndim >= 1 else 1))
+    """Split post-merger tokens by ``grid_thw`` and mean-pool each sample."""
     counts = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2] // merge_unit).tolist()
     if sum(counts) != flat_embeds.shape[0]:
         raise ValueError(
@@ -201,30 +137,14 @@ def _split_and_pool(
     pooled = []
     start = 0
     for c in counts:
-        if c == 0:
-            pooled.append(flat_embeds.new_zeros(flat_embeds.shape[-1]))
-            continue
-        chunk = flat_embeds[start:start + c]
+        chunk = flat_embeds[start : start + c]
         pooled.append(chunk.mean(dim=0))
         start += c
     return torch.stack(pooled, dim=0)
 
 
 class MultimodalAlignmentModel(nn.Module):
-    """Stage 1 wrapper.
-
-    Args:
-        qwen35_path: HF id or local path for the full Qwen3.5 checkpoint.
-        siglip2_text_path: HF id or local path for the paired SigLIP2-SO400M
-            checkpoint. Only its text tower is retained.
-        shared_dim: projection output dim.
-        proj_hidden_dim: projection MLP hidden width.
-        visual_dtype: dtype for both VEs (bf16 strongly recommended).
-        attn_impl: attention implementation used by the Qwen3.5 vision towers.
-        ts_representation: ``image`` for all merger-aware pseudo-images, ``video``
-            for all pseudo-videos, or ``hybrid`` (direct-value pseudo-images for
-            SmellNet/ECG and native pseudo-video for spatial tactile frames).
-    """
+    """Trainable Qwen vision tower, frozen image anchor, and SigLIP2 text tower."""
 
     def __init__(
         self,
@@ -235,163 +155,119 @@ class MultimodalAlignmentModel(nn.Module):
         proj_dropout: float = 0.0,
         visual_dtype: torch.dtype = torch.bfloat16,
         attn_impl: str = "sdpa",
-        gradient_checkpointing: bool = False,
-        ts_representation: str = "hybrid",
+        ecg_normalization: str = "robust",
+        tactile_delta_channels: bool = False,
+        gcms_input_dim: Optional[int] = None,
+        contrastive_temperature: float = 0.07,
     ):
         super().__init__()
-        from transformers import (
-            AutoProcessor,
-            AutoTokenizer,
-        )
+        from transformers import AutoProcessor, AutoTokenizer
 
-        import time as _time
-
-        # ---- Qwen3.5 processor (shared between trainable & frozen VE) ----
         logger.info("[1/4] loading Qwen3.5 processor from %s", qwen35_path)
-        _t = _time.time()
+        started = time.time()
         qwen_root = _resolve_snapshot(qwen35_path)
         self.qwen_processor = AutoProcessor.from_pretrained(qwen_root, local_files_only=True)
-        logger.info("       processor ready (%.1fs)", _time.time() - _t)
+        logger.info("       processor ready (%.1fs)", time.time() - started)
 
-        # ---- Trainable VE: exact native model.visual class and checkpoint tensors ----
-        logger.info("[2/4] loading exact Qwen3.5 model.visual weights (dtype=%s, attn=%s)",
-                    visual_dtype, attn_impl)
-        _t = _time.time()
+        logger.info("[2/4] loading exact Qwen3.5 model.visual weights (dtype=%s, attn=%s)", visual_dtype, attn_impl)
+        started = time.time()
         self.trainable_visual = _load_exact_qwen35_visual(
-            str(qwen_root), dtype=visual_dtype, attn_impl=attn_impl,
+            str(qwen_root),
+            dtype=visual_dtype,
+            attn_impl=attn_impl,
         )
-        logger.info("       trainable VE ready: %.1fM params (%.1fs)",
-                    sum(p.numel() for p in self.trainable_visual.parameters()) / 1e6,
-                    _time.time() - _t)
-
-        # ---- Frozen reference VE (right): identical weights, requires_grad=False ----
-        logger.info("[3/4] cloning frozen reference vision encoder (deepcopy on CPU)")
-        _t = _time.time()
-        self.frozen_visual = copy.deepcopy(self.trainable_visual)
-        for p in self.frozen_visual.parameters():
-            p.requires_grad_(False)
-        self.frozen_visual.eval()
-        logger.info("       frozen VE ready (%.1fs)", _time.time() - _t)
-
-        # Gradient checkpointing on the TRAINABLE VE only (frozen runs under no_grad,
-        # so there is nothing to checkpoint). Applied AFTER the frozen deepcopy so the
-        # frozen tower keeps its clean, un-patched forward.
-        self.gradient_checkpointing = bool(gradient_checkpointing)
-        if self.gradient_checkpointing:
-            n_ckpt = _enable_block_checkpointing(self.trainable_visual)
-            logger.info("       gradient checkpointing ON: wrapped %d trainable VE blocks", n_ckpt)
-
-        qwen_hidden = self._infer_qwen_visual_hidden(self.trainable_visual)
-
-        # Patch geometry needed to format raw signals exactly like image inputs
-        # (signal channels -> patch rows, time -> patch columns).
-        vcfg = getattr(self.trainable_visual, "config", None)
-        self.vit_patch_size = int(getattr(vcfg, "patch_size", 16))
-        self.vit_merge_size = int(getattr(vcfg, "spatial_merge_size", 2))
-        self.vit_temporal_patch_size = int(getattr(vcfg, "temporal_patch_size", 2))
         logger.info(
-            "[ts] signal-as-image formatting: patch_size=%d merge_size=%d temporal_patch_size=%d",
-            self.vit_patch_size, self.vit_merge_size, self.vit_temporal_patch_size,
+            "       trainable VE ready: %.1fM params (%.1fs)",
+            sum(p.numel() for p in self.trainable_visual.parameters()) / 1e6,
+            time.time() - started,
         )
 
-        # ---- SigLIP2 label-text encoder (frozen) ----
-        #
-        # Qwen3.5's native visual tower has the SigLIP2-SO400M architecture and was
-        # initialized from those weights, but Qwen subsequently VL-trained it. The
-        # original paired SigLIP2 text tower is therefore the closest contrastive text
-        # teacher, not an assertion that its final space is identical to Qwen3.5's.
-        # Learned projection heads bridge that expected drift.
+        logger.info("[3/4] cloning frozen reference vision encoder (deepcopy on CPU)")
+        started = time.time()
+        self.frozen_visual = copy.deepcopy(self.trainable_visual)
+        self.frozen_visual.requires_grad_(False).eval()
+        logger.info("       frozen VE ready (%.1fs)", time.time() - started)
+
+        qwen_hidden = int(self.trainable_visual.config.out_hidden_size)
+
+        vcfg = self.trainable_visual.config
+        self.vit_patch_size = int(vcfg.patch_size)
+        self.vit_merge_size = int(vcfg.spatial_merge_size)
+        self.vit_temporal_patch_size = int(vcfg.temporal_patch_size)
+        logger.info(
+            "[ts] signal-video formatting: patch_size=%d merge_size=%d temporal_patch_size=%d",
+            self.vit_patch_size,
+            self.vit_merge_size,
+            self.vit_temporal_patch_size,
+        )
+
         logger.info("[4/4] loading SigLIP2 label-text encoder %s", siglip2_text_path)
-        _t = _time.time()
+        started = time.time()
         siglip_root = _resolve_snapshot(siglip2_text_path)
         self.label_tokenizer = AutoTokenizer.from_pretrained(siglip_root, local_files_only=True)
-        self.label_text_model = _load_exact_siglip2_text(
-            str(siglip_root), dtype=visual_dtype
-        )
-        for p in self.label_text_model.parameters():
-            p.requires_grad_(False)
-        self.label_text_model.eval()
+        self.label_text_model = _load_exact_siglip2_text(str(siglip_root), dtype=visual_dtype)
+        self.label_text_model.requires_grad_(False).eval()
         label_hidden = self.label_text_model.config.projection_size
         logger.info(
             "       SigLIP2 text ready: hidden=%d (%.1fs)",
             label_hidden,
-            _time.time() - _t,
+            time.time() - started,
         )
 
-        # ---- Projection heads (2 total; contrastive space only) ----
-        # The ts contrastive loss compares the trainable VE output (at ``qwen_hidden``)
-        # with SigLIP2 text. Distillation happens on RAW VE features (no projection), so
-        # no head is needed for the frozen reference VE.
         self.proj_visual = ProjectionHead(qwen_hidden, shared_dim, proj_hidden_dim, proj_dropout)
         self.proj_text = ProjectionHead(label_hidden, shared_dim, proj_hidden_dim, proj_dropout)
+        self.proj_gcms = (
+            GCMSProjectionHead(int(gcms_input_dim), shared_dim)
+            if gcms_input_dim is not None
+            else None
+        )
 
-        # ---- Learnable contrastive temperature ----
-        self.log_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
+        self.tactile_delta_channels = bool(tactile_delta_channels)
+        self.log_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / contrastive_temperature)))
 
         self.shared_dim = shared_dim
-        self.qwen_hidden = qwen_hidden
-        self.label_hidden = label_hidden
-        self.visual_dtype = visual_dtype
-        if ts_representation not in {"image", "video", "hybrid"}:
-            raise ValueError(
-                "ts_representation must be one of 'image', 'video', or 'hybrid', "
-                f"got {ts_representation!r}"
-            )
-        self.ts_representation = ts_representation
+        self.ecg_normalization = ecg_normalization
 
-    # -------------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _infer_qwen_visual_hidden(visual_module: nn.Module) -> int:
-        """The Qwen3.5 visual tower exposes its output dim via config.out_hidden_size
-        (post merger). Fall back to inspecting the merger head if needed."""
-        cfg = getattr(visual_module, "config", None)
-        if cfg is not None:
-            for attr in ("out_hidden_size", "hidden_size"):
-                if hasattr(cfg, attr):
-                    return int(getattr(cfg, attr))
-        for name, mod in visual_module.named_modules():
-            if isinstance(mod, nn.Linear) and "merger" in name:
-                return mod.out_features
-        raise RuntimeError("could not infer Qwen3.5 visual output dim")
-
-    def trainable_parameter_groups(self, lr: float, weight_decay: float, head_lr: Optional[float] = None):
-        """Param groups for the optimizer. Frozen VE and label text encoder are excluded.
-
-        Two LR tiers:
-          * the pretrained Qwen3.5 ViT (``trainable_visual.*``) trains at ``lr``;
-          * the from-scratch modules (proj_visual/text, logit_scale) train at
-            ``head_lr`` (defaults to ``lr`` if not given).
-        Bias / LayerNorm / Norm params get weight_decay=0 (standard practice).
-        """
+    def trainable_parameter_groups(
+        self,
+        lr: float,
+        weight_decay: float,
+        head_lr: Optional[float] = None,
+        scalar_lr: Optional[float] = None,
+    ):
+        """Build ViT, projection-head, and scalar optimizer tiers."""
         head_lr = lr if head_lr is None else head_lr
+        scalar_lr = head_lr if scalar_lr is None else scalar_lr
         groups = {
-            ("vit", "decay"): [], ("vit", "no_decay"): [],
-            ("head", "decay"): [], ("head", "no_decay"): [],
+            ("vit", "decay"): [],
+            ("vit", "no_decay"): [],
+            ("head", "decay"): [],
+            ("head", "no_decay"): [],
+            ("scalar", "no_decay"): [],
         }
         for p_name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
+            if p.ndim == 0:
+                groups[("scalar", "no_decay")].append(p)
+                continue
             tier = "vit" if p_name.startswith("trainable_visual.") else "head"
-            no_decay = p.ndim == 1 or p_name.endswith(".bias") or "logit_scale" in p_name
+            no_decay = p.ndim <= 1 or p_name.endswith(".bias")
             groups[(tier, "no_decay" if no_decay else "decay")].append(p)
-        lr_for = {"vit": lr, "head": head_lr}
+        lr_for = {"vit": lr, "head": head_lr, "scalar": scalar_lr}
         out = []
         for (tier, kind), params in groups.items():
             if not params:
                 continue
-            out.append({
-                "params": params,
-                "lr": lr_for[tier],
-                "weight_decay": weight_decay if kind == "decay" else 0.0,
-            })
+            out.append(
+                {
+                    "name": f"{tier}_{kind}",
+                    "params": params,
+                    "lr": lr_for[tier],
+                    "weight_decay": weight_decay if kind == "decay" else 0.0,
+                }
+            )
         return out
-
-    # -------------------------------------------------------------------------
-    # Branch encoders
-    # -------------------------------------------------------------------------
 
     def _encode_qwen_branch(
         self,
@@ -400,173 +276,78 @@ class MultimodalAlignmentModel(nn.Module):
         *,
         visual: nn.Module,
         no_grad: bool,
+        pool: bool = True,
     ) -> torch.Tensor:
-        """Return ``[B, 4096]`` means of Qwen3.5's post-merger visual tokens."""
-        if pixel_values.numel() == 0 or image_grid_thw.numel() == 0:
-            return pixel_values.new_zeros((0, self.qwen_hidden))
-        pixel_values = pixel_values.to(dtype=visual.dtype if hasattr(visual, "dtype") else self.visual_dtype)
+        """Return Qwen3.5 post-merger tokens, optionally mean-pooled per sample."""
+        pixel_values = pixel_values.to(dtype=next(visual.parameters()).dtype)
         ctx = torch.no_grad() if no_grad else nullcontext()
         with ctx:
             output = visual(pixel_values, grid_thw=image_grid_thw)
             embeds = output.pooler_output
-        return _split_and_pool(embeds, image_grid_thw, self.vit_merge_size ** 2)
+        if not pool:
+            return embeds
+        return _split_and_pool(embeds, image_grid_thw, self.vit_merge_size**2)
 
-    def encode_images_trainable(self, pixel_values, image_grid_thw) -> torch.Tensor:
-        return self._encode_qwen_branch(
-            pixel_values, image_grid_thw, visual=self.trainable_visual, no_grad=False
-        )
+    def encode_visual(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        *,
+        frozen: bool = False,
+        pool: bool = True,
+    ) -> torch.Tensor:
+        visual = self.frozen_visual if frozen else self.trainable_visual
+        return self._encode_qwen_branch(pixel_values, grid_thw, visual=visual, no_grad=frozen, pool=pool)
 
-    def encode_images_frozen(self, pixel_values, image_grid_thw) -> torch.Tensor:
-        return self._encode_qwen_branch(
-            pixel_values, image_grid_thw, visual=self.frozen_visual, no_grad=True
-        )
-
-    # Videos use the same Qwen3.5 visual tower; the only thing that changes is
-    # ``grid_thw[:, 0] > 1`` (multiple frames per clip). We keep these as separate
-    # methods so the trainer reads more naturally and we have a hook point if we
-    # ever want video-specific pooling.
-    def encode_videos_trainable(self, pixel_values_videos, video_grid_thw) -> torch.Tensor:
-        return self._encode_qwen_branch(
-            pixel_values_videos, video_grid_thw, visual=self.trainable_visual, no_grad=False
-        )
-
-    def encode_videos_frozen(self, pixel_values_videos, video_grid_thw) -> torch.Tensor:
-        return self._encode_qwen_branch(
-            pixel_values_videos, video_grid_thw, visual=self.frozen_visual, no_grad=True
-        )
-
-    # ---- Time-series path: merger-aware pseudo-image / pseudo-video -----------------
-
-    def _patchify_pseudo_image(
-        self, img: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Carve a pseudo-image ``(B, 3, H, W)`` into Qwen patches.
-
-        ``H`` and ``W`` must already be divisible by ``patch_size * merge_size``.
-        Reproduces the exact flatten layout of Qwen3.5's image processor
-        (temporal replicate, split H/W into ``(grid//merge, merge, patch)``, flatten
-        per patch) so signals and real images share the ``(pixel_values, grid_thw)``
-        interface.
-
-        Returns:
-            pixel_values: ``[B * grid_h * grid_w, 3 * temporal_patch_size * patch_size**2]``
-            grid_thw:     ``[B, 3]`` rows of ``(1, grid_h=H/patch, grid_w=W/patch)``
-        """
-        tp = self.vit_temporal_patch_size
-        video = img.unsqueeze(1).expand(-1, tp, -1, -1, -1)
-        return self._patchify_pseudo_video(video)
-
-    def _patchify_pseudo_video(
-        self, video: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Patchify ``(B,F,3,H,W)`` exactly like Qwen3.5's video processor.
-
-        Consecutive pairs are fused by the native ``temporal_patch_size=2`` Conv3d
-        kernel before the spatial 2x2 merger. An odd final frame is repeated, matching
-        the processor's temporal padding behavior.
-        """
+    def _patchify_pseudo_video(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Patchify ``(B,F,3,H,W)`` like Qwen3.5, padding an odd final frame."""
         p, m, tp = self.vit_patch_size, self.vit_merge_size, self.vit_temporal_patch_size
-        b, frames, channels, H, W = video.shape
-        if channels != 3 or frames < 1:
-            raise ValueError(f"expected non-empty (B,F,3,H,W) video, got {tuple(video.shape)}")
-        if H % (p * m) or W % (p * m):
-            raise ValueError(f"video H/W must be divisible by {p * m}, got {(H, W)}")
+        batch, frames, _, height, width = video.shape
         if frames % tp:
-            video = torch.cat((video, video[:, -1:].expand(-1, tp - frames % tp, -1, -1, -1)), dim=1)
+            padding = video[:, -1:].expand(-1, tp - frames % tp, -1, -1, -1)
+            video = torch.cat((video, padding), dim=1)
             frames = video.shape[1]
 
-        grid_t, grid_h, grid_w = frames // tp, H // p, W // p
-        patches = video.reshape(
-            b, grid_t, tp, 3, grid_h // m, m, p, grid_w // m, m, p
-        )
+        grid_t, grid_h, grid_w = frames // tp, height // p, width // p
+        patches = video.reshape(batch, grid_t, tp, 3, grid_h // m, m, p, grid_w // m, m, p)
         patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
-        pixel_values = patches.reshape(b * grid_t * grid_h * grid_w, 3 * tp * p * p)
+        pixel_values = patches.reshape(batch * grid_t * grid_h * grid_w, 3 * tp * p * p)
         grid_thw = torch.tensor(
-            [[grid_t, grid_h, grid_w]] * b, device=video.device, dtype=torch.long
+            [[grid_t, grid_h, grid_w]] * batch,
+            device=video.device,
+            dtype=torch.long,
         )
         return pixel_values, grid_thw
 
     @staticmethod
     def _robust_normalize_rows(x: torch.Tensor) -> torch.Tensor:
-        """TimeOmni-style robust fidelity normalization, independently per row.
-
-        The median/MAD component resists sparse pressure spikes and sensor outliers,
-        while the standard-deviation component still represents broad variation.
-        ``tanh`` maps directly to the ``[-1, 1]`` range Qwen's image normalization
-        normally produces, without a PIL/uint8 quantization round trip.
-        """
+        """Normalize each row with a median/MAD/std blend into ``[-1, 1]``."""
         x = torch.nan_to_num(x.float())
         median = x.median(dim=-1, keepdim=True).values
         centered = x - median
         mad = centered.abs().median(dim=-1, keepdim=True).values / 0.6745
         std = x.std(dim=-1, keepdim=True, unbiased=False)
-        # MAD-weighted blend: the whole point of MAD is outlier resistance, so weight it
-        # over std (0.7/0.3) instead of an even split that re-injects the std's spike sensitivity.
-        scale = (0.7 * mad + 0.3 * std).clamp_min(1e-6)
-        # 2.0 (was 4.0) uses more of the [-1,1] range: a +/-1 sigma sample now maps to
-        # tanh(0.5)~=0.46 instead of tanh(0.25)~=0.245, so the pseudo-image has real contrast
-        # while tanh still saturates genuine outliers.
-        return torch.tanh(centered / (2.0 * scale))
+        mad_blend, tanh_gain = 0.7, 2.0
+        scale = (mad_blend * mad + (1.0 - mad_blend) * std).clamp_min(1e-6)
+        return torch.tanh(centered / (tanh_gain * scale))
 
     @staticmethod
-    def _pad_to(value: int, unit: int) -> int:
-        return ((int(value) + unit - 1) // unit) * unit
-
-    def _timeseries_to_pixel_inputs(
-        self, signal: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply one unified direct-value raster to any scalar-channel ``(C,T)`` series.
-
-        Consecutive samples snake through one merger-cell-high band per channel.
-        Every timestep occupies exactly one pixel (no plotting, interpolation,
-        downsampling, or modality-specific period estimation), neighboring columns
-        reverse direction to keep the 1-D path spatially continuous, and semantic
-        channels never share a post-merger token.
-
-        A 32x32 merger cell carries at most 1024 timesteps from one channel. Longer
-        sequences grow horizontally in complete 32px blocks. Thus native SmellNet and
-        ECG use exactly the same normalization, grayscale intensity, packing rule, padding, and
-        Qwen patch/merger contract; only ``C`` and ``T`` differ.
-        """
-        cell = self.vit_patch_size * self.vit_merge_size
-        finite = torch.isfinite(signal)
-        raw = torch.nan_to_num(signal.float())
-        value = self._robust_normalize_rows(raw)
-        value = value.masked_fill(~finite, -1.0)
-
-        channels, steps = value.shape
-        packed_cols = math.ceil(steps / cell)
-        width = self._pad_to(packed_cols, cell)
-        # Exact -1 is the padding/missing sentinel. The same scalar intensity is
-        # repeated over RGB so Qwen sees a grayscale numerical image rather than
-        # three unrelated engineered feature planes.
-        img = value.new_full((3, channels * cell, width), -1.0)
-
-        time_idx = torch.arange(steps, device=value.device)
-        cols = time_idx // cell
-        phase = time_idx % cell
-        rows = torch.where(cols.remainder(2) == 0, phase, cell - 1 - phase)
-        for channel in range(channels):
-            raster_rows = channel * cell + rows
-            img[:, raster_rows, cols] = value[channel].unsqueeze(0).expand(3, -1)
-        return self._patchify_pseudo_image(img.unsqueeze(0))
-
-    def _smell_to_pixel_inputs(self, signal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._timeseries_to_pixel_inputs(signal)
+    def _normalize_scalar_rows(x: torch.Tensor, mode: str = "robust") -> torch.Tensor:
+        """Map robust or already-standardized scalar rows to ``[-1, 1]``."""
+        if mode == "robust":
+            return MultimodalAlignmentModel._robust_normalize_rows(x)
+        if mode == "prestandardized":
+            return torch.nan_to_num(x.float()).clamp(-4.0, 4.0) / 4.0
+        raise ValueError(f"unknown scalar normalization mode {mode!r}")
 
     def _timeseries_to_video_inputs(
-        self, signal: torch.Tensor
+        self, signal: torch.Tensor, normalization: str = "robust"
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Use each fixed 32-step scalar-series window as one pseudo-video frame.
-
-        A temporal patch fuses two adjacent windows, then the 2x2 merger emits one
-        token per channel. This is a frequency-free all-video ablation shared by ECG
-        and SmellNet; the default hybrid path uses the denser scalar pseudo-image.
-        """
+        """Pack each merger-cell-width signal window as one video frame."""
         cell = self.vit_patch_size * self.vit_merge_size
         finite = torch.isfinite(signal)
         raw = torch.nan_to_num(signal.float())
-        value = self._robust_normalize_rows(raw)
+        value = self._normalize_scalar_rows(raw, normalization)
         value = value.masked_fill(~finite, -1.0)
 
         channels, steps = value.shape
@@ -579,47 +360,30 @@ class MultimodalAlignmentModel(nn.Module):
             frames[frame, :, :, :length] = tile.unsqueeze(0).expand(3, -1, -1)
         return self._patchify_pseudo_video(frames.unsqueeze(0))
 
-    def _ecg_to_pixel_inputs(self, signal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._timeseries_to_pixel_inputs(signal)
-
-    def _smell_to_video_inputs(self, signal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._timeseries_to_video_inputs(signal)
-
-    def _ecg_to_video_inputs(self, signal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._timeseries_to_video_inputs(signal)
-
-    def _tactile_frame_tiles(
-        self, payload: dict[str, torch.Tensor] | torch.Tensor
-    ) -> torch.Tensor:
-        """Build ``(T,3,32,64)`` tactile+right-force frame tiles."""
+    def _tactile_frame_tiles(self, payload: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Build ``(T,3,S,2S)`` tactile/force tiles at merger-cell resolution."""
         side = self.vit_patch_size * self.vit_merge_size
-        if isinstance(payload, dict):
-            tac = payload["tactile"]
-            force = payload.get("force")
-        else:
-            tac = payload
-            force = None
+        tac = payload["tactile"]
+        force = payload.get("force")
         finite = torch.isfinite(tac)
         raw = torch.nan_to_num(tac.float())
-        # Tactile taxels share a physical unit and form one pressure surface. A single
-        # recording-level scale preserves relative pressure across the 16x16 contact
-        # map; normalizing each taxel independently would erase that spatial signal.
+        # One recording-level scale preserves relative pressure across the taxel map.
         value = self._robust_normalize_rows(raw.reshape(1, -1)).reshape_as(raw)
         value = value.masked_fill(~finite, -1.0)
         value = F.interpolate(value.unsqueeze(1), size=(side, side), mode="nearest").squeeze(1)
 
         frame_count = value.shape[0]
-        tactile_frames = value.unsqueeze(1).expand(-1, 3, -1, -1).clone()
+        if self.tactile_delta_channels:
+            delta = torch.zeros_like(value)
+            delta[1:] = (value[1:] - value[:-1]) * 0.5
+            tactile_frames = torch.stack((value, delta, value), dim=1)
+        else:
+            tactile_frames = value.unsqueeze(1).expand(-1, 3, -1, -1).clone()
 
-        # The adjacent 32x32 cell carries the 13 right-hand force summaries. v2's
-        # left-hand columns were filtered by the loader so its schema matches v1.
+        # The adjacent merger cell carries the right-hand force summaries.
         force_frames = value.new_full((frame_count, 3, side, side), -1.0)
         if force is not None and force.numel() > 0:
             force = force.float()
-            if force.shape[0] != frame_count:
-                raise ValueError(
-                    f"tactile/force frame mismatch: {frame_count} vs {force.shape[0]}"
-                )
             force_finite = torch.isfinite(force)
             force_raw = torch.nan_to_num(force)
             force_value = self._robust_normalize_rows(force_raw.t()).t()
@@ -629,39 +393,12 @@ class MultimodalAlignmentModel(nn.Module):
                 row_start = channel * side // num_force
                 row_end = (channel + 1) * side // num_force
                 encoded = force_value[:, channel, None, None, None]
-                force_frames[:, :, row_start:row_end] = encoded.expand(
-                    -1, 3, row_end - row_start, side
-                )
+                force_frames[:, :, row_start:row_end] = encoded.expand(-1, 3, row_end - row_start, side)
 
         return torch.cat((tactile_frames, force_frames), dim=-1)
 
-    def _tactile_to_pixel_inputs(
-        self, payload: dict[str, torch.Tensor] | torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Map tactile+force frame tiles to a serpentine contact sheet."""
-        side = self.vit_patch_size * self.vit_merge_size
-        frame_tiles = self._tactile_frame_tiles(payload)
-        frame_count = frame_tiles.shape[0]
-        cols = max(1, math.ceil(math.sqrt(frame_count / 2)))
-        rows = math.ceil(frame_count / cols)
-        img = frame_tiles.new_full((3, rows * side, cols * side * 2), -1.0)
-        for frame in range(frame_count):
-            row = frame // cols
-            offset = frame % cols
-            col = offset if row % 2 == 0 else cols - 1 - offset
-            rs, cs = row * side, col * side * 2
-            img[:, rs : rs + side, cs : cs + side * 2] = frame_tiles[frame]
-        return self._patchify_pseudo_image(img.unsqueeze(0))
-
-    def _tactile_to_video_inputs(
-        self, payload: dict[str, torch.Tensor] | torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Feed tactile+force tiles through Qwen3.5's native temporal patch path.
-
-        Each source frame contributes two spatial merger cells (right tactile map and
-        right-force summary). The temporal kernel combines adjacent frame pairs, yielding
-        two 4096-D tokens per pair.
-        """
+    def _tactile_to_video_inputs(self, payload: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Feed tactile and force tiles through Qwen's temporal patch path."""
         frames = self._tactile_frame_tiles(payload)
         return self._patchify_pseudo_video(frames.unsqueeze(0))
 
@@ -670,52 +407,26 @@ class MultimodalAlignmentModel(nn.Module):
         signals: list[torch.Tensor | dict[str, torch.Tensor]],
         formats: list[str],
         device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Optional[torch.Tensor]:
-        """Encode a list of native-shape signals through the trainable VE (with grad).
-
-        ``signals`` and ``formats`` are parallel lists from the collator. Each sample is
-        formatted to its own ``(pixel_values, grid_thw)`` (the same direct-value
-        channel raster for ``smell``/``ecg``, spatial frames for ``tactile``), then
-        all are concatenated so the VE runs once and the batch can mix native shapes.
-        Returns ``[N, qwen_hidden]`` (or ``None``).
-        """
-        if not signals:
-            return None
+    ) -> torch.Tensor:
+        """Render mixed native-shape signals and encode them in one vision pass."""
         dev = device or next(self.trainable_visual.parameters()).device
         pvs, grids = [], []
-        for sig, fmt in zip(signals, formats):
+        for sig, fmt in zip(signals, formats, strict=True):
             s = (
                 {key: value.to(device=dev) for key, value in sig.items()}
                 if isinstance(sig, dict)
                 else sig.to(device=dev)
             )
-            use_video = self.ts_representation == "video" or (
-                self.ts_representation == "hybrid" and fmt == "tactile"
-            )
             if fmt == "tactile":
-                pv, g = (
-                    self._tactile_to_video_inputs(s)
-                    if use_video
-                    else self._tactile_to_pixel_inputs(s)
-                )
-            elif fmt == "ecg":
-                pv, g = self._ecg_to_video_inputs(s) if use_video else self._ecg_to_pixel_inputs(s)
-            elif fmt == "smell":
-                pv, g = (
-                    self._smell_to_video_inputs(s)
-                    if use_video
-                    else self._smell_to_pixel_inputs(s)
-                )
+                pv, g = self._tactile_to_video_inputs(s)
             else:
-                raise ValueError(f"unknown time-series format {fmt!r}")
+                normalization = self.ecg_normalization if fmt == "ecg" else "robust"
+                pv, g = self._timeseries_to_video_inputs(s, normalization=normalization)
             pvs.append(pv)
             grids.append(g)
         pixel_values = torch.cat(pvs, dim=0)
         grid_thw = torch.cat(grids, dim=0)
-        return self._encode_qwen_branch(
-            pixel_values, grid_thw, visual=self.trainable_visual, no_grad=False
-        )
+        return self._encode_qwen_branch(pixel_values, grid_thw, visual=self.trainable_visual, no_grad=False)
 
     @torch.no_grad()
     def encode_text(
@@ -724,11 +435,8 @@ class MultimodalAlignmentModel(nn.Module):
         device: torch.device,
         max_length: Optional[int] = None,
     ) -> torch.Tensor:
-        if not texts:
-            return torch.zeros((0, self.label_hidden), device=device)
         max_length = max_length or int(self.label_text_model.config.max_position_embeddings)
-        # SigLIP2 was trained with fixed-length padding, and its pooler reads the final
-        # token. Using padding="max_length" is therefore part of the model contract.
+        # SigLIP2's pooler reads the final token, so fixed-length padding is required.
         toks = self.label_tokenizer(
             texts,
             padding="max_length",
@@ -739,26 +447,11 @@ class MultimodalAlignmentModel(nn.Module):
         out = self.label_text_model(**toks)
         return out.pooler_output
 
-    # -------------------------------------------------------------------------
-    # Projection + normalize convenience
-    # -------------------------------------------------------------------------
-
     @staticmethod
     def _norm(x: torch.Tensor) -> torch.Tensor:
-        """L2-normalize with a *generous* epsilon floor.
-
-        Default ``F.normalize`` uses eps=1e-12 which is fine for fp32 but blows up
-        in mixed precision: low-magnitude feature vectors can collapse to ||x|| << 1e-6
-        after the visual encoder, giving 1e-6 / 1e-12 = 1e6-scale vectors that overflow
-        downstream. eps=1e-6 keeps gradients well-conditioned without changing
-        the unit-norm property for any feature with reasonable magnitude.
-        """
+        """L2-normalize with a mixed-precision-safe epsilon."""
         return F.normalize(x, dim=-1, eps=1e-6) if x.numel() > 0 else x
 
-    def project(self, head: ProjectionHead, x: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0:
-            return x.new_zeros((0, self.shared_dim))
-        # Cast to fp32 explicitly so the entire projection runs in full precision
-        # regardless of the visual encoder's dtype (avoids bf16 underflow in MLP).
+    def project(self, head: nn.Module, x: torch.Tensor) -> torch.Tensor:
         x = x.to(next(head.parameters()).dtype)
         return self._norm(head(x))

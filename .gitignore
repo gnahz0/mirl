@@ -131,3 +131,9 @@ logs
 log
 outputs
 .history
+
+# MIRL SFT trace data (never commit — it is data, and it is regenerable)
+data/sft/
+
+# staged plot PNGs for grounded SFT generation (regenerable from /scratch)
+data/sft/ts_images/

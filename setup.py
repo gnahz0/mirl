@@ -98,6 +98,7 @@ setup(
             "trainer/config/*/*.yaml",
             "experimental/*/config/*.yaml",
         ],
+        "mirl_ext": ["alignment/config/*.yaml"],
     },
     include_package_data=True,
     long_description=long_description,
