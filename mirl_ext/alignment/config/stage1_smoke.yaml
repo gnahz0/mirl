@@ -20,12 +20,12 @@ data:
   exclude_data_sources: [smellnet_mixture]
   include_all_ts: false
   max_train_samples: 320
-  ts_per_family_per_batch: 4
+  ts_per_family_per_batch: 2
   val_ts_per_family_per_batch: 10
   text_for_label: ground_truth
   tactile_label_mode: stem_task_pair
   enable_videos: true
-  max_video_frames: 4
+  max_video_frames: 8
   image_patch_size: 16
   tactile_max_frames: 64
   temporal_crop_steps:
@@ -53,8 +53,8 @@ loss_weights:
   distill_img: 1.0
 
 train:
-  batch_size: 32
-  grad_accum_steps: 2
+  batch_size: 16
+  grad_accum_steps: 4
   num_workers: 0
   lr: 1.0e-5
   head_lr: 1.0e-5

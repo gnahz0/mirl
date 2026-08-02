@@ -25,11 +25,11 @@ data:
   exclude_data_sources: [smellnet_mixture]
   include_all_ts: true
 
-  # Exact microbatch per rank: 4 from each signal family and 20 images/videos.
-  # Two-step accumulation preserves 8/family + 40 media per optimizer update.
+  # Exact microbatch per rank: 2 from each signal family and 10 images/videos.
+  # Four-step accumulation preserves 8/family + 40 media per optimizer update.
   # Validation uses five batches of ten rows per family. That visits every one of
   # the 50 base SmellNet validation recordings exactly once.
-  ts_per_family_per_batch: 4
+  ts_per_family_per_batch: 2
   val_ts_per_family_per_batch: 10
 
   text_for_label: ground_truth
@@ -37,7 +37,7 @@ data:
   # two-level task encoded in the controlled 3DHaptic stem for reusable positives.
   tactile_label_mode: stem_task_pair
   enable_videos: true
-  max_video_frames: 4
+  max_video_frames: 8
   image_patch_size: 16
   tactile_max_frames: 256
   temporal_crop_steps:
@@ -66,10 +66,10 @@ loss_weights:
   distill_img: 1.0
 
 train:
-  # Full-resolution media at batch 64 used 176-177 GiB/B200 without checkpointing.
-  # Batch 32 with two-step accumulation preserves effective global batch 256.
-  batch_size: 32
-  grad_accum_steps: 2
+  # Batch 32 at four video frames used 176 GiB/B200 without checkpointing.
+  # Batch 16 with four-step accumulation preserves effective global batch 256.
+  batch_size: 16
+  grad_accum_steps: 4
   num_workers: 4
   prefetch_factor: 2
   lr: 1.0e-5
