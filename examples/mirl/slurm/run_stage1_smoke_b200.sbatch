@@ -1,5 +1,5 @@
 #!/bin/bash
-# Four-B200 mixed-media memory gate for the production batch shape.
+# B200 mixed-media smoke test; command-line Slurm flags may reduce the GPU count.
 #SBATCH --job-name=mirl_s1_smoke
 #SBATCH --partition=b200-batch
 #SBATCH --account=ppliang_mit
@@ -32,5 +32,5 @@ source /home/dvdai_mit/miniconda3/etc/profile.d/conda.sh
 conda activate "$MIRL_CLUSTER_ROOT/envs/alec-mv"
 
 CONFIG="$PWD/mirl_ext/alignment/config/stage1_smoke.yaml" \
-NUM_GPUS=4 \
+NUM_GPUS="${NUM_GPUS:-4}" \
 bash examples/alignment/run_stage1_qwen35_siglip2.sh

@@ -20,32 +20,7 @@ from .projection import GCMSProjectionHead, ProjectionHead
 
 logger = logging.getLogger(__name__)
 
-
-def temporal_crop(
-    signal: torch.Tensor | dict[str, torch.Tensor],
-    family: str,
-    steps: int,
-    generator: Optional[torch.Generator] = None,
-) -> torch.Tensor | dict[str, torch.Tensor]:
-    """Crop scalar signals randomly and tactile signals around peak pressure."""
-    steps = int(steps)
-    if family == "tactile":
-        length = int(signal["tactile"].shape[0])
-    else:
-        length = int(signal.shape[-1])
-    crop = min(steps, length)
-    max_start = length - crop
-
-    if family == "tactile":
-        pressure = torch.nan_to_num(signal["tactile"].float()).clamp_min(0)
-        peak = int(pressure.flatten(1).sum(dim=1).argmax())
-        start = min(max(0, peak - crop // 2), max_start)
-    else:
-        start = int(torch.randint(max_start + 1, (), generator=generator))
-
-    if isinstance(signal, dict):
-        return {key: value[start : start + crop] for key, value in signal.items()}
-    return signal[:, start : start + crop]
+_TACTILE_PRESSURE_MAX = 3072.0
 
 
 def _resolve_snapshot(path_or_repo: str) -> Path:
@@ -122,6 +97,22 @@ def _load_exact_siglip2_text(path_or_repo: str, *, dtype: torch.dtype) -> nn.Mod
     return text_model
 
 
+def _enable_block_checkpointing(visual: nn.Module) -> int:
+    """Checkpoint trainable vision blocks; Qwen's vision loop ignores HF's flag."""
+    import torch.utils.checkpoint as checkpoint
+
+    for block in visual.blocks:
+        original_forward = block.forward
+
+        def forward(*args, _block=block, _forward=original_forward, **kwargs):
+            if _block.training:
+                return checkpoint.checkpoint(_forward, *args, use_reentrant=False, **kwargs)
+            return _forward(*args, **kwargs)
+
+        block.forward = forward
+    return len(visual.blocks)
+
+
 def _split_and_pool(
     flat_embeds: torch.Tensor,
     grid_thw: torch.Tensor,
@@ -155,6 +146,7 @@ class MultimodalAlignmentModel(nn.Module):
         proj_dropout: float = 0.0,
         visual_dtype: torch.dtype = torch.bfloat16,
         attn_impl: str = "sdpa",
+        gradient_checkpointing: bool = False,
         ecg_normalization: str = "robust",
         tactile_delta_channels: bool = False,
         gcms_input_dim: Optional[int] = None,
@@ -187,6 +179,10 @@ class MultimodalAlignmentModel(nn.Module):
         self.frozen_visual = copy.deepcopy(self.trainable_visual)
         self.frozen_visual.requires_grad_(False).eval()
         logger.info("       frozen VE ready (%.1fs)", time.time() - started)
+
+        if gradient_checkpointing:
+            wrapped = _enable_block_checkpointing(self.trainable_visual)
+            logger.info("       activation checkpointing ON: wrapped %d trainable VE blocks", wrapped)
 
         qwen_hidden = int(self.trainable_visual.config.out_hidden_size)
 
@@ -340,10 +336,17 @@ class MultimodalAlignmentModel(nn.Module):
             return torch.nan_to_num(x.float()).clamp(-4.0, 4.0) / 4.0
         raise ValueError(f"unknown scalar normalization mode {mode!r}")
 
+    @staticmethod
+    def _normalize_tactile(x: torch.Tensor) -> torch.Tensor:
+        """Apply OpenTouch's fixed pressure scale and map it to ``[-1, 1]``."""
+        return torch.nan_to_num(x.float()).clamp(0.0, _TACTILE_PRESSURE_MAX).mul(
+            2.0 / _TACTILE_PRESSURE_MAX
+        ).sub(1.0)
+
     def _timeseries_to_video_inputs(
         self, signal: torch.Tensor, normalization: str = "robust"
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack each merger-cell-width signal window as one video frame."""
+        """Pack consecutive merger-cell-width signal blocks as video frames."""
         cell = self.vit_patch_size * self.vit_merge_size
         finite = torch.isfinite(signal)
         raw = torch.nan_to_num(signal.float())
@@ -366,9 +369,7 @@ class MultimodalAlignmentModel(nn.Module):
         tac = payload["tactile"]
         force = payload.get("force")
         finite = torch.isfinite(tac)
-        raw = torch.nan_to_num(tac.float())
-        # One recording-level scale preserves relative pressure across the taxel map.
-        value = self._robust_normalize_rows(raw.reshape(1, -1)).reshape_as(raw)
+        value = self._normalize_tactile(tac)
         value = value.masked_fill(~finite, -1.0)
         value = F.interpolate(value.unsqueeze(1), size=(side, side), mode="nearest").squeeze(1)
 
@@ -429,23 +430,38 @@ class MultimodalAlignmentModel(nn.Module):
         return self._encode_qwen_branch(pixel_values, grid_thw, visual=self.trainable_visual, no_grad=False)
 
     @torch.no_grad()
+    def encode_text_chunks(
+        self,
+        texts: list[str],
+        device: torch.device,
+        max_length: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode every non-overlapping SigLIP2-length chunk and its answer index."""
+        max_length = max_length or int(self.label_text_model.config.max_position_embeddings)
+        toks = self.label_tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_overflowing_tokens=True,
+            return_tensors="pt",
+        )
+        owners = toks.pop("overflow_to_sample_mapping").to(device)
+        chunks = self.label_text_model(**toks.to(device)).pooler_output.float()
+        return chunks, owners
+
+    @torch.no_grad()
     def encode_text(
         self,
         texts: list[str],
         device: torch.device,
         max_length: Optional[int] = None,
     ) -> torch.Tensor:
-        max_length = max_length or int(self.label_text_model.config.max_position_embeddings)
-        # SigLIP2's pooler reads the final token, so fixed-length padding is required.
-        toks = self.label_tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        ).to(device)
-        out = self.label_text_model(**toks)
-        return out.pooler_output
+        chunks, owners = self.encode_text_chunks(texts, device, max_length)
+        pooled = chunks.new_zeros((len(texts), chunks.shape[-1]))
+        pooled.index_add_(0, owners, chunks)
+        counts = torch.bincount(owners, minlength=len(texts)).to(chunks.dtype)
+        return pooled / counts.unsqueeze(1)
 
     @staticmethod
     def _norm(x: torch.Tensor) -> torch.Tensor:

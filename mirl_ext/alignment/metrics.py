@@ -19,12 +19,27 @@ _METRIC_FAMILY_NAMES = {
 _REDUCED_METRIC_KEYS: tuple[str, ...] = (
     (
         "loss/ts_text",
+        "loss/ts_smell",
+        "loss/ts_ecg",
+        "loss/ts_tactile",
         "loss/smell_sensor_gcms",
         "loss/smell_gcms_text",
         "loss/distill_img",
         "loss/total",
         # Equal-family core metrics only include families with a real prototype task.
-        *(f"{stat}/ts_supervised_family_macro" for stat in ("accuracy", "f1_macro")),
+        *(
+            f"{stat}/ts_supervised_family_macro"
+            for stat in ("accuracy", "precision_macro", "recall_macro", "f1_macro")
+        ),
+        *(
+            f"{stat}/ts_supervised_class_macro"
+            for stat in ("precision_macro", "recall_macro", "f1_macro")
+        ),
+        *(
+            f"{stat}/ts_supervised_{aggregation}_macro"
+            for aggregation in ("family", "class")
+            for stat in ("recall_at_1_macro", "recall_at_5_macro")
+        ),
         "accuracy/smell_sensor_to_gcms",
         "accuracy/smell_gcms_to_text",
     )
@@ -33,7 +48,13 @@ _REDUCED_METRIC_KEYS: tuple[str, ...] = (
         for family in _TS_FAMILIES
         for stat in (
             "accuracy",
+            "precision_macro",
+            "recall_macro",
             "f1_macro",
+            "recall_at_1",
+            "recall_at_5",
+            "recall_at_1_macro",
+            "recall_at_5_macro",
             "gap",
             "eff_dim",
             "label_coverage",
@@ -52,7 +73,10 @@ _COUNT_KEYS: tuple[str, ...] = (
 _MUST_REDUCE_PREFIXES = (
     "loss/",
     "accuracy/",
+    "precision_macro/",
+    "recall_macro/",
     "f1_macro/",
+    "recall_at_",
     "gap/",
     "eff_dim/",
     "coverage/",
@@ -64,7 +88,11 @@ _MUST_REDUCE_PREFIXES = (
 # Recompute nonlinear metrics over the complete accumulation window.
 _TS_WINDOW_METRIC_PREFIXES = (
     "accuracy/",
+    "precision_macro/",
+    "recall_macro/",
     "f1_macro/",
+    "recall_at_",
+    "map/",
     "gap/",
     "eff_dim/",
     "label_coverage/",
@@ -194,6 +222,37 @@ def _effective_dim(z: torch.Tensor) -> Optional[float]:
 
 
 @torch.no_grad()
+def _paired_retrieval_metrics(
+    sensor: torch.Tensor,
+    text: torch.Tensor,
+    captions: list[str],
+    family: str,
+) -> dict[str, float]:
+    """Score both directions of paired sensor-text retrieval."""
+    similarity = sensor.float() @ text.float().t()
+    positive = torch.tensor(
+        [[left == right for right in captions] for left in captions],
+        device=similarity.device,
+        dtype=torch.bool,
+    )
+    metrics: dict[str, float] = {}
+    for direction, scores, matches in (
+        ("sensor_to_text", similarity, positive),
+        ("text_to_sensor", similarity.t(), positive.t()),
+    ):
+        ranked = matches.gather(1, scores.argsort(dim=1, descending=True))
+        for k in (1, 5):
+            recall = ranked[:, : min(k, ranked.shape[1])].any(dim=1).float().mean()
+            metrics[f"recall_at_{k}/ts_{family}_{direction}"] = float(recall)
+
+        ranks = torch.arange(1, ranked.shape[1] + 1, device=ranked.device)
+        precision = ranked.cumsum(dim=1) / ranks
+        average_precision = (precision * ranked).sum(dim=1) / ranked.sum(dim=1)
+        metrics[f"map/ts_{family}_{direction}"] = float(average_precision.mean())
+    return metrics
+
+
+@torch.no_grad()
 def _prototype_classification_metrics(
     z: torch.Tensor,
     labels: list[str],
@@ -233,6 +292,7 @@ def _prototype_classification_metrics(
                     "precision": 0.0,
                     "recall": 0.0,
                     "f1": 0.0,
+                    "recall_at_5": 0.0,
                 }
                 for class_id, label in enumerate(prototype_labels)
             )
@@ -241,7 +301,9 @@ def _prototype_classification_metrics(
     known_z = z[known].float()
     known_true = true[known]
     sims = known_z @ prototypes.float().t()
-    pred = sims.argmax(dim=1)
+    ranked = sims.argsort(dim=1, descending=True)
+    pred = ranked[:, 0]
+    recall_at_5 = (ranked[:, : min(5, ranked.shape[1])] == known_true[:, None]).any(dim=1)
     num_classes = len(prototype_labels)
     support = torch.bincount(known_true, minlength=num_classes)
     predicted = torch.bincount(pred, minlength=num_classes)
@@ -251,7 +313,10 @@ def _prototype_classification_metrics(
     )
 
     per_class: list[dict[str, object]] = []
+    supported_precision: list[float] = []
+    supported_recall: list[float] = []
     supported_f1: list[float] = []
+    supported_recall_at_5: list[float] = []
     for class_id, label in enumerate(prototype_labels):
         tp = int(true_positive[class_id])
         support_i = int(support[class_id])
@@ -260,8 +325,13 @@ def _prototype_classification_metrics(
         recall = tp / support_i if support_i else 0.0
         denom = precision + recall
         f1 = 2.0 * precision * recall / denom if denom else 0.0
+        class_mask = known_true == class_id
+        class_recall_at_5 = float(recall_at_5[class_mask].float().mean()) if support_i else 0.0
         if support_i:
+            supported_precision.append(precision)
+            supported_recall.append(recall)
             supported_f1.append(f1)
+            supported_recall_at_5.append(class_recall_at_5)
         per_class.append(
             {
                 "class_id": class_id,
@@ -271,6 +341,7 @@ def _prototype_classification_metrics(
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
+                "recall_at_5": class_recall_at_5,
             }
         )
     if per_class_out is not None:
@@ -279,9 +350,16 @@ def _prototype_classification_metrics(
     result.update(
         {
             "accuracy": float((pred == known_true).float().mean()),
+            "precision_macro": sum(supported_precision) / len(supported_precision),
+            "recall_macro": sum(supported_recall) / len(supported_recall),
             "f1_macro": sum(supported_f1) / len(supported_f1),
+            "recall_at_1": float((pred == known_true).float().mean()),
+            "recall_at_5": float(recall_at_5.float().mean()),
+            "recall_at_1_macro": sum(supported_recall) / len(supported_recall),
+            "recall_at_5_macro": sum(supported_recall_at_5) / len(supported_recall_at_5),
             "class_coverage": len(supported_f1) / num_classes,
             "prediction_coverage": float((predicted > 0).sum()) / num_classes,
+            "supported_classes": len(supported_f1),
         }
     )
 
@@ -325,7 +403,13 @@ def _ts_prediction_metrics(
             family_cms[family] = fam_cm
             for stat in (
                 "accuracy",
+                "precision_macro",
+                "recall_macro",
                 "f1_macro",
+                "recall_at_1",
+                "recall_at_5",
+                "recall_at_1_macro",
+                "recall_at_5_macro",
                 "gap",
                 "label_coverage",
                 "class_coverage",
@@ -337,12 +421,34 @@ def _ts_prediction_metrics(
         if fam_eff is not None:
             metrics[f"eff_dim/ts_{family}"] = fam_eff
 
-    for stat in ("accuracy", "f1_macro"):
+    for stat in ("accuracy", "precision_macro", "recall_macro", "f1_macro"):
         available = [family for family in _TS_FAMILIES if stat in family_cms.get(family, {})]
         if available:
             metrics[f"{stat}/ts_supervised_family_macro"] = sum(family_cms[family][stat] for family in available) / len(
                 available
             )
+
+    for stat in ("precision_macro", "recall_macro", "f1_macro"):
+        available = [family for family in _TS_FAMILIES if stat in family_cms.get(family, {})]
+        total_classes = sum(family_cms[family]["supported_classes"] for family in available)
+        if total_classes:
+            metrics[f"{stat}/ts_supervised_class_macro"] = sum(
+                family_cms[family][stat] * family_cms[family]["supported_classes"]
+                for family in available
+            ) / total_classes
+
+    for stat in ("recall_at_1_macro", "recall_at_5_macro"):
+        available = [family for family in _TS_FAMILIES if stat in family_cms.get(family, {})]
+        if available:
+            metrics[f"{stat}/ts_supervised_family_macro"] = sum(
+                family_cms[family][stat] for family in available
+            ) / len(available)
+        total_classes = sum(family_cms[family]["supported_classes"] for family in available)
+        if total_classes:
+            metrics[f"{stat}/ts_supervised_class_macro"] = sum(
+                family_cms[family][stat] * family_cms[family]["supported_classes"]
+                for family in available
+            ) / total_classes
 
     return metrics
 
@@ -353,9 +459,24 @@ def _training_metric_groups(
 ) -> dict[str, float]:
     """Return the compact, public training metric surface for W&B."""
     out: dict[str, float] = {"train/loss": metrics["loss/total"]}
+    for source, display in (("loss/ts_text", "siglip"), ("loss/distill_img", "distill")):
+        if source in metrics:
+            out[f"train-aux/loss/{display}"] = metrics[source]
     for family in _TS_FAMILIES:
         display = _METRIC_FAMILY_NAMES[family]
-        for stat in ("accuracy", "f1_macro"):
+        loss_key = f"loss/ts_{family}"
+        if loss_key in metrics:
+            out[f"train-aux/loss/siglip/{display}"] = metrics[loss_key]
+        for stat in ("accuracy", "precision_macro", "recall_macro", "f1_macro"):
+            key = f"{stat}/ts_{family}"
+            if key in metrics:
+                out[f"train-core/{stat}/{display}"] = metrics[key]
+        for stat in ("recall_at_1", "recall_at_5", "map"):
+            for direction in ("sensor_to_text", "text_to_sensor"):
+                key = f"{stat}/ts_{family}_{direction}"
+                if key in metrics:
+                    out[f"train-core/{stat}/{display}_{direction}"] = metrics[key]
+        for stat in ("recall_at_1", "recall_at_5", "recall_at_1_macro", "recall_at_5_macro"):
             key = f"{stat}/ts_{family}"
             if key in metrics:
                 out[f"train-core/{stat}/{display}"] = metrics[key]
@@ -368,10 +489,21 @@ def _training_metric_groups(
                 out[f"train-aux/{target}/{display}"] = metrics[key]
         out[f"train-aux/n/{display}"] = float(counts[f"n/ts_{family}"])
 
-    for stat in ("accuracy", "f1_macro"):
+    for stat in ("accuracy", "precision_macro", "recall_macro", "f1_macro"):
         key = f"{stat}/ts_supervised_family_macro"
         if key in metrics:
             out[f"train-core/{stat}/overall"] = metrics[key]
+    for stat in ("precision_macro", "recall_macro", "f1_macro"):
+        key = f"{stat}/ts_supervised_class_macro"
+        if key in metrics:
+            out[f"train-core/{stat}/all_classes"] = metrics[key]
+    for stat in ("recall_at_1_macro", "recall_at_5_macro"):
+        family_key = f"{stat}/ts_supervised_family_macro"
+        class_key = f"{stat}/ts_supervised_class_macro"
+        if family_key in metrics:
+            out[f"train-core/{stat}/overall"] = metrics[family_key]
+        if class_key in metrics:
+            out[f"train-core/{stat}/all_classes"] = metrics[class_key]
 
     for key, value in metrics.items():
         if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale"}:
@@ -393,9 +525,24 @@ def _validation_metric_groups(
 ) -> dict[str, float]:
     """Return core selection metrics and a small set of validation diagnostics."""
     out = {"val/loss": averaged_metrics["loss/total"]}
+    for source, display in (("loss/ts_text", "siglip"), ("loss/distill_img", "distill")):
+        if source in averaged_metrics:
+            out[f"val-aux/loss/{display}"] = averaged_metrics[source]
     for family in _TS_FAMILIES:
         display = _METRIC_FAMILY_NAMES[family]
-        for stat in ("accuracy", "f1_macro"):
+        loss_key = f"loss/ts_{family}"
+        if loss_key in averaged_metrics:
+            out[f"val-aux/loss/siglip/{display}"] = averaged_metrics[loss_key]
+        for stat in ("accuracy", "precision_macro", "recall_macro", "f1_macro"):
+            key = f"{stat}/ts_{family}"
+            if key in prediction_metrics:
+                out[f"val-core/{stat}/{display}"] = prediction_metrics[key]
+        for stat in ("recall_at_1", "recall_at_5", "map"):
+            for direction in ("sensor_to_text", "text_to_sensor"):
+                key = f"{stat}/ts_{family}_{direction}"
+                if key in prediction_metrics:
+                    out[f"val-core/{stat}/{display}_{direction}"] = prediction_metrics[key]
+        for stat in ("recall_at_1", "recall_at_5", "recall_at_1_macro", "recall_at_5_macro"):
             key = f"{stat}/ts_{family}"
             if key in prediction_metrics:
                 out[f"val-core/{stat}/{display}"] = prediction_metrics[key]
@@ -410,10 +557,21 @@ def _validation_metric_groups(
                 out[f"val-aux/{target}/{display}"] = prediction_metrics[key]
         out[f"val-core/n/{display}"] = float(bucket_totals[f"n/ts_{family}"])
 
-    for stat in ("accuracy", "f1_macro"):
+    for stat in ("accuracy", "precision_macro", "recall_macro", "f1_macro"):
         key = f"{stat}/ts_supervised_family_macro"
         if key in prediction_metrics:
             out[f"val-core/{stat}/overall"] = prediction_metrics[key]
+    for stat in ("precision_macro", "recall_macro", "f1_macro"):
+        key = f"{stat}/ts_supervised_class_macro"
+        if key in prediction_metrics:
+            out[f"val-core/{stat}/all_classes"] = prediction_metrics[key]
+    for stat in ("recall_at_1_macro", "recall_at_5_macro"):
+        family_key = f"{stat}/ts_supervised_family_macro"
+        class_key = f"{stat}/ts_supervised_class_macro"
+        if family_key in prediction_metrics:
+            out[f"val-core/{stat}/overall"] = prediction_metrics[family_key]
+        if class_key in prediction_metrics:
+            out[f"val-core/{stat}/all_classes"] = prediction_metrics[class_key]
 
     for source, target in (
         ("accuracy/smell_sensor_to_gcms", "smellnet_sensor_to_gcms"),

@@ -79,11 +79,13 @@ only for a subset of records.
 
 ## Temporal representation
 
-Smell sensors and heterogeneous force fields use robust normalization. ECG can
-use the same historical transform or `prestandardized`, a linear
-`clip(x, -4, 4) / 4` mapping for the stored per-lead z-scored tensors. The tactile
-pressure cube uses one recording-level robust scale so relative pressure across
-its physical 16×16 surface is not erased:
+The families share a `[-1, 1]` numeric contract, not one statistical transform.
+Smell sensors and heterogeneous force fields use robust normalization. ECG uses
+`clip(x, -4, 4) / 4` because the stored tensors are already per-lead z-scored.
+Tactile pressure follows OpenTouch's fixed physical scale: clip raw pressure to
+`[0, 3072]`, divide by 3072, then map the result to `[-1, 1]`.
+
+Robustly normalized rows use:
 
 `scale = 0.7 * (MAD / 0.6745) + 0.3 * std`
 
@@ -104,7 +106,7 @@ marks missing/padded pixels; no color channel has a separate engineered meaning.
 
 - Treat both inputs identically as `(channels, time)`; only their native dimensions
   differ.
-- Put each 32-step window in one video frame. A channel occupies one 32×32 merger
+- Put each consecutive 32-step block in one video frame. A channel occupies one 32×32 merger
   cell, with its 32 values repeated vertically and identically across RGB.
 - Qwen's native temporal patcher fuses adjacent frames, so each output token covers
   64 ordered timesteps from exactly one sensor or lead.
@@ -126,44 +128,47 @@ All families use this temporal Qwen input grammar; there is no image/hybrid mode
 
 - Every source is a 30-FPS sequence of 16×16 pressure maps (median 177 frames;
   range 47–4,606).
-- Keep native temporal resolution through 256 frames, which fully preserves 76.5%
-  of recordings. Uniformly cover the full duration only for the longer tail. This
-  retains 70.0% of all source frames overall, versus 24.9% under the former
-  64-frame cap.
-- Normalize the tactile cube at recording level to preserve relative spatial
-  pressure; normalize the heterogeneous force-summary fields independently.
+- Feed every recording at its complete native duration. There is no temporal
+  windowing, cropping, frame selection, or cap.
+- Normalize pressure with OpenTouch's fixed 3072-count scale. Normalize the
+  heterogeneous force-summary fields independently within each recording.
 - With `tactile_delta_channels=true`, encode pressure in R/B and the normalized
   frame delta in G; otherwise repeat pressure across RGB. Qwen's native temporal
   convolution still fuses adjacent frames.
 - Nearest-neighbor expand each 16×16 tactile map to one 32×32 merger cell.
 - Place the 13 aligned right-force summaries in an adjacent 32×32 cell.
 - Qwen's temporal kernel fuses adjacent frame pairs.
-- Preserve signed v2 calibration values; do not clamp negatives.
 
-An `F`-frame clip produces `2 × ceil(F/2)` output tokens: two spatial tokens
-(tactile and force) per temporal frame pair, with an odd final frame repeated as
-Qwen requires. Training uses one 21-frame peak-centered tactile crop; full
-validation clips retain at most 256 frames. The smoke cap is 64 frames.
+A recording with `T` tactile frames produces `2 * ceil(T / 2)` output tokens:
+two spatial tokens (tactile and force) per temporal frame pair. The median
+177-frame recording therefore produces 178 tokens; the 4,606-frame maximum
+produces 4,606 tokens.
 
 ## Training recipe
 
-- Each rank receives 4 smell, 4 ECG, 4 tactile, and 20 real image/video samples.
-  This is a 32-sample microbatch per rank. Two-step gradient accumulation gives
-  an effective global batch of 256 on four AICR B200s without activation checkpointing.
+- Each rank receives up to 8 SmellNet recordings, 8 ECG recordings, 8 tactile
+  recordings, and 8 real image/video samples. Two-step gradient accumulation
+  gives an effective global recording batch of 256 on four AICR B200s.
+- One epoch consumes every sensor recording once. A family disappears from later
+  batches after it is exhausted; it is never recycled to match a larger family or
+  the auxiliary image pool. Images are sampled without replacement alongside the
+  sensor-defined epoch.
 - SmellNet sampling and metrics use only the 50 base substances; mixture rows
   never enter the active dataset or W&B tables.
-- The clean baseline aligns each Qwen-encoded sensor crop directly with its frozen
-  SigLIP2 label prototype. GC-MS is disabled; it can be enabled later as a separate
-  ablation without changing the baseline result.
-- Training crops are 100 smell steps, 750 ECG steps (3 seconds at 250 Hz), and
-  21 tactile frames. There is no separate crop-consistency objective.
+- The clean baseline aligns SmellNet and ECG recordings with frozen SigLIP2 class
+  prototypes. Each tactile recording is paired with the complete annotated answer;
+  filename-derived task stems are not used. Answers longer than SigLIP2's 64-token
+  context produce multiple equally weighted positive chunks. Chunks are pooled
+  only when ranking complete answers for retrieval. GC-MS remains a separate ablation.
+- SmellNet, ECG, and tactile all retain their complete native time axes in both
+  training and validation. One dataset row produces one sensor embedding.
 - The visual/text projections are linear into 512 dimensions. Effective dimension
   is diagnostic only; the baseline has no variance or covariance objective.
 - AdamW uses `1e-5` for Qwen and projection heads, `3e-3` for the
-  temperature, weight decay `0.05`, gradient clipping `1.0`, and 5% warmup.
-- The production schedule is 1,500 optimizer steps. Validation runs every 100
-  steps over five deterministic balanced batches, visiting all 50 base SmellNet
-  validation recordings once.
-- Checkpoint selection focuses on SmellNet sensor-to-text top-1 at
-  `val-core/accuracy/smellnet`. Accuracy and macro-F1 are also logged for ECG,
-  haptic, and the equal-family overall; per-class tables remain under `val-aux/`.
+  temperature, weight decay `0.05`, gradient clipping `1.0`, and 3% warmup.
+- The production schedule is one sensor epoch. Validation runs every 100 steps
+  over the complete one-pass sensor validation sampler, visiting every SmellNet,
+  ECG, and haptic validation recording once.
+- Checkpoint selection uses the SmellNet/ECG validation macro-F1 at
+  `val-core/f1_macro/overall`. Haptic logs bidirectional sensor/text Recall@1,
+  Recall@5, and mAP over all 635 validation recordings.

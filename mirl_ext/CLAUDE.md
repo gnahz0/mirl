@@ -31,22 +31,20 @@ divides by D=4096 and yields ~1e-5, i.e. no gradient. Likewise `siglip_sigmoid`
 is mean-reduced over pairs, not summed over rows as in the reference (that is
 B× larger). Changing either reduction silently rebalances training.
 
-**SigLIP uses the full fixed family vocabulary.** Each family bias is the log-odds
-of `1 / K`, where `K` is its training-vocabulary size. Frozen SigLIP2 text
-features are cached once, then passed through the trainable text projection each
-step. `log_logit_scale` initializes to `log(1 / 0.07)` and is a 0-dim no-decay
-parameter.
+**SigLIP uses the full fixed SmellNet/ECG vocabularies.** Their family bias is
+the log-odds of `1 / K`, where `K` is the training-vocabulary size. Tactile uses
+the positives in its current gathered sensor-caption batch. `log_logit_scale`
+initializes to `log(1 / 0.07)` and is a 0-dim no-decay parameter.
 
-**The clean baseline is sensor-to-text only.** Every Qwen-encoded sensor crop is
-aligned directly with its frozen SigLIP2 label prototype. The optional SmellNet
-GC-MS path is an ablation, not part of the baseline; it loads only when a config
-provides `data.smellnet_gcms_path`. Mixture rows never enter either objective.
+**The clean baseline is sensor-to-text only.** SmellNet and ECG use fixed
+SigLIP2 class prototypes. Tactile uses its complete annotated answer as a paired
+SigLIP target within the gathered global batch. The optional SmellNet GC-MS path
+is an ablation, not part of the baseline; it loads only when a config provides
+`data.smellnet_gcms_path`. Mixture rows never enter either objective.
 
-**Classes and families are balanced explicitly.** Duplicate anchors for one
-class share that class's total row weight. Losses are averaged across enabled
-families, and absent vocabulary classes remain negatives. The 3DHaptic caption is
-unique per recording, so tactile uses the participant-independent two-level task
-signature from `extra_info.stem` rather than treating captions as classes.
+**Classes and families are balanced explicitly.** Duplicate class anchors share
+that class's total row weight for the SmellNet/ECG prototype loss. Tactile uses
+ordinary paired-caption positives, and the three family losses are averaged.
 
 **Distributed is hand-rolled — there is no `DistributedDataParallel`.** Each
 rank holds a full replica; gradients are averaged manually. Three spots deadlock
@@ -59,11 +57,14 @@ if edited casually:
    its local shard has zero TS rows. Replacing it with `dist.all_gather` silently
    detaches remote embeddings; branching before it deadlocks.
 
-**Selection metrics are per family.** W&B publishes accuracy and macro-F1 for
-SmellNet, ECG, haptic, and their equal-family `overall` under `train-core/` and
-`val-core/`. `*-aux/` is limited to losses, collapse/coverage diagnostics, counts,
-learning-rate/gradient diagnostics and validation per-class tables.
-Nonlinear metrics are recomputed over the full accumulation window.
+**Selection metrics match the supervision.** W&B publishes accuracy, macro
+precision/recall/F1, and validation per-class precision/recall/F1 for SmellNet
+and ECG. Prototype rankings also publish Recall@1/5 and class-macro Recall@1/5;
+`all_classes` weights every supported SmellNet/ECG class equally while `overall`
+weights the two families equally. Haptic publishes bidirectional sensor/text
+Recall@1, Recall@5, and mAP instead of pretending unique captions are classes.
+Training retrieval covers an effective optimization batch; validation retrieval
+is computed jointly over the complete validation set.
 
 **Metrics carry no placeholder values.** A key is present iff its branch fired.
 Never pre-populate `loss/*` with `0.0`: a placeholder is indistinguishable from
@@ -107,9 +108,9 @@ Start a new lineage: bump `WANDB_RUN_ID` *and* the checkpoint dir in the sbatch.
 similarities rather than the loss. `ts_text` names the shared loss, not a prediction
 family. Validation selection metrics live under `val-core/`; losses, collapse,
 coverage, and per-class diagnostics live under `val-aux/`.
-`val-core/{accuracy,f1_macro}/overall` is the equal-family mean over tasks with reusable
-labels (SmellNet, ECG, and haptic). Macro-F1 excludes classes absent from that
-validation sample; read `class_coverage` and `label_coverage` beside it.
+`val-core/{accuracy,f1_macro}/overall` is the equal-family mean over tasks with
+reusable labels (SmellNet and ECG). Macro-F1 excludes classes absent from that
+validation sample. Haptic uses paired retrieval metrics instead.
 
 ## Experiment log (2026-07-27..30) — what was tried, with verdicts
 
@@ -156,13 +157,14 @@ Chapman 10 / CPSC 12; AF: Georgia 14 vs Chapman 1021), so part of any margin is
 predicting the source corpus's prior. Always quote the margin over the MAJORITY
 baseline — the probe prints both.
 
-**Raw haptic captions are not a class label.** They are unique per row (1575/1575
-train, 635/635 valid), so the original index had zero within-label positive pairs.
-The active `stem_task_pair` mode strips date, participant, and replicate tokens and
-uses the controlled protocol plus subtask (for example `recognition lift` or
-`rubber squeeze`). On the date split this yields 101 train classes, 52 classes shared
-with validation, and 97.0% validation-row coverage. This is a MIRL task taxonomy,
-not OpenTouch's 29-way Feix grip annotation; do not report it as grip accuracy.
+**Raw haptic captions are paired text, not class labels.** They are unique per row
+(1575/1575 train, 635/635 valid). Use each complete `ground_truth` answer as the
+positive for its tactile recording. Filename stems are metadata only and never
+become supervision. SigLIP2 has a 64-token text context, so long answers are
+encoded as non-overlapping chunks. Every chunk is a positive during training and
+is weighted by the inverse number of chunks in its answer. Chunk features are
+pooled only for answer-level retrieval. Report retrieval metrics, not haptic
+class accuracy/F1.
 
 **SmellNet's raster is destroying its most informative channels.** Measured
 37.3% padding, 38.7% saturated, only 4.3 post-merger tokens/recording. Mechanism
@@ -258,9 +260,9 @@ materially different papers, and v3's headline is 58.5 not 63.3).
 - Base is **6 channels @ 1 Hz**, 600 s sessions, 6 days/substance, 50-way,
   **chance 2%**. Mixture is **4 channels @ 10 Hz**, 60 s, and is **12-dim
   proportion REGRESSION, not classification**.
-- Stage-1 alignment is currently **base-only**:
-  `data.exclude_data_sources: [smellnet_mixture]` removes mixture rows before
-  label-vocabulary construction, sampling, loss computation, and metric logging.
+- Stage-1 alignment is currently **base-only**: the alignment loader removes
+  `smellnet_mixture` before label-vocabulary construction, sampling, loss
+  computation, and metric logging.
   The active split is 250 train recordings and 50 validation recordings.
 - **Temporal differencing at lag p=25 (i.e. 25 SECONDS) is the dominant
   hyperparameter**, worth **+18 to +27 points** on every temporal model — more
@@ -341,11 +343,13 @@ materially different papers, and v3's headline is 58.5 not 63.3).
   enlarging the tactile map and using a large vision encoder does not provide an
   advantage."*
 - Normalization is a **global fixed scale**: `clip(x, 0, 3072) / 3072`, negatives
-  clipped to 0 (we preserve signed v2 calibration values), no per-recording stats.
-  Optional noise floor 500 counts.
-- Windows are **20 frames @ 30 Hz (0.67 s)**, or 21 frames centered on the
+  clipped to 0, no per-recording stats. Alignment now preserves this transform up
+  to an affine map from `[0, 1]` to Qwen's common `[-1, 1]` input range. Optional
+  noise floor 500 counts remains disabled.
+- OpenTouch uses **20 frames @ 30 Hz (0.67 s)**, or 21 frames centered on the
   **peak-pressure frame** — which matters because the captions were generated FROM
-  the peak-pressure frames. We spread up to 256 frames over the whole clip.
+  the peak-pressure frames. The alignment baseline intentionally does not copy
+  this sampling recipe: it feeds each complete native recording as one example.
 - AdamW, lr 1e-4, batch 128-256, 300 epochs, cosine + 5% warmup, tau=0.07 clamped
   at ln(100), **no augmentation at all**.
 
@@ -377,6 +381,9 @@ aicr**; they need copying.
 - Noise floor: run-to-run std is 0.0016-0.0039 and bootstrap CI half-widths are
   ~+-0.008, so **any delta under ~0.010 from a single run is noise.** Several of
   our cross-run f1 gaps are inside that band.
+
+The current clean baseline uses each full 8x2500 ECG tensor in both training and
+validation. It does not apply the 2-3 second crop described above.
 
 **Project decision (2026-07-30): do not use ECG-JEPA distillation.** ECG-JEPA and
 CLIMB are references for label semantics, temporal granularity, preprocessing, and

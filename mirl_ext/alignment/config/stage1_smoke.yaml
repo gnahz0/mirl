@@ -16,22 +16,11 @@ data:
     - ${data.root}/climb_valid.parquet
     - ${data.root}/human_behaviour_valid.parquet
     - ${data.root}/tactile_valid.parquet
-  balanced_sampling_key: data_source
-  exclude_data_sources: [smellnet_mixture]
-  include_all_ts: false
   max_train_samples: 320
   ts_per_family_per_batch: 2
   val_ts_per_family_per_batch: 10
-  text_for_label: ground_truth
-  tactile_label_mode: stem_task_pair
-  enable_videos: true
   max_video_frames: 8
-  image_patch_size: 16
-  tactile_max_frames: 64
-  temporal_crop_steps:
-    smell: 100
-    ecg: 750
-    tactile: 21
+  max_image_tokens: 1024
 
 model:
   qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
@@ -46,7 +35,8 @@ projection:
 
 loss:
   temperature: 0.07
-  prototype_families: [smell, ecg, tactile]
+  prototype_families: [smell, ecg]
+  paired_text_families: [tactile]
 
 loss_weights:
   ts_text: 1.0
@@ -69,7 +59,7 @@ train:
   val_every: 2
   val_batches: 1
   val_batch_size: 128
-  best_metric: val-core/accuracy/smellnet
+  best_metric: val-core/f1_macro/overall
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_smoke}
 
 wandb:

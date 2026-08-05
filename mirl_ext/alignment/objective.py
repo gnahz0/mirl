@@ -18,13 +18,14 @@ from torch.utils.data import DataLoader
 from .losses import distill_cosine, siglip_sigmoid
 from .metrics import (
     _TS_FAMILIES,
+    _paired_retrieval_metrics,
     _smellnet_gcms_top1_metrics,
     _ts_prediction_metrics,
     _validation_metric_groups,
     add_ts_family_counts,
     new_counts,
 )
-from .model import MultimodalAlignmentModel, temporal_crop
+from .model import MultimodalAlignmentModel
 from .smellnet_gcms import SmellNetGCMSBank
 
 logger = logging.getLogger("alignment.trainer")
@@ -59,6 +60,7 @@ def _encode_branch(
     videos,
     device: torch.device,
     dtype: torch.dtype,
+    max_image_tokens: Optional[int] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[int]]:
     """Encode image/video post-merger tokens with student and frozen Qwen towers."""
     if not images_pil and not videos:
@@ -69,11 +71,20 @@ def _encode_branch(
     rows_per_sample: list[int] = []
 
     if images_pil:
+        image_kwargs = {}
+        if max_image_tokens:
+            token_pixels = (model.vit_patch_size * model.vit_merge_size) ** 2
+            max_pixels = int(max_image_tokens) * token_pixels
+            min_pixels = min(int(model.qwen_processor.image_processor.size["shortest_edge"]), max_pixels)
+            image_kwargs["images_kwargs"] = {
+                "size": {"shortest_edge": min_pixels, "longest_edge": max_pixels}
+            }
         processed = model.qwen_processor(
             images=images_pil,
             text=["<image>"] * len(images_pil),
             return_tensors="pt",
             padding=True,
+            **image_kwargs,
         )
         pixels = processed["pixel_values"].to(device=device, dtype=dtype)
         grid = processed["image_grid_thw"].to(device=device)
@@ -181,6 +192,7 @@ def _score_ts_collector(
     prototype_bank: dict[str, TextPrototypeFamily],
     gcms_bank: Optional[SmellNetGCMSBank] = None,
     per_class_reports: Optional[dict[str, list[dict[str, object]]]] = None,
+    paired_families: tuple[str, ...] = (),
 ) -> dict[str, float]:
     """Score one fixed TS sample set against the current projected prototypes."""
     if not collector["z"]:
@@ -200,6 +212,19 @@ def _score_ts_collector(
         projected_bank,
         per_class_reports=per_class_reports,
     )
+    retrieval_chunks = collector.get("retrieval", [])
+    for family in paired_families:
+        chunks = [chunk for chunk in retrieval_chunks if chunk[0] == family]
+        if not chunks:
+            continue
+        metrics.update(
+            _paired_retrieval_metrics(
+                torch.cat([chunk[1] for chunk in chunks]),
+                torch.cat([chunk[2] for chunk in chunks]),
+                [caption for chunk in chunks for caption in chunk[3]],
+                family,
+            )
+        )
     if gcms_bank is not None:
         text_smell = projected_bank.get("smell")
         if text_smell is None:
@@ -243,14 +268,14 @@ def _run_validation(
     device: torch.device,
     visual_dtype: torch.dtype,
     amp_dtype: torch.dtype,
-    n_batches: int,
+    n_batches: Optional[int],
     prototype_bank: dict[str, TextPrototypeFamily],
     gcms_bank: Optional[SmellNetGCMSBank] = None,
 ) -> tuple[
     dict[str, float],
     dict[str, list[dict[str, object]]],
 ]:
-    """Evaluate losses and prediction metrics over a fixed validation subset."""
+    """Evaluate losses and prediction metrics over validation batches."""
     was_training = model.training
     model.eval()
 
@@ -258,8 +283,8 @@ def _run_validation(
 
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}
-    # Collect embeddings once, then score the fixed validation subset globally.
-    ts_eval: dict[str, list] = {"z": [], "labels": [], "families": []}
+    # Collect embeddings once, then score the validation set globally.
+    ts_eval: dict[str, list] = {"z": [], "labels": [], "families": [], "retrieval": []}
     # Track per-bucket totals across all val batches so users see what the
     # validation distribution actually looked like.
     bucket_totals = new_counts()
@@ -280,8 +305,7 @@ def _run_validation(
             # world_size=1 DELIBERATELY: validation is rank-0-only, so gathering here
             # would issue collectives no other rank answers and hang until the NCCL
             # watchdog fires. The LOSS remains batch-local (~16 TS rows/batch), but
-            # accuracy/F1/gap are replaced below by one calculation over every TS row
-            # collected from this fixed validation subset (~519 in production).
+            # accuracy/F1/gap are replaced below by one calculation over every TS row.
             _, metrics = _compute_losses(
                 model,
                 batch,
@@ -298,7 +322,11 @@ def _run_validation(
             if k.startswith(
                 (
                     "accuracy/",
+                    "precision_macro/",
+                    "recall_macro/",
                     "f1_",
+                    "recall_at_",
+                    "map/",
                     "gap/",
                     "eff_dim/",
                     "label_coverage/",
@@ -312,7 +340,7 @@ def _run_validation(
             sums[k] = sums.get(k, 0.0) + float(v)
             counts[k] = counts.get(k, 0) + 1
         n_seen += 1
-        if n_seen >= n_batches:
+        if n_batches is not None and n_seen >= n_batches:
             break
 
     averaged = {key: (sums[key] / counts[key]) for key in sums}
@@ -323,6 +351,7 @@ def _run_validation(
         prototype_bank,
         gcms_bank=gcms_bank,
         per_class_reports=per_class_reports,
+        paired_families=tuple(cfg.loss.get("paired_text_families") or ()),
     )
 
     if was_training:
@@ -395,10 +424,9 @@ def _family_prototype_siglip_loss(
     prototype_bank: dict[str, tuple[tuple[str, ...], torch.Tensor]],
     enabled_families: tuple[str, ...],
     log_logit_scale: torch.Tensor,
-) -> tuple[Optional[torch.Tensor], Optional[float], dict[str, float]]:
+) -> tuple[Optional[torch.Tensor], dict[str, torch.Tensor], dict[str, float]]:
     """Average class-balanced SigLIP losses over fixed family vocabularies."""
-    family_losses: list[torch.Tensor] = []
-    positive_rates: list[float] = []
+    family_losses: dict[str, torch.Tensor] = {}
     coverage: dict[str, float] = {}
     for family in enabled_families:
         global_rows = [i for i, value in enumerate(families) if value == family]
@@ -434,25 +462,69 @@ def _family_prototype_siglip_loss(
         row_weight = class_count.index_select(0, targets).reciprocal().unsqueeze(1)
         positive_rate = 1.0 / num_classes
         family_bias = anchors.new_tensor(math.log(positive_rate / (1.0 - positive_rate)))
-        family_losses.append(
-            siglip_sigmoid(
-                anchors,
-                prototypes,
-                log_logit_scale,
-                family_bias,
-                pos_mask=pos_mask,
-                pair_weight=row_weight,
-            )
+        family_losses[family] = siglip_sigmoid(
+            anchors,
+            prototypes,
+            log_logit_scale,
+            family_bias,
+            pos_mask=pos_mask,
+            pair_weight=row_weight,
         )
-        positive_rates.append(positive_rate)
 
     if not family_losses:
-        return None, None, coverage
-    return (
-        torch.stack(family_losses).mean(),
-        sum(positive_rates) / len(positive_rates),
-        coverage,
-    )
+        return None, {}, coverage
+    return torch.stack(tuple(family_losses.values())).mean(), family_losses, coverage
+
+
+def _family_paired_siglip_losses(
+    model: MultimodalAlignmentModel,
+    z_ts: torch.Tensor,
+    texts: list[str],
+    families: list[str],
+    enabled_families: tuple[str, ...],
+) -> tuple[
+    dict[str, torch.Tensor],
+    list[tuple[str, torch.Tensor, torch.Tensor, list[str]]],
+]:
+    """Align each sensor with every chunk of its complete caption."""
+    losses: dict[str, torch.Tensor] = {}
+    retrieval: list[tuple[str, torch.Tensor, torch.Tensor, list[str]]] = []
+    for family in enabled_families:
+        rows = [index for index, value in enumerate(families) if value == family]
+        if len(rows) < 2:
+            continue
+        select = torch.tensor(rows, device=z_ts.device, dtype=torch.long)
+        anchors = z_ts.index_select(0, select)
+        captions = [texts[index] for index in rows]
+        raw_chunks, owners = model.encode_text_chunks(captions, device=z_ts.device)
+        targets = model.project(model.proj_text, raw_chunks.float())
+        counts = torch.bincount(owners, minlength=len(captions))
+        positive = torch.arange(len(captions), device=z_ts.device)[:, None] == owners[None, :]
+        chunk_weight = counts.index_select(0, owners).reciprocal().unsqueeze(0)
+        positive_rate = 1.0 / len(captions)
+        bias = anchors.new_tensor(math.log(positive_rate / (1.0 - positive_rate)))
+        losses[family] = siglip_sigmoid(
+            anchors,
+            targets,
+            model.log_logit_scale,
+            bias,
+            pos_mask=positive,
+            pair_weight=chunk_weight,
+        )
+        pooled = targets.new_zeros((len(captions), targets.shape[-1]))
+        pooled.index_add_(0, owners, targets)
+        pooled = model._norm(pooled / counts.unsqueeze(1))
+        retrieval.append((family, anchors.detach().float(), pooled.detach().float(), captions))
+        if not getattr(model, "_logged_paired_text_chunks", False):
+            logger.info(
+                "paired %s text: answers=%d chunks=%d max_chunks/answer=%d",
+                family,
+                len(captions),
+                len(owners),
+                int(counts.max()),
+            )
+            model._logged_paired_text_chunks = True
+    return losses, retrieval
 
 
 def _compute_losses(
@@ -475,20 +547,12 @@ def _compute_losses(
         batch["img_video"],
         device,
         visual_dtype,
+        max_image_tokens=cfg.data.get("max_image_tokens"),
     )
     feat_ts = None
     ts_signal = batch.get("ts_signal")
     if ts_signal:
         ts_formats = list(batch.get("ts_format") or [])
-        crop_steps = dict(cfg.data.get("temporal_crop_steps") or {})
-        if model.training and crop_steps:
-            missing = sorted(set(ts_formats) - set(crop_steps))
-            if missing:
-                raise ValueError(f"temporal_crop_steps missing signal families {missing}")
-            ts_signal = [
-                temporal_crop(signal, family, int(crop_steps[family]))
-                for signal, family in zip(ts_signal, ts_formats, strict=True)
-            ]
         feat_ts = model.encode_ts_trainable(ts_signal, ts_formats, device=device)
 
     ts_text = list(batch["ts_signal_text"])
@@ -524,18 +588,31 @@ def _compute_losses(
             prototype_bank,
             projected_families,
         )
-        enabled_families = tuple(str(value) for value in (cfg.loss.get("prototype_families") or _TS_FAMILIES))
-        l_ts, _, _ = _family_prototype_siglip_loss(
+        prototype_families = tuple(str(value) for value in (cfg.loss.get("prototype_families") or ()))
+        _, family_ts_losses, _ = _family_prototype_siglip_loss(
             c_ts,
             c_labels,
             c_family,
             projected_bank,
-            enabled_families,
+            prototype_families,
             model.log_logit_scale,
         )
-        if l_ts is not None:
+        paired_losses, retrieval = _family_paired_siglip_losses(
+            model,
+            c_ts,
+            c_labels,
+            c_family,
+            tuple(str(value) for value in (cfg.loss.get("paired_text_families") or ())),
+        )
+        family_ts_losses.update(paired_losses)
+        if family_ts_losses:
+            l_ts = torch.stack(tuple(family_ts_losses.values())).mean()
             total = total + float(w.ts_text) * l_ts
             metrics["loss/ts_text"] = l_ts.detach().item()
+            metrics.update({
+                f"loss/ts_{family}": family_loss.detach().item()
+                for family, family_loss in family_ts_losses.items()
+            })
 
         if gcms_bank is not None:
             text_smell = projected_bank.get("smell")
@@ -588,6 +665,7 @@ def _compute_losses(
             ts_eval_collector["z"].append(c_ts.detach().float())
             ts_eval_collector["labels"].extend(c_labels)
             ts_eval_collector["families"].extend(c_family)
+            ts_eval_collector["retrieval"].extend(retrieval)
 
     if feat_img is not None and feat_ref_img is not None and feat_img.shape[0] > 0:
         l_img = distill_cosine(

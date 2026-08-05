@@ -3,8 +3,9 @@
 from types import SimpleNamespace
 
 import torch
+import torch.utils.checkpoint as torch_checkpoint
 
-from mirl_ext.alignment.model import MultimodalAlignmentModel, temporal_crop
+from mirl_ext.alignment.model import MultimodalAlignmentModel, _enable_block_checkpointing
 
 
 def _renderer() -> MultimodalAlignmentModel:
@@ -51,24 +52,6 @@ def test_scalar_rendering_preserves_values_geometry_and_missing_masks():
     assert torch.equal(model._normalize_scalar_rows(values, "prestandardized"), expected)
 
 
-def test_temporal_crop_is_local_and_tactile_fields_stay_aligned():
-    scalar = torch.arange(20, dtype=torch.float32).unsqueeze(0)
-    crop = temporal_crop(scalar, "ecg", 6, generator=torch.Generator().manual_seed(3))
-    start = int(crop[0, 0])
-    assert crop.shape == (1, 6)
-    assert torch.equal(crop, scalar[:, start : start + 6])
-
-    pressure = torch.zeros(15, 16, 16)
-    pressure[10] = 5.0
-    payload = {
-        "tactile": pressure,
-        "force": torch.arange(15, dtype=torch.float32).unsqueeze(1),
-    }
-    crop = temporal_crop(payload, "tactile", 5)
-    assert int(crop["force"][0]) == 8
-    assert torch.equal(crop["tactile"], pressure[8:13])
-
-
 def test_tactile_rendering_keeps_pressure_delta_and_force_cells_separate():
     model = _renderer()
     payload = {
@@ -83,6 +66,12 @@ def test_tactile_rendering_keeps_pressure_delta_and_force_cells_separate():
     assert grid.tolist() == [[24, 2, 4]]
     assert _postmerge_tokens(grid) == 48
     assert pixels.min() >= -1 and pixels.max() <= 1
+
+
+def test_tactile_uses_fixed_opentouch_pressure_scale():
+    values = torch.tensor([[-10.0, 0.0, 1536.0, 3072.0, 4000.0]])
+    expected = torch.tensor([[-1.0, -1.0, 0.0, 1.0, 1.0]])
+    assert torch.equal(MultimodalAlignmentModel._normalize_tactile(values), expected)
 
 
 def test_qwen_branch_can_return_tokens_or_pool_per_sample():
@@ -105,3 +94,62 @@ def test_qwen_branch_can_return_tokens_or_pool_per_sample():
 
     assert torch.equal(tokens, visual.tokens)
     assert torch.equal(pooled, torch.stack((visual.tokens[:2].mean(0), visual.tokens[2])))
+
+
+def test_text_encoder_exposes_and_mean_pools_all_overflow_chunks():
+    model = _renderer()
+
+    class Tokens(dict):
+        def to(self, device):
+            return Tokens({key: value.to(device) for key, value in self.items()})
+
+    class Tokenizer:
+        def __call__(self, texts, **kwargs):
+            assert texts == ["short", "long"]
+            assert kwargs["max_length"] == 64
+            assert kwargs["return_overflowing_tokens"] is True
+            return Tokens(
+                input_ids=torch.tensor([[1.0], [2.0], [4.0]]),
+                overflow_to_sample_mapping=torch.tensor([0, 1, 1]),
+            )
+
+    class TextModel(torch.nn.Module):
+        config = SimpleNamespace(max_position_embeddings=64)
+
+        def forward(self, input_ids):
+            return SimpleNamespace(pooler_output=torch.cat((input_ids, torch.zeros_like(input_ids)), dim=1))
+
+    model.label_tokenizer = Tokenizer()
+    model.label_text_model = TextModel()
+    chunks, owners = model.encode_text_chunks(["short", "long"], torch.device("cpu"))
+    encoded = model.encode_text(["short", "long"], torch.device("cpu"))
+
+    assert torch.equal(chunks, torch.tensor([[1.0, 0.0], [2.0, 0.0], [4.0, 0.0]]))
+    assert torch.equal(owners, torch.tensor([0, 1, 1]))
+    assert torch.equal(encoded, torch.tensor([[1.0, 0.0], [3.0, 0.0]]))
+
+
+def test_block_checkpointing_is_training_only(monkeypatch):
+    calls = []
+
+    class Block(torch.nn.Module):
+        def forward(self, value, scale=1):
+            return value * scale
+
+    block = Block()
+    visual = SimpleNamespace(blocks=torch.nn.ModuleList([block]))
+
+    def checkpoint(function, *args, use_reentrant, **kwargs):
+        calls.append(use_reentrant)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(torch_checkpoint, "checkpoint", checkpoint)
+    assert _enable_block_checkpointing(visual) == 1
+
+    block.train()
+    assert block(torch.tensor(2.0), scale=3).item() == 6
+    assert calls == [False]
+
+    block.eval()
+    assert block(torch.tensor(2.0), scale=4).item() == 8
+    assert calls == [False]

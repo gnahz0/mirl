@@ -90,20 +90,9 @@ def _dataset(
 ) -> AlignmentDataset:
     return AlignmentDataset(
         data_files=files,
-        text_for_label=cfg.data.text_for_label,
-        tactile_label_mode=cfg.data.tactile_label_mode,
         max_samples=max_samples,
-        balanced_sampling_key=cfg.data.balanced_sampling_key,
         seed=seed,
-        enable_videos=cfg.data.enable_videos,
         max_video_frames=cfg.data.max_video_frames,
-        image_patch_size=cfg.data.image_patch_size,
-        video_load_timeout=cfg.data.get("video_load_timeout", 30),
-        video_suppress_stderr=cfg.data.get("video_suppress_stderr", True),
-        data_source_filter=list(cfg.data.get("data_source_filter") or []) or None,
-        exclude_data_sources=list(cfg.data.exclude_data_sources),
-        tactile_max_frames=cfg.data.tactile_max_frames,
-        include_all_ts=cfg.data.include_all_ts,
     )
 
 
@@ -172,10 +161,10 @@ def build_loaders(
         pin_memory=True,
     )
     logger.info(
-        "val dataset: %d rows, batch=%d, batches/eval=%d (%.1fs)",
+        "val dataset: %d rows, batch=%d, batches/eval=%s (%.1fs)",
         len(val_ds),
         cfg.train.val_batch_size,
-        val_batches,
+        "all" if val_batches is None else val_batches,
         time.time() - started,
     )
     return train_ds, train_loader, train_sampler, val_loader
@@ -200,6 +189,7 @@ def build_model(
         shared_dim=cfg.projection.shared_dim,
         proj_hidden_dim=cfg.projection.hidden_dim,
         visual_dtype=visual_dtype,
+        gradient_checkpointing=bool(cfg.model.get("gradient_checkpointing", False)),
         ecg_normalization=cfg.model.ecg_normalization,
         tactile_delta_channels=cfg.model.tactile_delta_channels,
         gcms_input_dim=gcms_cpu.features.shape[1] if gcms_cpu is not None else None,

@@ -117,7 +117,7 @@ def train(cfg: DictConfig) -> None:
     metric_sums: dict[str, float] = {}
     metric_observations: dict[str, int] = {}
     # Keep embeddings from the exact microbatches contributing to one update.
-    ts_eval = {"z": [], "labels": [], "families": []} if is_main else None
+    ts_eval = {"z": [], "labels": [], "families": [], "retrieval": []} if is_main else None
     opt_step = 0
     best_value = float("-inf")
     started = time.time()
@@ -128,7 +128,7 @@ def train(cfg: DictConfig) -> None:
         for batch_index, batch in enumerate(train_loader):
             window_start = (batch_index // grad_accum) * grad_accum
             window_size = min(grad_accum, micro_batches_per_epoch - window_start)
-            micro_eval = {"z": [], "labels": [], "families": []} if is_main else None
+            micro_eval = {"z": [], "labels": [], "families": [], "retrieval": []} if is_main else None
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 loss, metrics = _compute_losses(
                     model,
@@ -150,6 +150,7 @@ def train(cfg: DictConfig) -> None:
                 ts_eval["z"].extend(micro_eval["z"])
                 ts_eval["labels"].extend(micro_eval["labels"])
                 ts_eval["families"].extend(micro_eval["families"])
+                ts_eval["retrieval"].extend(micro_eval["retrieval"])
             for key, value in metrics.items():
                 metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
                 metric_observations[key] = metric_observations.get(key, 0) + 1
@@ -167,6 +168,7 @@ def train(cfg: DictConfig) -> None:
                     ts_eval,
                     prototype_bank,
                     gcms_bank=gcms_bank,
+                    paired_families=tuple(cfg.loss.get("paired_text_families") or ()),
                 )
                 if is_main
                 else {}
@@ -203,7 +205,7 @@ def train(cfg: DictConfig) -> None:
                 )
 
             if validate_now:
-                # Other ranks wait while rank 0 evaluates the fixed validation subset.
+                # Other ranks wait while rank 0 evaluates validation.
                 dist.barrier()
                 if is_main:
                     best_value = report_validation(
@@ -225,7 +227,7 @@ def train(cfg: DictConfig) -> None:
             counts = new_counts()
             metric_sums = {}
             metric_observations = {}
-            ts_eval = {"z": [], "labels": [], "families": []} if is_main else None
+            ts_eval = {"z": [], "labels": [], "families": [], "retrieval": []} if is_main else None
 
     if is_main:
         pbar.close()

@@ -147,7 +147,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
     from omegaconf import OmegaConf
 
-    from mirl_ext.alignment.data import AlignmentDataset
+    from mirl_ext.alignment.data import AlignmentDataset, collate_alignment
     from mirl_ext.alignment.model import MultimodalAlignmentModel
 
     config_path = Path(args.config) if args.config else Path("mirl_ext/alignment/config/stage1_qwen35_siglip2.yaml")
@@ -169,15 +169,8 @@ def main() -> None:
 
     ds = AlignmentDataset(
         data_files=files,
-        text_for_label=cfg.data.get("text_for_label", "ground_truth"),
-        tactile_label_mode=str(cfg.data.get("tactile_label_mode", "ground_truth")),
-        max_samples=-1,
         seed=cfg.train.get("seed", 42),
-        enable_videos=False,  # ts branch only; skip video decode entirely
         data_source_filter=sources,
-        exclude_data_sources=list(cfg.data.get("exclude_data_sources") or []) or None,
-        tactile_max_frames=cfg.data.get("tactile_max_frames"),
-        include_all_ts=True,
     )
     print(f"\ndataset: {len(ds)} rows for {sources}")
 
@@ -186,11 +179,13 @@ def main() -> None:
         if len(signals) >= args.samples:
             break
         item = ds[i]
-        if item["branch"] != "ts" or item["media"] is None:
+        if item["kind"] != "signal":
             continue
-        signals.append(item["media"])
-        formats.append(item.get("ts_format", "smell"))
-        texts.append(item["text"])
+        batch = collate_alignment([item])
+        remaining = args.samples - len(signals)
+        signals.extend(batch["ts_signal"][:remaining])
+        formats.extend(batch["ts_format"][:remaining])
+        texts.extend(batch["ts_signal_text"][:remaining])
     print(f"loaded {len(signals)} signals, {len(set(texts))} distinct labels")
     if len(signals) < 4:
         raise SystemExit("too few signals loaded to say anything")

@@ -114,7 +114,16 @@ def report_validation(
         payload = dict(metrics)
         if is_best:
             payload.update({"best/metric": current, "best/step": step})
-        columns = ("class_id", "label", "support", "predicted", "precision", "recall", "f1")
+        columns = (
+            "class_id",
+            "label",
+            "support",
+            "predicted",
+            "precision",
+            "recall",
+            "f1",
+            "recall_at_5",
+        )
         for family, rows in per_class.items():
             payload[f"val-aux/per_class/{_METRIC_FAMILY_NAMES[family]}"] = wandb.Table(
                 columns=list(columns),
