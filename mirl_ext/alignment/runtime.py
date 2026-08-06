@@ -64,6 +64,7 @@ def build_loaders(
     train_ds = AlignmentDataset(
         list(cfg.data.train_files),
         max_video_frames=cfg.data.max_video_frames,
+        path_rewrites=dict(cfg.data.get("path_rewrites", {})),
     )
     logger.info("train dataset: %d rows (%.1fs)", len(train_ds), time.time() - started)
 
@@ -93,6 +94,7 @@ def build_loaders(
     val_ds = AlignmentDataset(
         list(cfg.data.val_files),
         max_video_frames=cfg.data.max_video_frames,
+        path_rewrites=dict(cfg.data.get("path_rewrites", {})),
     )
     val_sampler = HomogeneousBatchSampler(
         val_ds,

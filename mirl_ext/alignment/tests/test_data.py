@@ -142,6 +142,50 @@ def test_multi_media_rows_expand_every_unique_path(tmp_path):
     assert len(visited) == len(set(visited)) == len(dataset)
 
 
+def test_dataset_rewrites_every_embedded_media_path(tmp_path):
+    rows = [
+        {
+            "data_source": "climb",
+            "images": [
+                {"image": "/old/images/a.png"},
+                {"image": "/old/images/b.png"},
+            ],
+            "videos": None,
+            "signals": None,
+            "reward_model": {"ground_truth": "ignored visual annotation"},
+        },
+        {
+            "data_source": "tactile",
+            "images": None,
+            "videos": [{"video": "/old/videos/a.mp4"}],
+            "signals": None,
+            "reward_model": {"ground_truth": "ignored video annotation"},
+        },
+        {
+            "data_source": "ecg",
+            "images": None,
+            "videos": None,
+            "signals": [{"signal": "/old/signals/a.pt", "format": "ts_pt"}],
+            "reward_model": {"ground_truth": "Normal"},
+        },
+    ]
+
+    dataset = _dataset(tmp_path, "rewrites", rows, path_rewrites={"/old": "/new"})
+
+    paths = {
+        entry[key]
+        for row in dataset.rows
+        for column, key in (("images", "image"), ("videos", "video"), ("signals", "signal"))
+        for entry in (row.get(column) or [])
+    }
+    assert paths == {
+        "/new/images/a.png",
+        "/new/images/b.png",
+        "/new/videos/a.mp4",
+        "/new/signals/a.pt",
+    }
+
+
 def test_collate_keeps_complete_source_homogeneous_signals():
     signals = [
         torch.arange(12, dtype=torch.float32).reshape(2, 6),

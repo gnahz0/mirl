@@ -22,6 +22,41 @@ os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 _SIGNAL_FAMILIES = ("smellnet", "ecg", "tactile")
 
 
+def _rewrite_path(path: str, rewrites: tuple[tuple[str, str], ...]) -> str:
+    """Replace the longest matching path prefix."""
+    for old, new in rewrites:
+        if path == old or path.startswith(f"{old}/"):
+            return f"{new}{path[len(old):]}"
+    return path
+
+
+def _rewrite_media_paths(row: dict, rewrites: tuple[tuple[str, str], ...]) -> int:
+    """Translate embedded image, video, and signal paths in one Parquet row."""
+    changed = 0
+    for column, primary_key in (
+        ("images", "image"),
+        ("videos", "video"),
+        ("signals", "signal"),
+    ):
+        entries = row.get(column) or []
+        for index, entry in enumerate(entries):
+            if isinstance(entry, str):
+                rewritten = _rewrite_path(entry, rewrites)
+                entries[index] = rewritten
+                changed += rewritten != entry
+                continue
+            if not isinstance(entry, dict):
+                continue
+            for key in (primary_key, "path"):
+                path = entry.get(key)
+                if not path:
+                    continue
+                rewritten = _rewrite_path(str(path), rewrites)
+                entry[key] = rewritten
+                changed += rewritten != path
+    return changed
+
+
 def _visual_entries(row: dict) -> list[tuple[str, tuple[str, str], dict | str]]:
     """Return every physical image/video entry and its path-based key."""
     media: list[tuple[str, tuple[str, str], dict | str]] = []
@@ -102,12 +137,27 @@ class AlignmentDataset(Dataset):
         self,
         data_files: list[str],
         max_video_frames: int = 8,
+        path_rewrites: dict[str, str] | None = None,
     ):
         self.max_video_frames = max_video_frames
 
         rows: list[dict] = []
         for path in data_files:
             rows.extend(pq.read_table(path).to_pylist())
+
+        rewrites = tuple(
+            sorted(
+                (
+                    (str(old).rstrip("/"), str(new).rstrip("/"))
+                    for old, new in (path_rewrites or {}).items()
+                ),
+                key=lambda pair: len(pair[0]),
+                reverse=True,
+            )
+        )
+        rewritten = sum(_rewrite_media_paths(row, rewrites) for row in rows) if rewrites else 0
+        if rewritten:
+            logger.info("rewrote %d embedded media paths", rewritten)
 
         rows = [row for row in rows if row["data_source"] != "smellnet_mixture"]
         rows, visual_paths, repeated = _expand_and_deduplicate_visual_rows(rows)
