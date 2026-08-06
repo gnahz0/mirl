@@ -130,6 +130,55 @@ def _load_signal_csv(path: str) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(data.T))
 
 
+def _factor_aligned_video_size(height: int, width: int, factor: int = 32) -> tuple[int, int]:
+    """Make an extreme video aspect ratio acceptable to Qwen without dropping it."""
+    def ceil_factor(value: int) -> int:
+        return ((value + factor - 1) // factor) * factor
+
+    target_height = ceil_factor(max(height, factor))
+    target_width = ceil_factor(max(width, factor))
+    # qwen-vl-utils rejects ratios above 200; use 199 to avoid a rounding edge.
+    if target_height > 199 * target_width:
+        target_width = ceil_factor((target_height + 198) // 199)
+    elif target_width > 199 * target_height:
+        target_height = ceil_factor((target_width + 198) // 199)
+    return target_height, target_width
+
+
+def _process_video_with_extreme_aspect_fallback(video: dict, max_frames: int):
+    """Process a video, resizing only when Qwen rejects its raw aspect ratio."""
+    from verl.utils.dataset.vision_utils import process_video
+
+    kwargs = {
+        "image_patch_size": 16,
+        "return_video_metadata": True,
+        "nframes": max_frames,
+    }
+    try:
+        return process_video(video, **kwargs)
+    except ValueError as error:
+        if "absolute aspect ratio must be smaller" not in str(error):
+            raise
+
+    from torchcodec.decoders import VideoDecoder
+
+    path = video["video"]
+    frame = VideoDecoder(path, num_ffmpeg_threads=1)[0]
+    height, width = (int(value) for value in frame.shape[-2:])
+    resized_height, resized_width = _factor_aligned_video_size(height, width)
+    adjusted = dict(video)
+    adjusted.update(resized_height=resized_height, resized_width=resized_width)
+    logger.warning(
+        "resizing extreme-aspect video %s from %dx%d to %dx%d",
+        path,
+        height,
+        width,
+        resized_height,
+        resized_width,
+    )
+    return process_video(adjusted, **kwargs)
+
+
 class AlignmentDataset(Dataset):
     """Yield lazily loaded image, video, or native-signal samples."""
 
@@ -235,17 +284,10 @@ class AlignmentDataset(Dataset):
 
             return {"kind": "image", "media": process_image(images[0])}
 
-        from verl.utils.dataset.vision_utils import process_video
-
         video = sample["videos"][0]
         return {
             "kind": "video",
-            "media": process_video(
-                video,
-                image_patch_size=16,
-                return_video_metadata=True,
-                nframes=self.max_video_frames,
-            ),
+            "media": _process_video_with_extreme_aspect_fallback(video, self.max_video_frames),
         }
 
 

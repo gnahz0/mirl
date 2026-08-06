@@ -5,7 +5,12 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from mirl_ext.alignment.data import AlignmentDataset, HomogeneousBatchSampler, collate_alignment
+from mirl_ext.alignment.data import (
+    AlignmentDataset,
+    HomogeneousBatchSampler,
+    _factor_aligned_video_size,
+    collate_alignment,
+)
 
 
 def _dataset(tmp_path, name, rows, **kwargs):
@@ -184,6 +189,12 @@ def test_dataset_rewrites_every_embedded_media_path(tmp_path):
         "/new/videos/a.mp4",
         "/new/signals/a.pt",
     }
+
+
+def test_extreme_video_size_is_retained_with_safe_factor_alignment():
+    assert _factor_aligned_video_size(512, 2) == (512, 32)
+    assert _factor_aligned_video_size(2, 512) == (32, 512)
+    assert _factor_aligned_video_size(480, 640) == (480, 640)
 
 
 def test_collate_keeps_complete_source_homogeneous_signals():
