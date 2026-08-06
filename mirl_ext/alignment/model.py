@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import math
 import time
@@ -28,32 +27,6 @@ def _resolve_snapshot(path_or_repo: str) -> Path:
     return Path(snapshot_download(repo_id=path_or_repo)).resolve()
 
 
-def _load_safetensor_prefix(
-    root: Path,
-    prefix: str,
-    *,
-    strip_prefix: bool,
-) -> dict[str, torch.Tensor]:
-    from safetensors import safe_open
-
-    index_path = root / "model.safetensors.index.json"
-    if index_path.exists():
-        weight_map = json.loads(index_path.read_text())["weight_map"]
-        filenames = sorted({name for key, name in weight_map.items() if key.startswith(prefix)})
-    elif (root / "model.safetensors").exists():
-        filenames = ["model.safetensors"]
-    else:
-        raise FileNotFoundError(f"no safetensors checkpoint found under {root}")
-
-    state: dict[str, torch.Tensor] = {}
-    for filename in filenames:
-        with safe_open(root / filename, framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                if key.startswith(prefix):
-                    state[key.removeprefix(prefix) if strip_prefix else key] = handle.get_tensor(key)
-    return state
-
-
 def _load_exact_qwen35_visual(
     path_or_repo: str,
     *,
@@ -67,11 +40,13 @@ def _load_exact_qwen35_visual(
     full_config = AutoConfig.from_pretrained(root, local_files_only=True)
     vision_config = full_config.vision_config
     vision_config._attn_implementation = "sdpa"
-    visual = Qwen3_5VisionModel(vision_config).to(dtype=dtype)
-
-    state = _load_safetensor_prefix(root, "model.visual.", strip_prefix=True)
-    visual.load_state_dict(state, strict=True)
-    return visual
+    return Qwen3_5VisionModel.from_pretrained(
+        root,
+        config=vision_config,
+        dtype=dtype,
+        local_files_only=True,
+        key_mapping={r"^model\.visual\.": ""},
+    )
 
 
 def _enable_block_checkpointing(visual: nn.Module) -> int:
