@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -16,8 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
-_TACTILE_PRESSURE_MAX = 3072.0
 
 
 def _resolve_snapshot(path_or_repo: str) -> Path:
@@ -59,7 +58,6 @@ def _load_exact_qwen35_visual(
     path_or_repo: str,
     *,
     dtype: torch.dtype,
-    attn_impl: str,
 ) -> nn.Module:
     """Load the native Qwen3.5 vision tower without materializing the 9B LM."""
     from transformers import AutoConfig
@@ -68,7 +66,7 @@ def _load_exact_qwen35_visual(
     root = _resolve_snapshot(path_or_repo)
     full_config = AutoConfig.from_pretrained(root, local_files_only=True)
     vision_config = full_config.vision_config
-    vision_config._attn_implementation = attn_impl
+    vision_config._attn_implementation = "sdpa"
     visual = Qwen3_5VisionModel(vision_config).to(dtype=dtype)
 
     state = _load_safetensor_prefix(root, "model.visual.", strip_prefix=True)
@@ -76,33 +74,24 @@ def _load_exact_qwen35_visual(
     return visual
 
 
-def _load_exact_siglip2_text(path_or_repo: str, *, dtype: torch.dtype) -> nn.Module:
-    """Load only ``text_model.*`` from the full SigLIP2 checkpoint, strictly."""
-    from transformers import AutoConfig, Siglip2TextModel
-
-    root = _resolve_snapshot(path_or_repo)
-    full_config = AutoConfig.from_pretrained(root, local_files_only=True)
-    text_model = Siglip2TextModel(full_config.text_config).to(dtype=dtype)
-
-    state = _load_safetensor_prefix(root, "text_model.", strip_prefix=False)
-    text_model.load_state_dict(state, strict=True)
-    return text_model
-
-
 def _enable_block_checkpointing(visual: nn.Module) -> int:
-    """Checkpoint trainable vision blocks; Qwen's vision loop ignores HF's flag."""
-    import torch.utils.checkpoint as checkpoint
+    """Wrap Qwen vision blocks because its forward loop ignores the HF flag."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        CheckpointImpl,
+        apply_activation_checkpointing,
+        checkpoint_wrapper,
+    )
 
-    for block in visual.blocks:
-        original_forward = block.forward
-
-        def forward(*args, _block=block, _forward=original_forward, **kwargs):
-            if _block.training:
-                return checkpoint.checkpoint(_forward, *args, use_reentrant=False, **kwargs)
-            return _forward(*args, **kwargs)
-
-        block.forward = forward
-    return len(visual.blocks)
+    blocks = set(visual.blocks)
+    apply_activation_checkpointing(
+        visual,
+        checkpoint_wrapper_fn=partial(
+            checkpoint_wrapper,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        ),
+        check_fn=blocks.__contains__,
+    )
+    return len(blocks)
 
 
 class MultimodalAlignmentModel(nn.Module):
@@ -113,12 +102,11 @@ class MultimodalAlignmentModel(nn.Module):
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
         visual_dtype: torch.dtype = torch.bfloat16,
-        attn_impl: str = "sdpa",
         gradient_checkpointing: bool = False,
         contrastive_temperature: float = 0.07,
     ):
         super().__init__()
-        from transformers import AutoProcessor, AutoTokenizer
+        from transformers import AutoProcessor, AutoTokenizer, Siglip2TextModel
 
         logger.info("[1/4] loading Qwen3.5 processor from %s", qwen35_path)
         started = time.time()
@@ -126,12 +114,11 @@ class MultimodalAlignmentModel(nn.Module):
         self.qwen_processor = AutoProcessor.from_pretrained(qwen_root, local_files_only=True)
         logger.info("       processor ready (%.1fs)", time.time() - started)
 
-        logger.info("[2/4] loading exact Qwen3.5 model.visual weights (dtype=%s, attn=%s)", visual_dtype, attn_impl)
+        logger.info("[2/4] loading exact Qwen3.5 model.visual weights (dtype=%s)", visual_dtype)
         started = time.time()
         self.trainable_visual = _load_exact_qwen35_visual(
             str(qwen_root),
             dtype=visual_dtype,
-            attn_impl=attn_impl,
         )
         logger.info(
             "       trainable VE ready: %.1fM params (%.1fs)",
@@ -164,12 +151,14 @@ class MultimodalAlignmentModel(nn.Module):
         started = time.time()
         siglip_root = _resolve_snapshot(siglip2_text_path)
         self.label_tokenizer = AutoTokenizer.from_pretrained(siglip_root, local_files_only=True)
-        self.label_text_model = _load_exact_siglip2_text(str(siglip_root), dtype=visual_dtype)
+        # The model class loads the text prefix and ignores the vision weights.
+        self.label_text_model = Siglip2TextModel.from_pretrained(
+            siglip_root, local_files_only=True
+        ).to(dtype=visual_dtype)
         self.label_text_model.requires_grad_(False).eval()
-        label_hidden = self.label_text_model.config.projection_size
         logger.info(
             "       SigLIP2 text ready: hidden=%d (%.1fs)",
-            label_hidden,
+            self.label_text_model.config.projection_size,
             time.time() - started,
         )
 
@@ -193,6 +182,53 @@ class MultimodalAlignmentModel(nn.Module):
         counts = grid_thw.prod(dim=1).tolist()
         return torch.stack([tokens.mean(dim=0) for tokens in embeds.split(counts)])
 
+    def forward(
+        self,
+        kind: str,
+        media: list,
+        family: str | None,
+        max_image_tokens: int,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+    ]:
+        """Encode one source-homogeneous batch through the trainable tower."""
+        device = next(self.trainable_visual.parameters()).device
+        logit_scale = self.log_logit_scale * 1.0
+        if kind == "signal":
+            signal_features = self.encode_ts_trainable(media, family, device)
+            return None, None, None, signal_features, logit_scale
+
+        if kind == "image":
+            token_pixels = (self.vit_patch_size * self.vit_merge_size) ** 2
+            max_pixels = max_image_tokens * token_pixels
+            min_pixels = min(int(self.qwen_processor.image_processor.size["shortest_edge"]), max_pixels)
+            processed = self.qwen_processor.image_processor.preprocess(
+                media,
+                size={"shortest_edge": min_pixels, "longest_edge": max_pixels},
+                return_tensors="pt",
+            )
+            pixel_key, grid_key = "pixel_values", "image_grid_thw"
+        else:
+            tensors, metadata = zip(*media, strict=True)
+            processed = self.qwen_processor.video_processor.preprocess(
+                list(tensors),
+                video_metadata=list(metadata),
+                do_sample_frames=False,
+                return_tensors="pt",
+            )
+            pixel_key, grid_key = "pixel_values_videos", "video_grid_thw"
+
+        pixels = processed[pixel_key].to(device=device)
+        grid = processed[grid_key].to(device=device)
+        token_counts = grid.prod(dim=1)
+        features = self.encode_visual(pixels, grid, pool=False)
+        references = self.encode_visual(pixels, grid, frozen=True, pool=False)
+        return features, references, token_counts, None, logit_scale
+
     @staticmethod
     def _robust_normalize_rows(x: torch.Tensor) -> torch.Tensor:
         """Normalize each row with a median/MAD/std blend into ``[-1, 1]``."""
@@ -209,8 +245,12 @@ class MultimodalAlignmentModel(nn.Module):
         """Pack consecutive merger-cell-width signal blocks as video frames."""
         cell = self.vit_patch_size * self.vit_merge_size
         finite = torch.isfinite(signal)
-        raw = torch.nan_to_num(signal.float())
-        value = raw.clamp(-4.0, 4.0) / 4.0 if prestandardized else self._robust_normalize_rows(raw)
+        raw = signal.float()
+        value = (
+            torch.nan_to_num(raw).clamp(-4.0, 4.0) / 4.0
+            if prestandardized
+            else self._robust_normalize_rows(raw)
+        )
         value = value.masked_fill(~finite, -1.0)
 
         channels, steps = value.shape
@@ -220,60 +260,32 @@ class MultimodalAlignmentModel(nn.Module):
         tiles = tiles.repeat_interleave(cell, dim=1)
         return tiles.unsqueeze(1).expand(-1, 3, -1, -1)
 
-    def _tactile_frame_tiles(self, payload: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Build ``(T,3,S,2S)`` tactile/force tiles at merger-cell resolution."""
+    def _tactile_frames(self, tactile: torch.Tensor) -> torch.Tensor:
+        """Normalize each taxel over time and resize each map to one merger cell."""
         side = self.vit_patch_size * self.vit_merge_size
-        tac = payload["tactile"]
-        force = payload.get("force")
-        finite = torch.isfinite(tac)
-        value = torch.nan_to_num(tac.float()).clamp(0.0, _TACTILE_PRESSURE_MAX)
-        value = value.mul(2.0 / _TACTILE_PRESSURE_MAX).sub(1.0)
+        finite = torch.isfinite(tactile)
+        taxels = tactile.float().flatten(1).t()
+        value = self._robust_normalize_rows(taxels).t().reshape_as(tactile)
         value = value.masked_fill(~finite, -1.0)
-        value = F.interpolate(value.unsqueeze(1), size=(side, side), mode="nearest").squeeze(1)
-
-        frame_count = value.shape[0]
-        delta = torch.zeros_like(value)
-        delta[1:] = (value[1:] - value[:-1]) * 0.5
-        tactile_frames = torch.stack((value, delta, value), dim=1)
-
-        # The adjacent merger cell carries the right-hand force summaries.
-        force_frames = value.new_full((frame_count, 3, side, side), -1.0)
-        if force is not None and force.numel() > 0:
-            force = force.float()
-            force_finite = torch.isfinite(force)
-            force_raw = torch.nan_to_num(force)
-            force_value = self._robust_normalize_rows(force_raw.t()).t()
-            force_value = force_value.masked_fill(~force_finite, -1.0)
-            num_force = force.shape[1]
-            for channel in range(num_force):
-                row_start = channel * side // num_force
-                row_end = (channel + 1) * side // num_force
-                encoded = force_value[:, channel, None, None, None]
-                force_frames[:, :, row_start:row_end] = encoded.expand(-1, 3, row_end - row_start, side)
-
-        return torch.cat((tactile_frames, force_frames), dim=-1)
+        value = F.interpolate(value.unsqueeze(1), size=(side, side), mode="nearest")
+        return value.expand(-1, 3, -1, -1)
 
     def encode_ts_trainable(
         self,
-        signals: list[torch.Tensor | dict[str, torch.Tensor]],
-        formats: list[str],
+        signals: list[torch.Tensor],
+        family: str,
         device: torch.device,
     ) -> torch.Tensor:
-        """Render mixed native-shape signals and encode them in one vision pass."""
-        videos = []
-        for sig, fmt in zip(signals, formats, strict=True):
-            s = (
-                {key: value.to(device=device) for key, value in sig.items()}
-                if isinstance(sig, dict)
-                else sig.to(device=device)
-            )
-            if fmt == "tactile":
-                frames = self._tactile_frame_tiles(s)
-            else:
-                frames = self._timeseries_frames(s, prestandardized=fmt == "ecg")
-            videos.append(frames)
+        """Render one homogeneous sensor-family batch and encode it as video."""
+        if family == "tactile":
+            videos = [self._tactile_frames(signal.to(device)) for signal in signals]
+        else:
+            videos = [
+                self._timeseries_frames(signal.to(device), prestandardized=family == "ecg")
+                for signal in signals
+            ]
 
-        # Sensor frames already have merger-aligned geometry and normalized values.
+        # Sensor frames are already normalized and merger-aligned.
         processed = self.qwen_processor.video_processor.preprocess(
             videos,
             do_convert_rgb=False,

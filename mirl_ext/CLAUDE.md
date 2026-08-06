@@ -26,10 +26,11 @@ are load-bearing:
 
 **Losses must stay O(1).** `siglip` (label-bank sigmoid) and
 `distill` (`1 - cos`) are weighted 1.0/1.0, which is only meaningful because
-both are order-1. `distill_cosine` is deliberately not `F.mse_loss` — mean MSE
-divides by the 1152-D feature width and weakens the preservation gradient. Likewise `siglip_sigmoid`
-is mean-reduced over pairs, not summed over rows as in the reference (that is
-B× larger). Changing either reduction silently rebalances training.
+both are order-1. Distillation uses `F.cosine_similarity` and
+`torch.segment_reduce` so every visual sample has equal weight despite different
+token counts. Sensor alignment uses `F.binary_cross_entropy_with_logits`,
+mean-reduced over each complete label bank and class-balanced over anchor rows.
+Changing either reduction silently rebalances training.
 
 **SigLIP uses one complete text-label bank per family and split.** The family
 bias is the log-odds of `1 / K`, where `K` is that split's family-vocabulary
@@ -40,30 +41,25 @@ tactile recording. `log_logit_scale` initializes to `log(1 / 0.07)` and is a
 **The clean baseline is sensor-to-text only.** SmellNet and ECG use fixed
 SigLIP2 class labels; tactile uses its complete annotated answer. All three run
 through the same family label-bank SigLIP path. SmellNet mixtures and GC-MS do
-not enter the dataset, model, or objective.
+not enter the dataset, model, or objective. Stored sensor labels are already
+clean and are passed to SigLIP2 verbatim; the loader does not alter casing.
 
 **Visual rows are preservation anchors, not QA examples.** Their annotation text
-is ignored, so `AlignmentDataset` keeps one row per image/video path. The one-pass
-sampler consumes every unique media path and sensor recording once per epoch.
+is ignored, so `AlignmentDataset` keeps one row per image/video path. The sampler
+does not repeat rows and skips source groups too small to give every rank a sample.
+Every global microbatch has one media kind and one `data_source`.
 
-**Labels and families are balanced explicitly.** Anchors with the same label
+**Labels are balanced explicitly.** Anchors with the same label
 share that label's total row weight; unique tactile answers naturally receive
-one full row weight each. The three family losses are averaged.
+one full row weight each. Class counts are global within each source-homogeneous
+microbatch.
 
-**Distributed is hand-rolled — there is no `DistributedDataParallel`.** Each
-rank holds a full replica; gradients are averaged manually. Tensor collectives
-use NCCL; string metadata and rank-0 reporting barriers use a separate Gloo group.
-Four spots deadlock
-if edited casually:
-1. `_allreduce_grad_average` materializes a zero grad for params with
-   `grad is None`, so every rank issues an identical collective sequence.
-2. The gradient all-reduce runs **before** `clip_grad_norm_`, so all replicas
-   clip on the same global norm.
-3. `_gather_ts_embeddings` is differentiable and every rank must enter it even when
-   its local shard has zero TS rows. Replacing it with `dist.all_gather` silently
-   detaches remote embeddings; branching before it deadlocks.
-4. Validation is sharded across every rank. All rank samplers have the same number
-   of batches, and an empty local tail must still enter `_compute_losses`.
+**Distributed uses Accelerate's standard DDP wrapper.** DDP buckets gradient
+reductions and `no_sync` skips communication during accumulation. Sensor rows
+stay local because their negatives are the complete frozen label bank, not other
+samples. One small class-count reduction preserves exact global class weighting;
+prediction metrics reduce count statistics. There is no embedding gather, string
+metadata gather, Gloo side group, or manual parameter-gradient loop.
 
 **Selection metrics match the supervision.** W&B publishes accuracy, macro-F1,
 Recall@5, and validation per-class precision/recall/F1 for SmellNet and ECG;
@@ -103,15 +99,17 @@ sbatch examples/mirl/slurm/run_stage1_b200.sbatch
 Config keys are OmegaConf-overridable on the CLI (`train.num_train_epochs=2`).
 The trainer derives optimizer steps per epoch as
 `ceil(len(train_loader) / grad_accum_steps)` and flushes the final partial
-accumulation window. `ckpt_every` and `val_every` are optimizer-step intervals;
-warmup is configured as a fraction of the complete run with `warmup_ratio`.
+accumulation window. `val_every` is an optimizer-step interval; warmup is
+configured as a fraction of the complete run with `warmup_ratio`. Validation
+saves the best encoder and the run saves one final encoder; there is no partial
+optimizer state to present as a resumable checkpoint.
 
 ## When changing the objective
 
 Start a new lineage: bump `WANDB_RUN_ID` *and* the checkpoint dir in the sbatch.
 `loss/*` is not comparable across objectives; prediction metrics read cosine
 similarities rather than the loss. Aggregate and per-family losses live with selection metrics under
-`val-core/`; component losses, collapse, coverage, and per-class diagnostics
+`val-core/`; component losses, coverage, and per-class diagnostics
 live under `val-aux/`.
 `val-core/{accuracy,f1_macro}/overall` is the equal-family mean over tasks with
 reusable labels (SmellNet and ECG). Macro-F1 excludes classes absent from that
@@ -151,8 +149,8 @@ projected space the loss optimizes, everything lands on ~1 axis. A ~2-D embeddin
 hosts 7 coarse ECG classes; it cannot host 93 smellnet or 635 haptic labels.
 **No reweighting of the loss recovers axes the projection has already discarded.**
 The clean baseline therefore uses Qwen's 1152-D pre-merger encoder state directly and the two essential
-losses before testing anti-collapse methods separately. Each `eff_dim/ts_<family>`
-is measured to expose collapse without changing the baseline objective.
+losses before testing anti-collapse methods separately. The effective-dimension
+measurements above remain historical diagnostics, not training-loop metrics.
 
 **ECG is NOT a working positive control.** "Normal" is 44.1% of
 `ecg_valid_nan_filtered`, so 0.500 top-1 is ~6 points over a constant-majority
@@ -346,10 +344,10 @@ materially different papers, and v3's headline is 58.5 not 63.3).
   at native 16x16 — *"our method improves mAP by 10.49% over ResNet-18... Simply
   enlarging the tactile map and using a large vision encoder does not provide an
   advantage."*
-- Normalization is a **global fixed scale**: `clip(x, 0, 3072) / 3072`, negatives
-  clipped to 0, no per-recording stats. Alignment now preserves this transform up
-  to an affine map from `[0, 1]` to Qwen's common `[-1, 1]` input range. Optional
-  noise floor 500 counts remains disabled.
+- OpenTouch uses a **global fixed scale**: `clip(x, 0, 3072) / 3072`, with
+  negatives clipped to 0. The clean alignment baseline deliberately avoids this
+  hard-coded ceiling and robustly normalizes each selected right-map taxel over
+  the complete recording instead.
 - OpenTouch uses **20 frames @ 30 Hz (0.67 s)**, or 21 frames centered on the
   **peak-pressure frame** — which matters because the captions were generated FROM
   the peak-pressure frames. The alignment baseline intentionally does not copy

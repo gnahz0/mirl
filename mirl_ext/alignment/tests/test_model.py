@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 
 import torch
-import torch.utils.checkpoint as torch_checkpoint
 
 from mirl_ext.alignment.model import MultimodalAlignmentModel, _enable_block_checkpointing
 
@@ -38,25 +37,15 @@ def test_scalar_rendering_preserves_values_geometry_and_missing_masks():
     assert torch.equal(frames[0, 0, 0, :7], expected[0])
 
 
-def test_tactile_rendering_keeps_pressure_delta_and_force_cells_separate():
+def test_tactile_rendering_uses_one_rgb_cell_per_full_frame():
     model = _renderer()
-    payload = {
-        "tactile": torch.randn(47, 16, 16),
-        "force": torch.randn(47, 13),
-    }
-    frames = model._tactile_frame_tiles(payload)
+    tactile = torch.randn(47, 16, 16)
+    frames = model._tactile_frames(tactile)
 
-    assert frames.shape == (47, 3, 32, 64)
-    assert torch.equal(frames[:, 0, :, :32], frames[:, 2, :, :32])
+    assert frames.shape == (47, 3, 32, 32)
+    assert torch.equal(frames[:, 0], frames[:, 1])
+    assert torch.equal(frames[:, 1], frames[:, 2])
     assert frames.min() >= -1 and frames.max() <= 1
-
-
-def test_tactile_uses_fixed_opentouch_pressure_scale():
-    values = torch.tensor([[-10.0, 0.0, 1536.0, 3072.0, 4000.0]])
-    expected = torch.tensor([[-1.0, -1.0, 0.0, 1.0, 1.0]])
-    payload = {"tactile": values.reshape(5, 1, 1), "force": torch.empty(5, 0)}
-    frames = _renderer()._tactile_frame_tiles(payload)
-    assert torch.equal(frames[:, 0, 0, 0], expected[0])
 
 
 def test_qwen_branch_can_return_tokens_or_pool_per_sample():
@@ -110,27 +99,17 @@ def test_text_encoder_truncates_each_text_to_model_context():
     assert torch.equal(encoded, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
 
 
-def test_block_checkpointing_is_training_only(monkeypatch):
-    calls = []
+def test_block_checkpointing_preserves_state_dict_keys():
+    class Visual(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
 
-    class Block(torch.nn.Module):
-        def forward(self, value, scale=1):
-            return value * scale
+        def forward(self, value):
+            return self.blocks[0](value)
 
-    block = Block()
-    visual = SimpleNamespace(blocks=torch.nn.ModuleList([block]))
-
-    def checkpoint(function, *args, use_reentrant, **kwargs):
-        calls.append(use_reentrant)
-        return function(*args, **kwargs)
-
-    monkeypatch.setattr(torch_checkpoint, "checkpoint", checkpoint)
+    visual = Visual()
+    keys = set(visual.state_dict())
     assert _enable_block_checkpointing(visual) == 1
-
-    block.train()
-    assert block(torch.tensor(2.0), scale=3).item() == 6
-    assert calls == [False]
-
-    block.eval()
-    assert block(torch.tensor(2.0), scale=4).item() == 8
-    assert calls == [False]
+    assert set(visual.state_dict()) == keys
+    visual(torch.ones(1, 2, requires_grad=True)).sum().backward()

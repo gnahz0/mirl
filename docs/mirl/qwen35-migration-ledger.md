@@ -192,7 +192,6 @@ The runnable Qwen3.5 port now lives below `mirl_ext.alignment`; the old
 | `verl/trainer/alignment/config/stage1_qwen3vl_clip.yaml` | Qwen3.5 Stage-1 config under the extension. |
 | `verl/trainer/alignment/config/stage1_smoke.yaml` | Removed; only the production config remains. |
 | `verl/trainer/alignment/data.py` | `mirl_ext.alignment.data`. |
-| `verl/trainer/alignment/losses.py` | `mirl_ext.alignment.losses`. |
 | `verl/trainer/alignment/model.py` | `mirl_ext.alignment.model`. |
 | `verl/trainer/alignment/trainer.py` | `mirl_ext.alignment.trainer`. |
 | `verl/trainer/alignment/ts_renderer.py` | Shared raw-signal preprocessing under `mirl_ext`. |

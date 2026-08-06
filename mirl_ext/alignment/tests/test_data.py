@@ -13,20 +13,6 @@ def _dataset(tmp_path, name, rows, **kwargs):
     return AlignmentDataset([str(path)], **kwargs)
 
 
-def test_label_identity_is_casefolded_and_whitespace_normalized(tmp_path):
-    rows = [
-        {
-            "data_source": "ecg",
-            "signals": [{"signal": f"missing-{index}.pt", "format": "ts_pt"}],
-            "reward_model": {"ground_truth": label},
-        }
-        for index, label in enumerate(("Normal", " normal ", "NORMAL", "Other"))
-    ]
-    dataset = _dataset(tmp_path, "ecg", rows)
-
-    assert dataset.ts_label_vocabs == {"ecg": ("normal", "other")}
-
-
 def test_smellnet_mixture_never_enters_rows_or_label_vocab(tmp_path):
     rows = [
         {
@@ -36,9 +22,9 @@ def test_smellnet_mixture_never_enters_rows_or_label_vocab(tmp_path):
         }
         for index, (source, label) in enumerate(
             (
-                ("smellnet_base", "Apple"),
-                ("smellnet_base", "Pear"),
-                ("smellnet_mixture", "Apple + Pear"),
+                ("smellnet_base", "apple"),
+                ("smellnet_base", "pear"),
+                ("smellnet_mixture", "apple + pear"),
             )
         )
     ]
@@ -52,7 +38,7 @@ def test_smellnet_mixture_never_enters_rows_or_label_vocab(tmp_path):
 def test_tactile_uses_complete_ground_truth_instead_of_filename_stem(tmp_path):
     captions = (
         "The participant quickly lifts the teapot while maintaining a stable grasp.",
-        "  The mug slips during the lift.  ",
+        "The mug slips during the lift.",
     )
     rows = [
         {
@@ -67,8 +53,8 @@ def test_tactile_uses_complete_ground_truth_instead_of_filename_stem(tmp_path):
 
     assert dataset.ts_label_vocabs == {
         "tactile": (
-            "the mug slips during the lift.",
-            "the participant quickly lifts the teapot while maintaining a stable grasp.",
+            "The mug slips during the lift.",
+            "The participant quickly lifts the teapot while maintaining a stable grasp.",
         ),
     }
 
@@ -96,71 +82,60 @@ def test_visual_annotations_are_deduplicated_by_media_path(tmp_path):
     dataset = _dataset(tmp_path, "visual", rows)
 
     assert len(dataset) == 2
-    assert len(dataset.sampling_groups["image"]) == 1
-    assert len(dataset.sampling_groups["video"]) == 1
-    assert all("reward_model" not in row for row in dataset.rows)
+    assert len(dataset.sampling_groups[("image", "climb")]) == 1
+    assert len(dataset.sampling_groups[("video", "tactile")]) == 1
+    assert all("reward_model" not in row and "data_source" in row for row in dataset.rows)
 
 
-def test_collate_keeps_complete_native_signals():
-    signal = torch.arange(12, dtype=torch.float32).reshape(2, 6)
-    tactile = torch.arange(24 * 4, dtype=torch.float32).reshape(24, 2, 2)
-    force = torch.arange(24 * 3, dtype=torch.float32).reshape(24, 3)
+def test_collate_keeps_complete_source_homogeneous_signals():
+    signals = [
+        torch.arange(12, dtype=torch.float32).reshape(2, 6),
+        torch.arange(16, dtype=torch.float32).reshape(2, 8),
+    ]
     batch = collate_alignment(
         [
             {
                 "kind": "signal",
                 "media": signal,
                 "family": "smellnet",
-                "text": "apple",
-            },
-            {
-                "kind": "signal",
-                "media": {"tactile": tactile, "force": force},
-                "family": "tactile",
-                "text": "the grasp remains stable while lifting the mug",
-            },
+                "text": label,
+            }
+            for signal, label in zip(signals, ("apple", "pear"), strict=True)
         ]
     )
 
-    assert len(batch["ts_signal"]) == 2
-    assert torch.equal(batch["ts_signal"][0], signal)
-    assert torch.equal(batch["ts_signal"][1]["tactile"], tactile)
-    assert torch.equal(batch["ts_signal"][1]["force"], force)
-    assert batch["ts_format"] == ["smellnet", "tactile"]
-    assert batch["ts_signal_text"] == ["apple", "the grasp remains stable while lifting the mug"]
+    assert batch["kind"] == "signal"
+    assert batch["family"] == "smellnet"
+    assert all(actual is expected for actual, expected in zip(batch["media"], signals, strict=True))
+    assert batch["text"] == ["apple", "pear"]
 
 
 class _GroupedDataset:
     def __init__(self):
         self.sampling_groups = {
-            "smellnet": list(range(0, 12)),
-            "ecg": list(range(12, 24)),
-            "tactile": list(range(24, 36)),
-            "image": list(range(36, 48)),
-            "video": list(range(48, 60)),
+            ("signal", "smellnet_base"): list(range(0, 12)),
+            ("signal", "ecg"): list(range(12, 24)),
+            ("signal", "haptic_tactile"): list(range(24, 36)),
+            ("image", "climb"): list(range(36, 48)),
+            ("video", "human_behaviour"): list(range(48, 60)),
         }
 
 
 def _group_counts(dataset, batch):
-    owner = {index: family for family, indices in dataset.sampling_groups.items() for index in indices}
-    return {family: sum(owner[index] == family for index in batch) for family in dataset.sampling_groups}
+    owner = {index: group for group, indices in dataset.sampling_groups.items() for index in indices}
+    return {group: sum(owner[index] == group for index in batch) for group in dataset.sampling_groups}
 
 
-def _batch_modalities(dataset, batch):
+def _batch_groups(dataset, batch):
     counts = _group_counts(dataset, batch)
-    return {
-        "sensor" if group in {"smellnet", "ecg", "tactile"} else group
-        for group, count in counts.items()
-        if count
-    }
+    return {group for group, count in counts.items() if count}
 
 
-def test_family_balanced_sampler_consumes_all_rows_once_across_ranks():
+def test_homogeneous_sampler_consumes_all_rows_once_across_ranks():
     dataset = _GroupedDataset()
     rank0 = HomogeneousBatchSampler(
         dataset,
         batch_size=8,
-        ts_per_family=2,
         rank=0,
         world_size=2,
         seed=7,
@@ -168,7 +143,6 @@ def test_family_balanced_sampler_consumes_all_rows_once_across_ranks():
     rank1 = HomogeneousBatchSampler(
         dataset,
         batch_size=8,
-        ts_per_family=2,
         rank=1,
         world_size=2,
         seed=7,
@@ -177,9 +151,7 @@ def test_family_balanced_sampler_consumes_all_rows_once_across_ranks():
     seen = []
     for batch0, batch1 in zip(rank0, rank1, strict=True):
         assert len(batch0) <= 8 and len(batch1) <= 8
-        assert len(_batch_modalities(dataset, batch0 + batch1)) == 1
-        for counts in (_group_counts(dataset, batch0), _group_counts(dataset, batch1)):
-            assert all(counts[family] <= 2 for family in ("smellnet", "ecg", "tactile"))
+        assert len(_batch_groups(dataset, batch0 + batch1)) == 1
         assert set(batch0).isdisjoint(batch1)
         seen.extend(batch0)
         seen.extend(batch1)
@@ -191,24 +163,27 @@ def test_family_balanced_sampler_consumes_all_rows_once_across_ranks():
 def test_distributed_sampler_keeps_tail_ranks_in_lockstep():
     dataset = _GroupedDataset()
     dataset.sampling_groups = {
-        "smellnet": list(range(5)),
-        "ecg": list(range(5, 9)),
-        "tactile": list(range(9, 13)),
-        "image": [],
-        "video": [],
+        ("signal", "smellnet_base"): list(range(5)),
+        ("signal", "ecg"): list(range(5, 9)),
+        ("signal", "haptic_tactile"): list(range(9, 13)),
     }
-    rank0 = list(HomogeneousBatchSampler(dataset, 6, 2, rank=0, world_size=2, seed=3))
-    rank1 = list(HomogeneousBatchSampler(dataset, 6, 2, rank=1, world_size=2, seed=3))
+    rank0 = list(HomogeneousBatchSampler(dataset, 6, rank=0, world_size=2, seed=3))
+    rank1 = list(HomogeneousBatchSampler(dataset, 6, rank=1, world_size=2, seed=3))
 
-    assert len(rank0) == len(rank1) == 2
+    assert len(rank0) == len(rank1) == 3
+    assert all(batch for batch in rank0 + rank1)
+    assert all(
+        len(_batch_groups(dataset, batch0 + batch1)) == 1
+        for batch0, batch1 in zip(rank0, rank1)
+    )
     assert set(index for batch in rank0 + rank1 for index in batch) == set(range(13))
 
 
-def test_family_balanced_sampler_is_deterministic_per_epoch():
+def test_homogeneous_sampler_is_deterministic_per_epoch():
     dataset = _GroupedDataset()
-    sampler = HomogeneousBatchSampler(dataset, 8, 2, seed=11)
+    sampler = HomogeneousBatchSampler(dataset, 8, seed=11)
     first = list(sampler)
-    assert first == list(HomogeneousBatchSampler(dataset, 8, 2, seed=11))
+    assert first == list(HomogeneousBatchSampler(dataset, 8, seed=11))
     flattened = [index for batch in first for index in batch]
     assert len(flattened) == len(set(flattened))
     assert set(flattened) == set(range(60))

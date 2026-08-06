@@ -22,14 +22,11 @@ _REDUCED_METRIC_KEYS = (
     "loss/total",
 )
 
+# Derive n/ts_signal after reducing its family counts.
 _COUNT_KEYS: tuple[str, ...] = (
     "n/img_image",
     "n/img_video",
-    "n/ts_signal",
 ) + tuple(f"n/ts_{family}" for family in _TS_FAMILIES)
-
-def new_counts() -> dict[str, int]:
-    return dict.fromkeys(_COUNT_KEYS, 0)
 
 
 def _allreduce_metrics(metrics: dict, device: torch.device, world_size: int) -> dict:
@@ -60,29 +57,22 @@ def _allreduce_metrics(metrics: dict, device: torch.device, world_size: int) -> 
 def _allreduce_counts(counts: dict, device: torch.device, world_size: int) -> dict:
     """Sum sample counts across ranks in a fixed collective order."""
     if world_size <= 1:
-        return counts
-    packed = torch.tensor([float(counts.get(k, 0)) for k in _COUNT_KEYS], device=device, dtype=torch.float64)
-    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    return {k: int(v) for k, v in zip(_COUNT_KEYS, packed.tolist(), strict=True)}
+        out = {key: int(counts.get(key, 0)) for key in _COUNT_KEYS}
+    else:
+        packed = torch.tensor([counts.get(key, 0) for key in _COUNT_KEYS], device=device, dtype=torch.long)
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        out = {k: int(v) for k, v in zip(_COUNT_KEYS, packed.tolist(), strict=True)}
+    out["n/ts_signal"] = sum(out[f"n/ts_{family}"] for family in _TS_FAMILIES)
+    return out
 
 
-def add_ts_family_counts(counts: dict, batch: dict) -> None:
-    """Add per-family row counts."""
-    for family in batch.get("ts_format") or []:
-        counts[f"n/ts_{family}"] += 1
-
-
-@torch.no_grad()
-def _effective_dim(z: torch.Tensor) -> float | None:
-    """Participation ratio of the centered embedding covariance spectrum."""
-    if z.shape[0] < 3:
-        return None
-    centered = z.float() - z.float().mean(dim=0, keepdim=True)
-    ev = torch.linalg.svdvals(centered) ** 2
-    total = float(ev.sum())
-    if total <= 0.0:
-        return None
-    return float((total**2) / float((ev**2).sum()))
+def add_batch_counts(counts: dict, batch: dict) -> None:
+    """Count one source-homogeneous local batch."""
+    size = len(batch["media"])
+    if batch["kind"] == "signal":
+        counts[f"n/ts_{batch['family']}"] += size
+    else:
+        counts[f"n/img_{batch['kind']}"] += size
 
 
 @torch.no_grad()
@@ -92,6 +82,7 @@ def _label_ranking_metrics(
     candidate_labels: tuple[str, ...],
     text_embeddings: torch.Tensor,
     per_class_out: list[dict[str, object]] | None = None,
+    world_size: int = 1,
 ) -> dict[str, float]:
     """Score labels, macro-averaging only classes present in ground truth."""
     label_to_id = {label: idx for idx, label in enumerate(candidate_labels)}
@@ -106,17 +97,29 @@ def _label_ranking_metrics(
     support = torch.bincount(true, minlength=num_classes)
     predicted = torch.bincount(pred, minlength=num_classes)
     true_positive = torch.bincount(true[pred == true], minlength=num_classes)
-
-    support_f = support.float()
-    predicted_f = predicted.float()
-    precision = true_positive.float() / predicted_f.clamp_min(1)
-    recall = true_positive.float() / support_f.clamp_min(1)
-    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
-    recall_at_5_by_class = torch.bincount(
+    recall_at_5_count = torch.bincount(
         true,
         weights=recall_at_5.float(),
         minlength=num_classes,
-    ) / support_f.clamp_min(1)
+    )
+    packed = torch.cat(
+        (
+            support.double(),
+            predicted.double(),
+            true_positive.double(),
+            recall_at_5_count.double(),
+            reciprocal_rank.double().sum().reshape(1),
+        )
+    )
+    if world_size > 1:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    support, predicted, true_positive, recall_at_5_count = packed[:-1].reshape(4, num_classes)
+    sample_count = support.sum()
+
+    precision = true_positive / predicted.clamp_min(1)
+    recall = true_positive / support.clamp_min(1)
+    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
+    recall_at_5_by_class = recall_at_5_count / support.clamp_min(1)
     supported = support > 0
 
     if per_class_out is not None:
@@ -146,11 +149,11 @@ def _label_ranking_metrics(
         )
 
     return {
-        "accuracy": float((pred == true).float().mean()),
+        "accuracy": float(true_positive.sum() / sample_count),
         "f1_macro": float(f1[supported].mean()),
-        "recall_at_1": float((pred == true).float().mean()),
-        "recall_at_5": float(recall_at_5.float().mean()),
-        "map": float(reciprocal_rank.mean()),
+        "recall_at_1": float(true_positive.sum() / sample_count),
+        "recall_at_5": float(recall_at_5_count.sum() / sample_count),
+        "map": float(packed[-1] / sample_count),
         "prediction_coverage": float((predicted > 0).sum()) / num_classes,
     }
 
@@ -162,6 +165,7 @@ def _ts_prediction_metrics(
     families: list[str],
     label_bank: dict[str, tuple[tuple[str, ...], torch.Tensor]],
     per_class_reports: dict[str, list[dict[str, object]]] | None = None,
+    world_size: int = 1,
 ) -> dict[str, float]:
     """Compute honest per-family metrics and an equal-family overall score."""
     metrics: dict[str, float] = {}
@@ -183,6 +187,7 @@ def _ts_prediction_metrics(
             family_labels,
             entry[0],
             entry[1],
+            world_size=world_size,
             per_class_out=report_rows,
         )
         if family in _CLASSIFICATION_FAMILIES:
@@ -192,9 +197,6 @@ def _ts_prediction_metrics(
             published = _RETRIEVAL_STATS
         for stat in published:
             metrics[f"{stat}/ts_{family}"] = family_metrics[stat]
-        fam_eff = _effective_dim(z[sel])
-        if fam_eff is not None:
-            metrics[f"eff_dim/ts_{family}"] = fam_eff
 
     for stat in ("accuracy", "f1_macro"):
         values = [scores[stat] for scores in family_scores.values() if stat in scores]
@@ -204,90 +206,45 @@ def _ts_prediction_metrics(
     return metrics
 
 
-def _publish_family_metrics(
-    out: dict[str, float],
-    family: str,
+def _metric_groups(
+    split: str,
     loss_metrics: dict[str, float],
-    prediction_metrics: dict[str, float],
-    *,
-    core_prefix: str,
-    aux_prefix: str,
-) -> None:
-    loss_key = f"loss/ts_{family}"
-    if loss_key in loss_metrics:
-        out[f"{core_prefix}/loss/{family}"] = loss_metrics[loss_key]
+    counts: dict[str, int],
+    prediction_metrics: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Build the shared train/validation W&B metric surface."""
+    prediction_metrics = loss_metrics if prediction_metrics is None else prediction_metrics
+    core = f"{split}-core"
+    aux = f"{split}-aux"
+    out: dict[str, float] = {f"{core}/loss/aggregate": loss_metrics["loss/total"]}
 
-    for stat in _PUBLIC_STATS:
-        key = f"{stat}/ts_{family}"
-        if key in prediction_metrics:
-            out[f"{core_prefix}/{stat}/{family}"] = prediction_metrics[key]
-    for source, target in (("eff_dim", "effective_dimension"), ("prediction_coverage", "prediction_coverage")):
-        key = f"{source}/ts_{family}"
-        if key in prediction_metrics:
-            out[f"{aux_prefix}/{target}/{family}"] = prediction_metrics[key]
+    for name in ("siglip", "distill"):
+        key = f"loss/{name}"
+        if key in loss_metrics:
+            out[f"{aux}/loss/{name}"] = loss_metrics[key]
 
+    for family in _TS_FAMILIES:
+        loss_key = f"loss/ts_{family}"
+        if loss_key in loss_metrics:
+            out[f"{core}/loss/{family}"] = loss_metrics[loss_key]
+        for stat in _PUBLIC_STATS:
+            key = f"{stat}/ts_{family}"
+            if key in prediction_metrics:
+                out[f"{core}/{stat}/{family}"] = prediction_metrics[key]
+        coverage_key = f"prediction_coverage/ts_{family}"
+        if coverage_key in prediction_metrics:
+            out[f"{aux}/prediction_coverage/{family}"] = prediction_metrics[coverage_key]
+        out[f"{aux}/n/{family}"] = float(counts[f"n/ts_{family}"])
 
-def _publish_supervised_aggregates(
-    out: dict[str, float],
-    metrics: dict[str, float],
-    core_prefix: str,
-) -> None:
     for stat in ("accuracy", "f1_macro"):
         key = f"{stat}/overall"
-        if key in metrics:
-            out[f"{core_prefix}/{stat}/overall"] = metrics[key]
+        if key in prediction_metrics:
+            out[f"{core}/{stat}/overall"] = prediction_metrics[key]
 
-
-def _training_metric_groups(
-    metrics: dict[str, float],
-    counts: dict[str, int],
-) -> dict[str, float]:
-    """Return the compact, public training metric surface for W&B."""
-    out: dict[str, float] = {"train-core/loss/aggregate": metrics["loss/total"]}
-    for name in ("siglip", "distill"):
-        if f"loss/{name}" in metrics:
-            out[f"train-aux/loss/{name}"] = metrics[f"loss/{name}"]
-    for family in _TS_FAMILIES:
-        _publish_family_metrics(
-            out,
-            family,
-            metrics,
-            metrics,
-            core_prefix="train-core",
-            aux_prefix="train-aux",
-        )
-        out[f"train-aux/n/{family}"] = float(counts[f"n/ts_{family}"])
-
-    _publish_supervised_aggregates(out, metrics, "train-core")
-
-    for key, value in metrics.items():
-        if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale"}:
-            out[f"train-aux/{key}"] = value
-    out["train-aux/n/img"] = float(counts["n/img_image"] + counts["n/img_video"])
-    return out
-
-
-def _validation_metric_groups(
-    averaged_metrics: dict[str, float],
-    prediction_metrics: dict[str, float],
-    bucket_totals: dict[str, int],
-) -> dict[str, float]:
-    """Return core selection metrics and a small set of validation diagnostics."""
-    out = {"val-core/loss/aggregate": averaged_metrics["loss/total"]}
-    for name in ("siglip", "distill"):
-        if f"loss/{name}" in averaged_metrics:
-            out[f"val-aux/loss/{name}"] = averaged_metrics[f"loss/{name}"]
-    for family in _TS_FAMILIES:
-        _publish_family_metrics(
-            out,
-            family,
-            averaged_metrics,
-            prediction_metrics,
-            core_prefix="val-core",
-            aux_prefix="val-aux",
-        )
-        out[f"val-aux/n/{family}"] = float(bucket_totals[f"n/ts_{family}"])
-
-    _publish_supervised_aggregates(out, prediction_metrics, "val-core")
+    if split == "train":
+        for key, value in loss_metrics.items():
+            if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale"}:
+                out[f"{aux}/{key}"] = value
+        out[f"{aux}/n/img"] = float(counts["n/img_image"] + counts["n/img_video"])
 
     return out

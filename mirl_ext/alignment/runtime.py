@@ -5,17 +5,14 @@ from __future__ import annotations
 
 import logging
 import math
-import multiprocessing as mp
-import os
 import sys
 import time
-from datetime import timedelta
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 from .data import AlignmentDataset, HomogeneousBatchSampler, collate_alignment
 from .model import MultimodalAlignmentModel
@@ -36,30 +33,6 @@ def setup_logging(level_name: str) -> None:
     sys.stderr.reconfigure(line_buffering=True)
 
 
-def init_distributed() -> tuple[int, int, int, dist.ProcessGroup]:
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        device_id=torch.device("cuda", local_rank),
-        timeout=timedelta(minutes=60),
-    )
-    control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=60))
-    return rank, local_rank, world_size, control_group
-
-
-def allreduce_grad_average(params: list[torch.nn.Parameter], world_size: int) -> None:
-    if world_size == 1:
-        return
-    for param in params:
-        if param.grad is None:
-            param.grad = torch.zeros_like(param)
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        param.grad.div_(world_size)
-
-
 def maybe_init_wandb(cfg: DictConfig):
     if not cfg.wandb.enable:
         return None
@@ -68,7 +41,6 @@ def maybe_init_wandb(cfg: DictConfig):
     run = wandb.init(
         project=str(cfg.wandb.project),
         name=str(cfg.wandb.name),
-        entity=str(cfg.wandb.get("entity")) if cfg.wandb.get("entity") else None,
         config=OmegaConf.to_container(cfg, resolve=True),
         settings=wandb.Settings(console="off"),
     )
@@ -98,7 +70,6 @@ def build_loaders(
     train_sampler = HomogeneousBatchSampler(
         train_ds,
         batch_size=cfg.train.batch_size,
-        ts_per_family=cfg.data.ts_per_family_per_batch,
         rank=rank,
         world_size=world_size,
         seed=seed,
@@ -112,9 +83,8 @@ def build_loaders(
     if cfg.train.num_workers:
         # CUDA is already initialized, so workers must spawn rather than fork.
         train_kwargs.update(
-            multiprocessing_context=mp.get_context("spawn"),
+            multiprocessing_context="spawn",
             persistent_workers=True,
-            prefetch_factor=cfg.train.prefetch_factor,
         )
     train_loader = DataLoader(train_ds, **train_kwargs)
 
@@ -126,7 +96,6 @@ def build_loaders(
     val_sampler = HomogeneousBatchSampler(
         val_ds,
         batch_size=cfg.train.val_batch_size,
-        ts_per_family=cfg.data.val_ts_per_family_per_batch,
         rank=rank,
         world_size=world_size,
         seed=seed + 1,
@@ -200,14 +169,7 @@ def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_step
     )
     warmup = math.ceil(total_steps * float(cfg.train.warmup_ratio))
     logger.info("cosine schedule: %d warmup steps, %d total optimizer steps", warmup, total_steps)
-
-    def lr_scale(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        progress = min(1.0, (step - warmup) / max(1, total_steps - warmup))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_scale)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
     return optimizer, scheduler
 
 

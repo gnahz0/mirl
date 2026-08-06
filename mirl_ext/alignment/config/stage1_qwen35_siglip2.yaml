@@ -21,21 +21,15 @@ data:
     - ${data.root}/tactile_valid.parquet
   # The loader excludes mixtures; Stage 1 learns the 50-way base-substance task.
 
-  # Image, video, and sensor batches stay separate. Sensor families are spread
-  # across their batches, and one epoch consumes every row once.
-  ts_per_family_per_batch: 8
-  val_ts_per_family_per_batch: 10
+  # Batches contain one media kind and one data_source.
 
   max_video_frames: 8
-  # Qwen recommends 256-1280 merged tokens per image. Videos retain Qwen's
-  # native per-frame and total-video budgets.
+  # Images use at most 1024 merged tokens; videos retain Qwen's native budgets.
   max_image_tokens: 1024
-  # Sensor rows retain their complete native time axis.
 
 model:
   qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
   siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
-  trainable_visual_dtype: bf16
   gradient_checkpointing: true
 
 loss:
@@ -49,20 +43,17 @@ train:
   batch_size: 32
   grad_accum_steps: 2
   num_workers: 4
-  prefetch_factor: 2
   lr: 1.0e-5
   scalar_lr: 3.0e-3
   weight_decay: 0.05
-  # The trainer derives optimizer steps from the distributed sampler and accumulation.
+  # Optimizer steps are derived from the sampler and accumulation.
   num_train_epochs: 1
   warmup_ratio: 0.03
-  # Interval values are optimizer steps, not micro-batches.
+  # val_every is measured in optimizer steps.
   grad_clip: 1.0
   amp_dtype: bf16
-  log_every: 10
-  ckpt_every: 100
-  val_every: 100
-  val_batch_size: 128
+  val_every: 200
+  val_batch_size: 256
   # Tactile uses retrieval metrics rather than class F1 because captions are unique.
   best_metric: val-core/f1_macro/overall
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35}
