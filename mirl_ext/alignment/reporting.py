@@ -11,7 +11,7 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from .metrics import _METRIC_FAMILY_NAMES, _training_metric_groups
+from .metrics import _training_metric_groups
 from .runtime import save_checkpoint
 
 
@@ -32,7 +32,7 @@ def report_train_step(
     public = _training_metric_groups(metrics, counts)
     pbar.set_postfix(
         loss=f"{metrics['loss/total']:.3f}",
-        lr=f"{lrs['vit']:.1e}",
+        lr=f"{lrs['model']:.1e}",
         img=counts["n/img_image"] + counts["n/img_video"],
         ts=counts["n/ts_signal"],
         refresh=False,
@@ -43,8 +43,7 @@ def report_train_step(
         wandb_run.log(
             {
                 **public,
-                "train-aux/lr/vit": lrs["vit"],
-                "train-aux/lr/head": lrs["head"],
+                "train-aux/lr/model": lrs["model"],
                 "train-aux/lr/scalar": lrs["scalar"],
                 "train-aux/epoch": epoch,
             },
@@ -57,7 +56,7 @@ def report_train_step(
         torch.cuda.reset_peak_memory_stats()
         core = " ".join(f"{key}={value:.3f}" for key, value in public.items() if key.startswith("train-core/"))
         tqdm.write(
-            f"step {step:6d} | lr {lrs['vit']:.2e} | loss={metrics['loss/total']:.4f} "
+            f"step {step:6d} | lr {lrs['model']:.2e} | loss={metrics['loss/total']:.4f} "
             f"| {core} | peak {peak_gib:.1f}GiB | {time.time() - started:.1f}s",
             file=sys.stdout,
         )
@@ -80,8 +79,7 @@ def report_validation(
     aux = " ".join(
         f"{key}={value:.4f}"
         for key, value in sorted(metrics.items())
-        if key == "val/loss"
-        or key.startswith(("val-aux/effective_dimension/", "val-aux/prediction_coverage/"))
+        if key.startswith(("val-aux/effective_dimension/", "val-aux/prediction_coverage/"))
     )
     tqdm.write(f"VAL-CORE @ step {step:6d} | {core}", file=sys.stdout)
     tqdm.write(f"VAL-AUX  @ step {step:6d} | {aux}", file=sys.stdout)
@@ -109,7 +107,7 @@ def report_validation(
             "recall_at_5",
         )
         for family, rows in per_class.items():
-            payload[f"val-aux/per_class/{_METRIC_FAMILY_NAMES[family]}"] = wandb.Table(
+            payload[f"val-aux/per_class/{family}"] = wandb.Table(
                 columns=list(columns),
                 data=[[row[column] for column in columns] for row in rows],
             )

@@ -21,8 +21,8 @@ data:
     - ${data.root}/tactile_valid.parquet
   # The loader excludes mixtures; Stage 1 learns the 50-way base-substance task.
 
-  # Each rank gets at most 8 rows from a sensor family; unique visual media fill
-  # the remaining slots. One epoch consumes every row once without recycling.
+  # Image, video, and sensor batches stay separate. Sensor families are spread
+  # across their batches, and one epoch consumes every row once.
   ts_per_family_per_batch: 8
   val_ts_per_family_per_batch: 10
 
@@ -37,33 +37,20 @@ model:
   siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
   trainable_visual_dtype: bf16
   gradient_checkpointing: true
-  # ECG tensors were already standardized when the CLIMB indexes were built.
-  ecg_normalization: prestandardized
-  tactile_delta_channels: true
-
-projection:
-  shared_dim: 512
 
 loss:
   temperature: 0.07
-  prototype_families: [smell, ecg]
-  paired_text_families: [tactile]
-
-loss_weights:
-  ts_text: 1.0
-  distill_img: 1.0
+  siglip_weight: 1.0
+  distill_weight: 1.0
 
 train:
+  seed: 42
   # Four GPUs and two-step accumulation give a global batch of up to 256.
   batch_size: 32
   grad_accum_steps: 2
   num_workers: 4
   prefetch_factor: 2
   lr: 1.0e-5
-  # Keep the linear alignment adapters from outrunning the transferable encoder.
-  # F1 is measured after these adapters, so a 10x head LR can improve F1 while the
-  # raw Qwen tower barely moves. Equal LR keeps the bridge learnable but unfavored.
-  head_lr: 1.0e-5
   scalar_lr: 3.0e-3
   weight_decay: 0.05
   # The trainer derives optimizer steps from the distributed sampler and accumulation.
@@ -75,9 +62,8 @@ train:
   log_every: 10
   ckpt_every: 100
   val_every: 100
-  val_batches: null
   val_batch_size: 128
-  # Haptic uses retrieval metrics rather than class F1 because captions are unique.
+  # Tactile uses retrieval metrics rather than class F1 because captions are unique.
   best_metric: val-core/f1_macro/overall
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35}
 

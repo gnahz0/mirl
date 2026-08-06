@@ -17,7 +17,7 @@ import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from .data import AlignmentDataset, FamilyBalancedBatchSampler, collate_alignment
+from .data import AlignmentDataset, HomogeneousBatchSampler, collate_alignment
 from .model import MultimodalAlignmentModel
 
 logger = logging.getLogger("alignment.trainer")
@@ -34,14 +34,6 @@ def setup_logging(level_name: str) -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
-
-
-def resolve_dtype(name: str) -> torch.dtype:
-    return {
-        "fp32": torch.float32,
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-    }[name]
 
 
 def init_distributed() -> tuple[int, int, int, dist.ProcessGroup]:
@@ -84,20 +76,6 @@ def maybe_init_wandb(cfg: DictConfig):
     return run
 
 
-def _dataset(
-    cfg: DictConfig,
-    files: list[str],
-    seed: int,
-    max_samples: int,
-) -> AlignmentDataset:
-    return AlignmentDataset(
-        data_files=files,
-        max_samples=max_samples,
-        seed=seed,
-        max_video_frames=cfg.data.max_video_frames,
-    )
-
-
 def build_loaders(
     cfg: DictConfig,
     rank: int,
@@ -105,20 +83,19 @@ def build_loaders(
     seed: int,
 ) -> tuple[
     AlignmentDataset,
+    AlignmentDataset,
     DataLoader,
-    FamilyBalancedBatchSampler,
+    HomogeneousBatchSampler,
     DataLoader,
 ]:
     started = time.time()
-    train_ds = _dataset(
-        cfg,
+    train_ds = AlignmentDataset(
         list(cfg.data.train_files),
-        seed,
-        cfg.data.get("max_train_samples", -1),
+        max_video_frames=cfg.data.max_video_frames,
     )
     logger.info("train dataset: %d rows (%.1fs)", len(train_ds), time.time() - started)
 
-    train_sampler = FamilyBalancedBatchSampler(
+    train_sampler = HomogeneousBatchSampler(
         train_ds,
         batch_size=cfg.train.batch_size,
         ts_per_family=cfg.data.ts_per_family_per_batch,
@@ -141,15 +118,12 @@ def build_loaders(
         )
     train_loader = DataLoader(train_ds, **train_kwargs)
 
-    val_batches = cfg.train.val_batches
     started = time.time()
-    val_ds = _dataset(
-        cfg,
+    val_ds = AlignmentDataset(
         list(cfg.data.val_files),
-        seed,
-        cfg.data.get("max_val_samples", -1),
+        max_video_frames=cfg.data.max_video_frames,
     )
-    val_sampler = FamilyBalancedBatchSampler(
+    val_sampler = HomogeneousBatchSampler(
         val_ds,
         batch_size=cfg.train.val_batch_size,
         ts_per_family=cfg.data.val_ts_per_family_per_batch,
@@ -165,13 +139,12 @@ def build_loaders(
         pin_memory=True,
     )
     logger.info(
-        "val dataset: %d rows, batch/rank=%d, batches/eval=%s (%.1fs)",
+        "val dataset: %d rows, batch/rank=%d, full evaluation (%.1fs)",
         len(val_ds),
         cfg.train.val_batch_size,
-        "all" if val_batches is None else val_batches,
         time.time() - started,
     )
-    return train_ds, train_loader, train_sampler, val_loader
+    return train_ds, val_ds, train_loader, train_sampler, val_loader
 
 
 def build_model(
@@ -183,11 +156,8 @@ def build_model(
     model = MultimodalAlignmentModel(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
-        shared_dim=cfg.projection.shared_dim,
         visual_dtype=visual_dtype,
-        gradient_checkpointing=bool(cfg.model.get("gradient_checkpointing", False)),
-        ecg_normalization=cfg.model.ecg_normalization,
-        tactile_delta_channels=cfg.model.tactile_delta_channels,
+        gradient_checkpointing=bool(cfg.model.gradient_checkpointing),
         contrastive_temperature=cfg.loss.temperature,
     ).to(device)
     trainable = [param for param in model.parameters() if param.requires_grad]
@@ -203,15 +173,28 @@ def build_model(
 
 
 def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_steps: int):
-    head_lr = float(cfg.train.head_lr)
-    scalar_lr = float(cfg.train.scalar_lr)
+    trainable = [p for p in model.parameters() if p.requires_grad and p is not model.log_logit_scale]
     optimizer = torch.optim.AdamW(
-        model.trainable_parameter_groups(
-            lr=cfg.train.lr,
-            weight_decay=cfg.train.weight_decay,
-            head_lr=head_lr,
-            scalar_lr=scalar_lr,
-        ),
+        [
+            {
+                "name": "model_decay",
+                "params": [p for p in trainable if p.ndim > 1],
+                "lr": cfg.train.lr,
+                "weight_decay": cfg.train.weight_decay,
+            },
+            {
+                "name": "model_no_decay",
+                "params": [p for p in trainable if p.ndim <= 1],
+                "lr": cfg.train.lr,
+                "weight_decay": 0.0,
+            },
+            {
+                "name": "scalar",
+                "params": [model.log_logit_scale],
+                "lr": cfg.train.scalar_lr,
+                "weight_decay": 0.0,
+            },
+        ],
         betas=(0.9, 0.95),
         eps=1e-8,
     )
@@ -232,23 +215,9 @@ def save_checkpoint(model: MultimodalAlignmentModel, path: Path, cfg: DictConfig
     path.mkdir(parents=True, exist_ok=True)
     state = {
         "trainable_visual": model.trainable_visual.state_dict(),
-        "proj_visual": model.proj_visual.state_dict(),
-        "proj_text": model.proj_text.state_dict(),
         "log_logit_scale": model.log_logit_scale.detach().cpu(),
         "step": step,
     }
     torch.save(state, path / "alignment_state.pt")
     OmegaConf.save(cfg, path / "config.yaml")
     logger.info("checkpoint saved to %s (step=%d)", path, step)
-
-
-def load_checkpoint(model: MultimodalAlignmentModel, path: Path) -> int:
-    ckpt_file = path / "alignment_state.pt" if path.is_dir() else path
-    state = torch.load(ckpt_file, map_location="cpu", weights_only=True)
-    model.trainable_visual.load_state_dict(state["trainable_visual"])
-    model.proj_visual.load_state_dict(state["proj_visual"])
-    model.proj_text.load_state_dict(state["proj_text"])
-    with torch.no_grad():
-        model.log_logit_scale.copy_(state["log_logit_scale"].to(model.log_logit_scale.device))
-    logger.info("loaded %s at step %d", ckpt_file, state["step"])
-    return state["step"]

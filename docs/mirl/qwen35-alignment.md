@@ -10,10 +10,10 @@
 - **Time-series loss:** class-balanced **SigLIP sigmoid**
   ([arXiv:2303.15343](https://arxiv.org/abs/2303.15343)) against each family's
   complete fixed label vocabulary. SigLIP2 text features are cached once; their
-  projection and the shared temperature remain trainable. Each family derives
-  its bias from `1 / number_of_classes`.
+  normalization is fixed and the shared temperature remains trainable. Each
+  family derives its bias from `1 / number_of_classes`.
 - **Preservation loss:** sample-balanced cosine distance between every
-  post-merger student and anchor token on real images/videos.
+  pre-merger student and anchor encoder token on real images/videos.
 
 The Qwen tower is not replaced by Google's standalone vision tower. Qwen3.5
 uses a Qwen-specific `Qwen3_5VisionModel` whose exact final weights are loaded
@@ -28,17 +28,16 @@ from the Qwen checkpoint. Its geometry is:
 | spatial merger | 2×2 patches |
 | post-merger output | 4096 |
 
-A semantic tile boundary must therefore be a multiple of 32 pixels. The model's
-`last_hidden_state` is pre-merger 1152-D; alignment uses the 4096-D
-`pooler_output`, whose token sequence is what the language tower consumes.
-Stage 1 mean-pools each time-series sequence for classification, while image and
-video preservation operates on the full post-merger token sequence.
+A semantic tile boundary must therefore be a multiple of 32 pixels. Stage 1
+mean-pools the model's 1152-D pre-merger `last_hidden_state` for sensor alignment
+and preserves every pre-merger image/video token. The frozen 4096-D merger remains
+the interface consumed by the language tower in Stage 2.
 
-The SigLIP2 text tower is the closest paired contrastive label encoder because
-the Qwen vision architecture/initialization derives from SigLIP2-SO400M.
-Qwen subsequently vision-language-trained its tower, so learned visual/text
-projection heads are retained rather than assuming the final spaces are
-identical.
+The SigLIP2 text tower is the closest contrastive label encoder because the Qwen
+vision architecture/initialization derives from SigLIP2-SO400M. Qwen exposes its
+1152-D pre-merger encoder state, which matches SigLIP2's 1152-D text output, so
+the normalized features are compared directly with no projection head. The
+pretrained 4096-D Qwen merger remains frozen.
 
 ## Full raw-data audit
 
@@ -46,7 +45,7 @@ identical.
 |---|---:|---|---|
 | SmellNet | 2,279 | CSV | 1,979 mixture files: timestamp + 4 sensors; 300 base files: 6 sensors. Native lengths 517–900. |
 | ECG | 49,305 | bare contiguous `torch.bfloat16` tensor, `format=ts_pt` | Every file is 8×2500 across PTB-XL (21,837), Georgia (10,344), Chapman-Shaoxing (10,247), and CPSC (6,877). |
-| haptic | 2,210 | `torch.float32` dictionary, `format=tactile_pt` | v1 (1,318): right 16×16 tactile only; v2 (892): left/right/aligned/mat tactile. Right tactile is selected consistently. |
+| tactile | 2,210 | `torch.float32` dictionary, `format=tactile_pt` | v1 (1,318): right 16×16 tactile only; v2 (892): left/right/aligned/mat tactile. Right tactile is selected consistently. |
 
 The cleaned SmellNet indexes contain 1,192 training recordings (250 base and
 942 mixture) and 297 validation recordings (50 base and 247 mixture) after
@@ -70,7 +69,7 @@ index is named `ecg_valid_nan_filtered.parquet` and remains at 9,856 rows becaus
 none occur there. The raw `.pt` files are retained on scratch for provenance and
 recovery; neither alignment config can sample them.
 
-Haptic files also contain aligned `hand_force_stats`: 13 right-force summaries
+Tactile files also contain aligned `hand_force_stats`: 13 right-force summaries
 for v1 and 26 left+right summaries for v2. The loader selects the 13 `right_*`
 columns to match the right tactile map and maintain a common v1/v2 schema. One
 v1 record has no force statistics and receives a masked force tile. v2-only
@@ -124,7 +123,7 @@ Example token counts:
 
 All families use this temporal Qwen input grammar; there is no image/hybrid mode.
 
-### Haptic: pseudo-video
+### Tactile: pseudo-video
 
 - Every source is a 30-FPS sequence of 16×16 pressure maps (median 177 frames;
   range 47–4,606).
@@ -132,9 +131,8 @@ All families use this temporal Qwen input grammar; there is no image/hybrid mode
   windowing, cropping, frame selection, or cap.
 - Normalize pressure with OpenTouch's fixed 3072-count scale. Normalize the
   heterogeneous force-summary fields independently within each recording.
-- With `tactile_delta_channels=true`, encode pressure in R/B and the normalized
-  frame delta in G; otherwise repeat pressure across RGB. Qwen's native temporal
-  convolution still fuses adjacent frames.
+- Encode pressure in R/B and the normalized frame delta in G. Qwen's native
+  temporal convolution still fuses adjacent frames.
 - Nearest-neighbor expand each 16×16 tactile map to one 32×32 merger cell.
 - Place the 13 aligned right-force summaries in an adjacent 32×32 cell.
 - Qwen's temporal kernel fuses adjacent frame pairs.
@@ -146,26 +144,25 @@ produces 4,606 tokens.
 
 ## Training recipe
 
-- Each rank receives at most 8 recordings from any one sensor family. Deduplicated
-  real images/videos fill the remaining batch slots.
+- Image, video, and sensor microbatches are separate. Each rank receives at most
+  8 recordings from any one family inside a sensor batch.
 - One epoch consumes every unique sensor recording and visual-media path once.
   Smaller sensor families are spread across the epoch and are never recycled.
 - SmellNet sampling and metrics use only the 50 base substances; mixture rows
   never enter the active dataset or W&B tables.
-- The clean baseline aligns SmellNet and ECG recordings with frozen SigLIP2 class
-  prototypes. Each tactile recording is paired with the complete annotated answer;
-  filename-derived task stems are not used. Answers longer than SigLIP2's 64-token
-  context produce multiple equally weighted positive chunks. Chunks are pooled
-  only when ranking complete answers for retrieval.
+- The clean baseline aligns every sensor family through one complete SigLIP2
+  text-label bank per split: 50 SmellNet labels, 7 ECG labels, and one annotated
+  open answer per tactile recording. Filename-derived task stems are not used;
+  each answer is truncated to SigLIP2's 64-token context and encoded once.
 - SmellNet, ECG, and tactile all retain their complete native time axes in both
   training and validation. One dataset row produces one sensor embedding.
-- The visual/text projections are linear into 512 dimensions. Effective dimension
-  is diagnostic only; the baseline has no variance or covariance objective.
-- AdamW uses `1e-5` for Qwen and projection heads, `3e-3` for the
+- Frozen SigLIP2 embeddings and Qwen's 1152-D pre-merger states are compared
+  directly. Effective dimension is diagnostic only.
+- AdamW uses `1e-5` for Qwen, `3e-3` for the
   temperature, weight decay `0.05`, gradient clipping `1.0`, and 3% warmup.
 - The production schedule is one complete unique-data epoch. Validation runs every 100 steps
   over the complete one-pass sensor validation sampler, visiting every SmellNet,
-  ECG, and haptic validation recording once.
+  ECG, and tactile validation recording once.
 - Checkpoint selection uses the SmellNet/ECG validation macro-F1 at
-  `val-core/f1_macro/overall`. Haptic logs bidirectional sensor/text Recall@1,
-  Recall@5, and mAP over all 635 validation recordings.
+  `val-core/f1_macro/overall`. Tactile logs sensor-to-text Recall@1, Recall@5,
+  and mAP over all 635 validation recordings.

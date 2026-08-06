@@ -44,7 +44,7 @@ def _body_uneven(rank: int, world: int, out: dict) -> None:
 
     metadata_group = dist.new_group(backend="gloo")
     counts = [2, 0, 1]
-    families_by_rank = ["smell", "ecg", "tactile"]
+    families_by_rank = ["smellnet", "ecg", "tactile"]
     n = counts[rank]
     z = torch.full((n, SHARED_DIM), float(rank + 1), requires_grad=True) if n else None
     labels = [f"r{rank}_{i}" for i in range(n)]
@@ -56,7 +56,7 @@ def _body_uneven(rank: int, world: int, out: dict) -> None:
         families,
         torch.device("cpu"),
         world,
-        shared_dim=SHARED_DIM,
+        embedding_dim=SHARED_DIM,
         metadata_group=metadata_group,
     )
     gathered.sum().backward()
@@ -75,6 +75,6 @@ def test_gather_handles_uneven_rows_metadata_and_backward():
     for label, family, value in out["rows_0"]:
         owner = int(label[1])
         assert value == pytest.approx(owner + 1)
-        assert family == ("smell" if owner == 0 else "tactile")
+        assert family == ("smellnet" if owner == 0 else "tactile")
     assert out["grad_0"] > 0 and out["grad_2"] > 0
     assert all(out[f"backward_{rank}"] for rank in range(3))

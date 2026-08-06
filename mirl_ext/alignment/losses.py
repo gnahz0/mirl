@@ -36,7 +36,9 @@ def distill_cosine(
     rows_per_sample: list[int] | None = None,
 ) -> torch.Tensor:
     """Cosine distance to a frozen teacher, optionally balanced by sample."""
-    row_loss = 1.0 - (student * teacher.detach()).sum(dim=-1)
+    student = F.normalize(student.float(), dim=-1, eps=1e-6)
+    teacher = F.normalize(teacher.detach().float(), dim=-1, eps=1e-6)
+    row_loss = 1.0 - (student * teacher).sum(dim=-1)
     if rows_per_sample is None:
         return row_loss.mean()
     return torch.stack([chunk.mean() for chunk in row_loss.split(rows_per_sample)]).mean()

@@ -1,5 +1,5 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Train Qwen3.5's vision encoder against SigLIP2 text prototypes."""
+"""Train Qwen3.5's vision encoder against SigLIP2 text-label banks."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import logging
 import math
 import sys
 import time
-from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -19,12 +19,15 @@ from tqdm import tqdm
 from .metrics import (
     _allreduce_counts,
     _allreduce_metrics,
-    _is_ts_window_metric,
     add_ts_family_counts,
-    group_grad_norms,
     new_counts,
 )
-from .objective import _build_text_prototype_bank, _compute_losses, _run_validation, _score_ts_collector
+from .objective import (
+    _build_text_label_bank,
+    _compute_losses,
+    _run_validation,
+    _score_ts,
+)
 from .reporting import report_train_step, report_validation
 from .runtime import (
     allreduce_grad_average,
@@ -33,7 +36,6 @@ from .runtime import (
     build_optimizer,
     init_distributed,
     maybe_init_wandb,
-    resolve_dtype,
     save_checkpoint,
     setup_logging,
 )
@@ -41,24 +43,42 @@ from .runtime import (
 logger = logging.getLogger("alignment.trainer")
 
 
-def _new_ts_collector() -> dict[str, list]:
-    return {"z": [], "labels": [], "families": [], "retrieval": []}
+@dataclass
+class AccumulationWindow:
+    counts: dict[str, int] = field(default_factory=new_counts)
+    metric_values: dict[str, list[float]] = field(default_factory=dict)
+    ts_embeddings: list[torch.Tensor] = field(default_factory=list)
+    ts_labels: list[str] = field(default_factory=list)
+    ts_families: list[str] = field(default_factory=list)
 
+    def add(self, batch: dict, metrics: dict, ts_eval: tuple) -> None:
+        self.counts["n/img_image"] += len(batch["img_image_pil"])
+        self.counts["n/img_video"] += len(batch["img_video"])
+        self.counts["n/ts_signal"] += len(batch["ts_signal"])
+        add_ts_family_counts(self.counts, batch)
+        embeddings, labels, families = ts_eval
+        if embeddings is not None:
+            self.ts_embeddings.append(embeddings)
+            self.ts_labels.extend(labels)
+            self.ts_families.extend(families)
+        for key, value in metrics.items():
+            self.metric_values.setdefault(key, []).append(float(value))
 
 def train(cfg: DictConfig) -> None:
     setup_logging(cfg.get("log_level", "INFO"))
     # torchrun owns one full model replica per GPU; gradients are synced manually.
     rank, local_rank, world_size, control_group = init_distributed()
     is_main = rank == 0
-    seed = int(cfg.train.get("seed", 42))
+    seed = int(cfg.train.seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     if not is_main:
         logging.getLogger().setLevel(logging.WARNING)
 
     device = torch.device("cuda", local_rank)
-    amp_dtype = resolve_dtype(cfg.train.amp_dtype)
-    visual_dtype = resolve_dtype(cfg.model.trainable_visual_dtype)
+    dtypes = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+    amp_dtype = dtypes[cfg.train.amp_dtype]
+    visual_dtype = dtypes[cfg.model.trainable_visual_dtype]
     out_dir = Path(cfg.train.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
@@ -70,15 +90,11 @@ def train(cfg: DictConfig) -> None:
         out_dir,
     )
 
-    train_ds, train_loader, train_sampler, val_loader = build_loaders(cfg, rank, world_size, seed)
+    train_ds, val_ds, train_loader, train_sampler, val_loader = build_loaders(cfg, rank, world_size, seed)
     model = build_model(cfg, device, visual_dtype)
-    # The complete SigLIP2 label vocabulary acts as the classifier; no class head.
-    families = tuple(cfg.loss.prototype_families)
-    prototype_bank = _build_text_prototype_bank(
-        model,
-        {family: train_ds.ts_label_vocabs[family] for family in families},
-        device,
-    )
+    # Every family aligns against its split's complete SigLIP2 text-label bank.
+    train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
+    val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
     free, total = torch.cuda.mem_get_info()
     logger.info(
         "GPU memory after load: %.2f / %.2f GiB",
@@ -115,9 +131,7 @@ def train(cfg: DictConfig) -> None:
 
     pbar = tqdm(total=total_steps, desc="stage1", dynamic_ncols=True, file=sys.stdout) if is_main else None
     trainable = [param for param in model.parameters() if param.requires_grad]
-    counts = new_counts()
-    metric_values: defaultdict[str, list[float]] = defaultdict(list)
-    ts_eval = _new_ts_collector()
+    window = AccumulationWindow()
     opt_step = 0
     best_value = float("-inf")
     started = time.time()
@@ -128,46 +142,35 @@ def train(cfg: DictConfig) -> None:
         for batch_index, batch in enumerate(train_loader):
             window_start = (batch_index // grad_accum) * grad_accum
             window_size = min(grad_accum, micro_batches_per_epoch - window_start)
-            micro_eval = _new_ts_collector()
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                loss, metrics = _compute_losses(
+                loss, metrics, micro_eval = _compute_losses(
                     model,
                     batch,
                     cfg,
                     device,
-                    visual_dtype,
                     world_size=world_size,
-                    ts_eval_collector=micro_eval,
-                    prototype_bank=prototype_bank,
+                    label_bank=train_label_bank,
                     metadata_group=control_group,
                 )
 
-            counts["n/img_image"] += len(batch["img_image_pil"])
-            counts["n/img_video"] += len(batch["img_video"])
-            counts["n/ts_signal"] += len(batch["ts_signal"])
-            add_ts_family_counts(counts, batch)
-            for key in ts_eval:
-                ts_eval[key].extend(micro_eval[key])
-            for key, value in metrics.items():
-                metric_values[key].append(float(value))
+            window.add(batch, metrics, micro_eval)
 
             (loss / window_size).backward()
             end_of_epoch = batch_index + 1 == micro_batches_per_epoch
             if (batch_index + 1) % grad_accum and not end_of_epoch:
                 continue
 
-            metrics = {key: sum(values) / len(values) for key, values in metric_values.items()}
+            metrics = {key: sum(values) / len(values) for key, values in window.metric_values.items()}
             # Average first, then clip, so every replica applies the same update.
             allreduce_grad_average(trainable, world_size)
-            metrics.update(group_grad_norms(model))
             metrics["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(trainable, cfg.train.grad_clip))
             # Every rank scores the same globally gathered window before the update.
             # Keeping this symmetric prevents faster ranks from waiting in NCCL.
-            window_metrics = _score_ts_collector(
-                model,
-                ts_eval,
-                prototype_bank,
-                paired_families=tuple(cfg.loss.paired_text_families),
+            window_metrics = _score_ts(
+                window.ts_embeddings,
+                window.ts_labels,
+                window.ts_families,
+                train_label_bank,
             )
             optimizer.step()
             lrs = {str(group["name"]).partition("_")[0]: float(group["lr"]) for group in optimizer.param_groups}
@@ -176,10 +179,9 @@ def train(cfg: DictConfig) -> None:
             opt_step += 1
 
             metrics = _allreduce_metrics(metrics, device, world_size)
-            counts = _allreduce_counts(counts, device, world_size)
+            counts = _allreduce_counts(window.counts, device, world_size)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
-                metrics = {key: value for key, value in metrics.items() if not _is_ts_window_metric(key)}
                 metrics.update(window_metrics)
                 report_train_step(
                     model,
@@ -203,10 +205,8 @@ def train(cfg: DictConfig) -> None:
                     val_loader,
                     cfg,
                     device,
-                    visual_dtype,
                     amp_dtype,
-                    n_batches=cfg.train.val_batches,
-                    prototype_bank=prototype_bank,
+                    label_bank=val_label_bank,
                     world_size=world_size,
                     metadata_group=control_group,
                 )
@@ -223,9 +223,7 @@ def train(cfg: DictConfig) -> None:
                     )
                 dist.barrier(group=control_group)
 
-            counts = new_counts()
-            metric_values.clear()
-            ts_eval = _new_ts_collector()
+            window = AccumulationWindow()
 
     if is_main:
         pbar.close()
