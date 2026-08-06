@@ -2,6 +2,7 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 
 from mirl_ext.alignment.data import AlignmentDataset, HomogeneousBatchSampler, collate_alignment
@@ -190,3 +191,61 @@ def test_homogeneous_sampler_is_deterministic_per_epoch():
 
     sampler.set_epoch(1)
     assert first != list(sampler)
+
+
+def test_homogeneous_sampler_repeats_only_configured_signal_sources():
+    dataset = _GroupedDataset()
+    rank0 = HomogeneousBatchSampler(
+        dataset,
+        batch_size=8,
+        rank=0,
+        world_size=2,
+        seed=13,
+        signal_repeat_factors={"smellnet_base": 3, "haptic_tactile": 2},
+    )
+    rank1 = HomogeneousBatchSampler(
+        dataset,
+        batch_size=8,
+        rank=1,
+        world_size=2,
+        seed=13,
+        signal_repeat_factors={"smellnet_base": 3, "haptic_tactile": 2},
+    )
+
+    counts = {group: 0 for group in dataset.sampling_groups}
+    owner = {
+        index: group
+        for group, indices in dataset.sampling_groups.items()
+        for index in indices
+    }
+    for batch0, batch1 in zip(rank0, rank1, strict=True):
+        assert len(_batch_groups(dataset, batch0 + batch1)) == 1
+        for index in batch0 + batch1:
+            counts[owner[index]] += 1
+
+    assert counts == {
+        ("signal", "smellnet_base"): 36,
+        ("signal", "ecg"): 12,
+        ("signal", "haptic_tactile"): 24,
+        ("image", "climb"): 12,
+        ("video", "human_behaviour"): 12,
+    }
+
+
+@pytest.mark.parametrize("factor", [0, -1, 1.5, True])
+def test_homogeneous_sampler_rejects_non_positive_integer_repeat_factors(factor):
+    with pytest.raises(ValueError, match="positive integers"):
+        HomogeneousBatchSampler(
+            _GroupedDataset(),
+            batch_size=8,
+            signal_repeat_factors={"smellnet_base": factor},
+        )
+
+
+def test_homogeneous_sampler_rejects_unknown_repeat_sources():
+    with pytest.raises(ValueError, match="unknown signal sources"):
+        HomogeneousBatchSampler(
+            _GroupedDataset(),
+            batch_size=8,
+            signal_repeat_factors={"missing": 2},
+        )

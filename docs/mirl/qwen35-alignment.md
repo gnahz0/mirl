@@ -146,8 +146,10 @@ produces 2,303 tokens.
 
 - Every microbatch contains one media kind and one `data_source`; SigLIP negatives
   still come from the complete family label bank.
-- Rows are not repeated within an epoch. Source groups smaller than the GPU count
-  are skipped so every rank receives a sample.
+- Visual rows and signal sources omitted from `train.signal_repeat_factors` are
+  visited once per epoch. Configured low-resource signal sources repeat complete
+  independently shuffled passes. Validation is always one-pass. Source groups
+  smaller than the GPU count are skipped so every rank receives a sample.
 - SmellNet sampling and metrics use only the 50 base substances; mixture rows
   never enter the active dataset or W&B tables.
 - The clean baseline aligns every sensor family through one complete SigLIP2

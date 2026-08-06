@@ -45,9 +45,11 @@ not enter the dataset, model, or objective. Stored sensor labels are already
 clean and are passed to SigLIP2 verbatim; the loader does not alter casing.
 
 **Visual rows are preservation anchors, not QA examples.** Their annotation text
-is ignored, so `AlignmentDataset` keeps one row per image/video path. The sampler
-does not repeat rows and skips source groups too small to give every rank a sample.
-Every global microbatch has one media kind and one `data_source`.
+is ignored, so `AlignmentDataset` keeps one row per image/video path. Visual rows
+remain one-pass; low-resource signal sources may repeat complete shuffled passes
+through integer `train.signal_repeat_factors`. Validation remains one-pass. The
+sampler skips source groups too small to give every rank a sample. Every global
+microbatch has one media kind and one `data_source`.
 
 **Labels are balanced explicitly.** Anchors with the same label
 share that label's total row weight; unique tactile answers naturally receive

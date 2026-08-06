@@ -39,6 +39,13 @@ loss:
 
 train:
   seed: 42
+  # Repeat complete shuffled passes over low-resource signal sources. Values are
+  # positive integers; omitted sources and all visual sources repeat once.
+  # Validation is always one-pass. These factors approximate square-root
+  # balancing without requiring a sampling exponent.
+  signal_repeat_factors:
+    smellnet_base: 13
+    haptic_tactile: 5
   # Four GPUs and two-step accumulation give a global batch of up to 256.
   batch_size: 32
   grad_accum_steps: 2

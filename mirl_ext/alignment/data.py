@@ -10,7 +10,7 @@ import random
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from torch.utils.data import BatchSampler, Dataset, Sampler
+from torch.utils.data import Dataset, Sampler
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +173,11 @@ class AlignmentDataset(Dataset):
 
 
 class HomogeneousBatchSampler(Sampler[list[int]]):
-    """Yield source-homogeneous batches with one nonempty shard per rank."""
+    """Yield source-homogeneous batches with one nonempty shard per rank.
+
+    Training may repeat complete shuffled passes over selected signal sources.
+    Visual sources and omitted signal sources always retain one-pass sampling.
+    """
 
     def __init__(
         self,
@@ -183,6 +187,7 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         rank: int = 0,
         world_size: int = 1,
         seed: int = 42,
+        signal_repeat_factors: dict[str, int] | None = None,
     ) -> None:
         self.groups = dataset.sampling_groups
         self.rank = rank
@@ -190,11 +195,34 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         self.seed = seed
         self.epoch = 0
         self.batch_size = batch_size
-        self.num_batches = len(self._global_batches(self.groups))
-        dropped = sum(
-            len(BatchSampler(rows, batch_size * world_size, drop_last=False))
-            for rows in self.groups.values()
-        ) - self.num_batches
+        self.signal_repeat_factors = dict(signal_repeat_factors or {})
+
+        signal_sources = {source for kind, source in self.groups if kind == "signal"}
+        unknown = sorted(set(self.signal_repeat_factors) - signal_sources)
+        if unknown:
+            raise ValueError(f"signal_repeat_factors contains unknown signal sources: {unknown}")
+        for source, factor in self.signal_repeat_factors.items():
+            if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
+                raise ValueError(
+                    "signal_repeat_factors values must be positive integers; "
+                    f"got {source}={factor!r}"
+                )
+
+        effective_sizes = {
+            group: len(rows) * self._repeat_factor(group)
+            for group, rows in self.groups.items()
+        }
+        global_batch_size = self.batch_size * self.world_size
+        batch_counts = {
+            group: (size + global_batch_size - 1) // global_batch_size
+            for group, size in effective_sizes.items()
+        }
+        self.num_batches = sum(
+            count
+            for group, count in batch_counts.items()
+            if effective_sizes[group] >= self.world_size
+        )
+        dropped = sum(batch_counts.values()) - self.num_batches
         if dropped:
             logger.warning(
                 "HomogeneousBatchSampler: dropped %d global batch(es) with fewer than "
@@ -202,13 +230,27 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
                 dropped,
                 world_size,
             )
+        if self.signal_repeat_factors:
+            logger.info(
+                "HomogeneousBatchSampler: signal repeat factors=%s; effective rows=%s",
+                self.signal_repeat_factors,
+                {
+                    f"{kind}/{source}": effective_sizes[(kind, source)]
+                    for kind, source in self.groups
+                    if kind == "signal"
+                },
+            )
+
+    def _repeat_factor(self, group: tuple[str, str]) -> int:
+        kind, source = group
+        return self.signal_repeat_factors.get(source, 1) if kind == "signal" else 1
 
     def _global_batches(self, pools: dict) -> list[list[int]]:
         """Build global batches that give every rank a sample."""
         batches: list[list[int]] = []
         global_batch_size = self.batch_size * self.world_size
         for rows in pools.values():
-            batch_count = len(BatchSampler(rows, global_batch_size, drop_last=False))
+            batch_count = (len(rows) + global_batch_size - 1) // global_batch_size
             for start in range(batch_count):
                 chunk = rows[start * len(rows) // batch_count : (start + 1) * len(rows) // batch_count]
                 if len(chunk) >= self.world_size:
@@ -224,9 +266,14 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
     def __iter__(self):
         epoch_seed = self.seed + self.epoch * 1_000_003
         rng = random.Random(epoch_seed)
-        pools = {name: list(indices) for name, indices in self.groups.items()}
-        for values in pools.values():
-            rng.shuffle(values)
+        pools: dict[tuple[str, str], list[int]] = {}
+        for group, indices in self.groups.items():
+            values: list[int] = []
+            for _ in range(self._repeat_factor(group)):
+                cycle = list(indices)
+                rng.shuffle(cycle)
+                values.extend(cycle)
+            pools[group] = values
 
         global_batches = self._global_batches(pools)
         rng.shuffle(global_batches)

@@ -73,6 +73,7 @@ def build_loaders(
         rank=rank,
         world_size=world_size,
         seed=seed,
+        signal_repeat_factors=dict(cfg.train.get("signal_repeat_factors", {})),
     )
     train_kwargs = {
         "batch_sampler": train_sampler,
