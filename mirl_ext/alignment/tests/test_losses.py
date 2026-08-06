@@ -27,7 +27,7 @@ from mirl_ext.alignment.objective import (  # noqa: E402
     _family_paired_siglip_losses,
     _family_prototype_siglip_loss,
 )
-from mirl_ext.alignment.projection import GCMSMLPEncoder, GCMSProjectionHead, ProjectionHead  # noqa: E402
+from mirl_ext.alignment.projection import ProjectionHead  # noqa: E402
 
 
 def _scalars(positive_rate: float = 0.25):
@@ -82,34 +82,11 @@ def test_token_distillation_weights_samples_not_token_count():
     assert float(distill_cosine(student, teacher, [1, 2])) == pytest.approx(1.0)
 
 
-def test_projection_head_is_linear_unless_hidden_dimension_is_requested():
-    linear = ProjectionHead(16, 8, hidden_dim=None)
-    mlp = ProjectionHead(16, 8, hidden_dim=12)
+def test_projection_head_is_linear():
+    projection = ProjectionHead(16, 8)
 
-    assert isinstance(linear.net, torch.nn.Linear)
-    assert isinstance(mlp.net, torch.nn.Sequential)
-    assert linear(torch.randn(3, 16)).shape == mlp(torch.randn(3, 16)).shape == (3, 8)
-
-
-
-def test_gcms_projection_uses_smellnet_encoder_before_shared_adapter():
-    gcms = GCMSProjectionHead(460, 32)
-    layers = list(gcms.encoder.net)
-
-    assert isinstance(gcms.encoder, GCMSMLPEncoder)
-    assert [type(layer) for layer in layers] == [
-        torch.nn.LayerNorm,
-        torch.nn.Linear,
-        torch.nn.ReLU,
-        torch.nn.Dropout,
-        torch.nn.Linear,
-        torch.nn.ReLU,
-        torch.nn.Dropout,
-        torch.nn.Linear,
-    ]
-    assert [layer.out_features for layer in layers if isinstance(layer, torch.nn.Linear)] == [512, 256, 256]
-    assert gcms.adapter.in_features == 256
-    assert gcms(torch.randn(4, 460)).shape == (4, 32)
+    assert isinstance(projection.net, torch.nn.Linear)
+    assert projection(torch.randn(3, 16)).shape == (3, 8)
 
 
 def test_family_prototype_loss_is_class_balanced():
@@ -128,20 +105,18 @@ def test_family_prototype_loss_is_class_balanced():
             scale,
         )
 
-    small, small_families, small_coverage = compute(2)
-    large, large_families, large_coverage = compute(20)
-    assert float(small) == pytest.approx(float(large), rel=1e-6)
+    small_families = compute(2)
+    large_families = compute(20)
     assert float(small_families["ecg"]) == pytest.approx(
         float(large_families["ecg"]), rel=1e-6
     )
-    assert small_coverage == large_coverage == {"ecg": 1.0}
 
 
 def test_family_prototype_loss_uses_absent_classes_as_negatives():
     anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
     scale, _ = _scalars(1 / 3)
-    loss, family_losses, coverage = _family_prototype_siglip_loss(
+    family_losses = _family_prototype_siglip_loss(
         anchors,
         ["A", "B"],
         ["ecg", "ecg"],
@@ -149,9 +124,8 @@ def test_family_prototype_loss_uses_absent_classes_as_negatives():
         ("ecg",),
         scale,
     )
-    assert torch.isfinite(loss)
+    assert torch.isfinite(family_losses["ecg"])
     assert family_losses.keys() == {"ecg"}
-    assert coverage == {"ecg": 1.0}
 
 
 def test_paired_caption_siglip_uses_balanced_multi_positive_chunks(monkeypatch):
@@ -217,15 +191,13 @@ def test_paired_retrieval_reports_both_directions():
     }
 
 
-def test_prototype_metrics_exclude_unknown_labels_and_report_coverage():
+def test_prototype_metrics_exclude_unknown_labels():
     metrics = _prototype_classification_metrics(
         torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
         ["A", "unseen"],
         ("A", "B"),
         torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
     )
-    assert metrics["label_coverage"] == pytest.approx(0.5)
-    assert metrics["class_coverage"] == pytest.approx(0.5)
     assert metrics["accuracy"] == pytest.approx(1.0)
     assert metrics["f1_macro"] == pytest.approx(1.0)
 
@@ -271,7 +243,7 @@ def test_absent_ground_truth_classes_do_not_cap_macro_f1():
         metrics["recall_macro"],
         metrics["f1_macro"],
     } == {1.0}
-    assert metrics["class_coverage"] == metrics["prediction_coverage"] == pytest.approx(2 / 3)
+    assert metrics["prediction_coverage"] == pytest.approx(2 / 3)
     assert report[2] == {
         "class_id": 2,
         "label": "C",
@@ -364,10 +336,7 @@ def test_validation_metrics_separate_core_from_aux_and_do_not_fake_haptic_f1():
             "accuracy/ts_smell": 0.5,
             "precision_macro/ts_smell": 0.45,
             "recall_macro/ts_smell": 0.42,
-            "accuracy/smell_sensor_to_gcms": 0.6,
-            "accuracy/smell_gcms_to_text": 0.8,
             "f1_macro/ts_smell": 0.4,
-            "class_coverage/ts_smell": 0.75,
             "prediction_coverage/ts_smell": 0.25,
             "accuracy/ts_supervised_family_macro": 0.5,
             "precision_macro/ts_supervised_family_macro": 0.45,
@@ -410,8 +379,6 @@ def test_validation_metrics_separate_core_from_aux_and_do_not_fake_haptic_f1():
     assert metrics["val-core/recall_at_1/smellnet"] == 0.5
     assert metrics["val-core/recall_at_5/smellnet"] == 0.8
     assert metrics["val-core/recall_at_5_macro/all_classes"] == 0.68
-    assert metrics["val-aux/accuracy/smellnet_sensor_to_gcms"] == 0.6
-    assert metrics["val-aux/accuracy/smellnet_gcms_to_text"] == 0.8
     assert metrics["val-core/accuracy/overall"] == 0.5
     assert metrics["val-core/f1_macro/overall"] == 0.4
     assert "val-core/f1_macro/haptic" not in metrics
@@ -449,7 +416,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "recall_at_5_macro/ts_supervised_class_macro": 0.68,
         "eff_dim/ts_smell": 3.0,
         "prediction_coverage/ts_smell": 0.2,
-        "gap/ts_smell": 0.1,
         "loss/ts_text": 0.75,
         "loss/ts_smell": 0.7,
         "loss/ts_ecg": 0.8,
@@ -487,7 +453,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     assert grouped["train-aux/loss/siglip/ecg"] == 0.8
     assert grouped["train-aux/loss/siglip/haptic"] == 0.75
     assert grouped["train-aux/loss/distill"] == 0.5
-    assert not any("gap" in key for key in grouped)
 
 
 def test_effective_dim_detects_rank_collapse():

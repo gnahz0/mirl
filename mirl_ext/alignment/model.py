@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .projection import GCMSProjectionHead, ProjectionHead
+from .projection import ProjectionHead
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +24,38 @@ _TACTILE_PRESSURE_MAX = 3072.0
 
 
 def _resolve_snapshot(path_or_repo: str) -> Path:
-    """Resolve a local HF snapshot, downloading it only when a repo id is given."""
     path = Path(path_or_repo).expanduser()
     if path.exists():
         return path.resolve()
     from huggingface_hub import snapshot_download
 
     return Path(snapshot_download(repo_id=path_or_repo)).resolve()
+
+
+def _load_safetensor_prefix(
+    root: Path,
+    prefix: str,
+    *,
+    strip_prefix: bool,
+) -> dict[str, torch.Tensor]:
+    from safetensors import safe_open
+
+    index_path = root / "model.safetensors.index.json"
+    if index_path.exists():
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        filenames = sorted({name for key, name in weight_map.items() if key.startswith(prefix)})
+    elif (root / "model.safetensors").exists():
+        filenames = ["model.safetensors"]
+    else:
+        raise FileNotFoundError(f"no safetensors checkpoint found under {root}")
+
+    state: dict[str, torch.Tensor] = {}
+    for filename in filenames:
+        with safe_open(root / filename, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key.startswith(prefix):
+                    state[key.removeprefix(prefix) if strip_prefix else key] = handle.get_tensor(key)
+    return state
 
 
 def _load_exact_qwen35_visual(
@@ -40,7 +65,6 @@ def _load_exact_qwen35_visual(
     attn_impl: str,
 ) -> nn.Module:
     """Load the native Qwen3.5 vision tower without materializing the 9B LM."""
-    from safetensors import safe_open
     from transformers import AutoConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
@@ -50,50 +74,21 @@ def _load_exact_qwen35_visual(
     vision_config._attn_implementation = attn_impl
     visual = Qwen3_5VisionModel(vision_config).to(dtype=dtype)
 
-    index_path = root / "model.safetensors.index.json"
-    if index_path.exists():
-        weight_map = json.loads(index_path.read_text())["weight_map"]
-        filenames = sorted({name for key, name in weight_map.items() if key.startswith("model.visual.")})
-    elif (root / "model.safetensors").exists():
-        filenames = ["model.safetensors"]
-    else:
-        raise FileNotFoundError(f"no safetensors checkpoint found under {root}")
-
-    state_dict: dict[str, torch.Tensor] = {}
-    for filename in filenames:
-        with safe_open(root / filename, framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                if key.startswith("model.visual."):
-                    state_dict[key.removeprefix("model.visual.")] = handle.get_tensor(key)
-    visual.load_state_dict(state_dict, strict=True)
+    state = _load_safetensor_prefix(root, "model.visual.", strip_prefix=True)
+    visual.load_state_dict(state, strict=True)
     return visual
 
 
 def _load_exact_siglip2_text(path_or_repo: str, *, dtype: torch.dtype) -> nn.Module:
     """Load only ``text_model.*`` from a paired SigLIP2 checkpoint, strictly."""
-    from safetensors import safe_open
     from transformers import AutoConfig, Siglip2TextModel
 
     root = _resolve_snapshot(path_or_repo)
     full_config = AutoConfig.from_pretrained(root, local_files_only=True)
     text_model = Siglip2TextModel(full_config.text_config).to(dtype=dtype)
 
-    index_path = root / "model.safetensors.index.json"
-    if index_path.exists():
-        weight_map = json.loads(index_path.read_text())["weight_map"]
-        filenames = sorted({name for key, name in weight_map.items() if key.startswith("text_model.")})
-    elif (root / "model.safetensors").exists():
-        filenames = ["model.safetensors"]
-    else:
-        raise FileNotFoundError(f"no safetensors checkpoint found under {root}")
-
-    state_dict: dict[str, torch.Tensor] = {}
-    for filename in filenames:
-        with safe_open(root / filename, framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                if key.startswith("text_model."):
-                    state_dict[key] = handle.get_tensor(key)
-    text_model.load_state_dict(state_dict, strict=True)
+    state = _load_safetensor_prefix(root, "text_model.", strip_prefix=False)
+    text_model.load_state_dict(state, strict=True)
     return text_model
 
 
@@ -142,14 +137,11 @@ class MultimodalAlignmentModel(nn.Module):
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
         shared_dim: int = 512,
-        proj_hidden_dim: Optional[int] = 1024,
-        proj_dropout: float = 0.0,
         visual_dtype: torch.dtype = torch.bfloat16,
         attn_impl: str = "sdpa",
         gradient_checkpointing: bool = False,
         ecg_normalization: str = "robust",
         tactile_delta_channels: bool = False,
-        gcms_input_dim: Optional[int] = None,
         contrastive_temperature: float = 0.07,
     ):
         super().__init__()
@@ -210,13 +202,8 @@ class MultimodalAlignmentModel(nn.Module):
             time.time() - started,
         )
 
-        self.proj_visual = ProjectionHead(qwen_hidden, shared_dim, proj_hidden_dim, proj_dropout)
-        self.proj_text = ProjectionHead(label_hidden, shared_dim, proj_hidden_dim, proj_dropout)
-        self.proj_gcms = (
-            GCMSProjectionHead(int(gcms_input_dim), shared_dim)
-            if gcms_input_dim is not None
-            else None
-        )
+        self.proj_visual = ProjectionHead(qwen_hidden, shared_dim)
+        self.proj_text = ProjectionHead(label_hidden, shared_dim)
 
         self.tactile_delta_channels = bool(tactile_delta_channels)
         self.log_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / contrastive_temperature)))
@@ -398,7 +385,10 @@ class MultimodalAlignmentModel(nn.Module):
 
         return torch.cat((tactile_frames, force_frames), dim=-1)
 
-    def _tactile_to_video_inputs(self, payload: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _tactile_to_video_inputs(
+        self,
+        payload: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Feed tactile and force tiles through Qwen's temporal patch path."""
         frames = self._tactile_frame_tiles(payload)
         return self._patchify_pseudo_video(frames.unsqueeze(0))

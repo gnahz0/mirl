@@ -21,10 +21,8 @@ data:
     - ${data.root}/tactile_valid.parquet
   # The loader excludes mixtures; Stage 1 learns the 50-way base-substance task.
 
-  # Up to 8 rows from each signal family and 8 images/videos per rank. An epoch
-  # consumes every sensor row once; exhausted families are not recycled.
-  # Until exhaustion, four GPUs contribute 32 recordings per signal family.
-  # Validation chunks ten recordings per family and exhausts the one-pass sampler.
+  # Each rank gets at most 8 rows from a sensor family; unique visual media fill
+  # the remaining slots. One epoch consumes every row once without recycling.
   ts_per_family_per_batch: 8
   val_ts_per_family_per_batch: 10
 
@@ -45,7 +43,6 @@ model:
 
 projection:
   shared_dim: 512
-  hidden_dim: null
 
 loss:
   temperature: 0.07
@@ -57,7 +54,7 @@ loss_weights:
   distill_img: 1.0
 
 train:
-  # Four GPUs and two-step accumulation give an effective global batch of 256.
+  # Four GPUs and two-step accumulation give a global batch of up to 256.
   batch_size: 32
   grad_accum_steps: 2
   num_workers: 4

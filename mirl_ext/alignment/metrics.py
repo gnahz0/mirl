@@ -22,8 +22,6 @@ _REDUCED_METRIC_KEYS: tuple[str, ...] = (
         "loss/ts_smell",
         "loss/ts_ecg",
         "loss/ts_tactile",
-        "loss/smell_sensor_gcms",
-        "loss/smell_gcms_text",
         "loss/distill_img",
         "loss/total",
         # Equal-family core metrics only include families with a real prototype task.
@@ -40,8 +38,6 @@ _REDUCED_METRIC_KEYS: tuple[str, ...] = (
             for aggregation in ("family", "class")
             for stat in ("recall_at_1_macro", "recall_at_5_macro")
         ),
-        "accuracy/smell_sensor_to_gcms",
-        "accuracy/smell_gcms_to_text",
     )
     + tuple(
         f"{stat}/ts_{family}"
@@ -55,10 +51,7 @@ _REDUCED_METRIC_KEYS: tuple[str, ...] = (
             "recall_at_5",
             "recall_at_1_macro",
             "recall_at_5_macro",
-            "gap",
             "eff_dim",
-            "label_coverage",
-            "class_coverage",
             "prediction_coverage",
         )
     )
@@ -77,11 +70,7 @@ _MUST_REDUCE_PREFIXES = (
     "recall_macro/",
     "f1_macro/",
     "recall_at_",
-    "gap/",
     "eff_dim/",
-    "coverage/",
-    "label_coverage/",
-    "class_coverage/",
     "prediction_coverage/",
 )
 
@@ -93,10 +82,7 @@ _TS_WINDOW_METRIC_PREFIXES = (
     "f1_macro/",
     "recall_at_",
     "map/",
-    "gap/",
     "eff_dim/",
-    "label_coverage/",
-    "class_coverage/",
     "prediction_coverage/",
 )
 
@@ -170,38 +156,6 @@ def group_grad_norms(model: torch.nn.Module) -> dict[str, float]:
     return out
 
 
-@torch.no_grad()
-def _smellnet_gcms_top1_metrics(
-    z_ts: torch.Tensor,
-    labels: list[str],
-    families: list[str],
-    text_bank: tuple[tuple[str, ...], torch.Tensor],
-    gcms_bank: tuple[tuple[str, ...], torch.Tensor],
-) -> dict[str, float]:
-    """Report sensor-to-GC-MS and GC-MS-to-text top-1 retrieval accuracy."""
-    text_labels, text_features = text_bank
-    gcms_labels, gcms_features = gcms_bank
-
-    out: dict[str, float] = {}
-    smell_rows = [index for index, family in enumerate(families) if family == "smell"]
-    if smell_rows:
-        select = torch.tensor(smell_rows, device=z_ts.device, dtype=torch.long)
-        smell_labels = [labels[index] for index in smell_rows]
-        result = _prototype_classification_metrics(
-            z_ts.index_select(0, select),
-            smell_labels,
-            gcms_labels,
-            gcms_features,
-        )
-        if "accuracy" in result:
-            out["accuracy/smell_sensor_to_gcms"] = result["accuracy"]
-
-    similarity = gcms_features.float() @ text_features.float().t()
-    target = torch.arange(len(gcms_labels), device=similarity.device)
-    out["accuracy/smell_gcms_to_text"] = float((similarity.argmax(dim=1) == target).float().mean())
-    return out
-
-
 def add_ts_family_counts(counts: dict, batch: dict) -> None:
     """Add per-family row counts."""
     for family in batch.get("ts_format") or []:
@@ -262,11 +216,7 @@ def _prototype_classification_metrics(
 ) -> dict[str, float]:
     """Score known labels, macro-averaging only classes present in ground truth."""
     if not labels or not prototype_labels:
-        return {
-            "label_coverage": 0.0,
-            "class_coverage": 0.0,
-            "prediction_coverage": 0.0,
-        }
+        return {}
 
     label_to_id = {label: idx for idx, label in enumerate(prototype_labels)}
     prototypes = prototypes.to(device=z.device)
@@ -276,11 +226,7 @@ def _prototype_classification_metrics(
         dtype=torch.long,
     )
     known = true >= 0
-    result = {
-        "label_coverage": float(known.float().mean()),
-        "class_coverage": 0.0,
-        "prediction_coverage": 0.0,
-    }
+    result: dict[str, float] = {}
     if not bool(known.any()):
         if per_class_out is not None:
             per_class_out.extend(
@@ -296,7 +242,7 @@ def _prototype_classification_metrics(
                 }
                 for class_id, label in enumerate(prototype_labels)
             )
-        return result
+        return {}
 
     known_z = z[known].float()
     known_true = true[known]
@@ -357,19 +303,10 @@ def _prototype_classification_metrics(
             "recall_at_5": float(recall_at_5.float().mean()),
             "recall_at_1_macro": sum(supported_recall) / len(supported_recall),
             "recall_at_5_macro": sum(supported_recall_at_5) / len(supported_recall_at_5),
-            "class_coverage": len(supported_f1) / num_classes,
             "prediction_coverage": float((predicted > 0).sum()) / num_classes,
             "supported_classes": len(supported_f1),
         }
     )
-
-    pos = sims.gather(1, known_true[:, None]).squeeze(1)
-    negative_mask = torch.ones_like(sims, dtype=torch.bool)
-    negative_mask.scatter_(1, known_true[:, None], False)
-    neg = sims[negative_mask]
-    result["pos_sim"] = float(pos.mean())
-    result["neg_sim"] = float(neg.mean()) if neg.numel() else 0.0
-    result["gap"] = result["pos_sim"] - result["neg_sim"]
     return result
 
 
@@ -410,9 +347,6 @@ def _ts_prediction_metrics(
                 "recall_at_5",
                 "recall_at_1_macro",
                 "recall_at_5_macro",
-                "gap",
-                "label_coverage",
-                "class_coverage",
                 "prediction_coverage",
             ):
                 if stat in fam_cm:
@@ -508,12 +442,6 @@ def _training_metric_groups(
     for key, value in metrics.items():
         if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale"}:
             out[f"train-aux/{key}"] = value
-    for source, target in (
-        ("accuracy/smell_sensor_to_gcms", "smellnet_sensor_to_gcms"),
-        ("accuracy/smell_gcms_to_text", "smellnet_gcms_to_text"),
-    ):
-        if source in metrics:
-            out[f"train-aux/accuracy/{target}"] = metrics[source]
     out["train-aux/n/img"] = float(counts["n/img_image"] + counts["n/img_video"])
     return out
 
@@ -549,8 +477,6 @@ def _validation_metric_groups(
         for source, target in (
             ("eff_dim", "effective_dimension"),
             ("prediction_coverage", "prediction_coverage"),
-            ("label_coverage", "label_coverage"),
-            ("class_coverage", "class_coverage"),
         ):
             key = f"{source}/ts_{family}"
             if key in prediction_metrics:
@@ -573,10 +499,4 @@ def _validation_metric_groups(
         if class_key in prediction_metrics:
             out[f"val-core/{stat}/all_classes"] = prediction_metrics[class_key]
 
-    for source, target in (
-        ("accuracy/smell_sensor_to_gcms", "smellnet_sensor_to_gcms"),
-        ("accuracy/smell_gcms_to_text", "smellnet_gcms_to_text"),
-    ):
-        if source in prediction_metrics:
-            out[f"val-aux/accuracy/{target}"] = prediction_metrics[source]
     return out

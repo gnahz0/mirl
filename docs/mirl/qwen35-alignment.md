@@ -146,27 +146,24 @@ produces 4,606 tokens.
 
 ## Training recipe
 
-- Each rank receives up to 8 SmellNet recordings, 8 ECG recordings, 8 tactile
-  recordings, and 8 real image/video samples. Two-step gradient accumulation
-  gives an effective global recording batch of 256 on four AICR B200s.
-- One epoch consumes every sensor recording once. A family disappears from later
-  batches after it is exhausted; it is never recycled to match a larger family or
-  the auxiliary image pool. Images are sampled without replacement alongside the
-  sensor-defined epoch.
+- Each rank receives at most 8 recordings from any one sensor family. Deduplicated
+  real images/videos fill the remaining batch slots.
+- One epoch consumes every unique sensor recording and visual-media path once.
+  Smaller sensor families are spread across the epoch and are never recycled.
 - SmellNet sampling and metrics use only the 50 base substances; mixture rows
   never enter the active dataset or W&B tables.
 - The clean baseline aligns SmellNet and ECG recordings with frozen SigLIP2 class
   prototypes. Each tactile recording is paired with the complete annotated answer;
   filename-derived task stems are not used. Answers longer than SigLIP2's 64-token
   context produce multiple equally weighted positive chunks. Chunks are pooled
-  only when ranking complete answers for retrieval. GC-MS remains a separate ablation.
+  only when ranking complete answers for retrieval.
 - SmellNet, ECG, and tactile all retain their complete native time axes in both
   training and validation. One dataset row produces one sensor embedding.
 - The visual/text projections are linear into 512 dimensions. Effective dimension
   is diagnostic only; the baseline has no variance or covariance objective.
 - AdamW uses `1e-5` for Qwen and projection heads, `3e-3` for the
   temperature, weight decay `0.05`, gradient clipping `1.0`, and 3% warmup.
-- The production schedule is one sensor epoch. Validation runs every 100 steps
+- The production schedule is one complete unique-data epoch. Validation runs every 100 steps
   over the complete one-pass sensor validation sampler, visiting every SmellNet,
   ECG, and haptic validation recording once.
 - Checkpoint selection uses the SmellNet/ECG validation macro-F1 at

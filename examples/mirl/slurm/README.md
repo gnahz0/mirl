@@ -16,14 +16,12 @@ All temporary files and runtime caches go below
 `/scratch/dvdai_mit/alecz`; the log goes to
 `/work/mit/ppliang_mit/alecz/logs/mirl_qwen35_<job>.out`.
 
-Stage-1 alignment has two launchers:
+Stage-1 alignment uses the production launcher:
 
 ```bash
-sbatch examples/mirl/slurm/run_stage1_smoke_b200.sbatch
 sbatch examples/mirl/slurm/run_stage1_b200.sbatch
 ```
 
-The smoke launcher exercises two-rank training and family-balanced validation.
 The production launcher reads all experiment settings from
 `mirl_ext/alignment/config/stage1_qwen35_siglip2.yaml` and writes checkpoints to
 `/scratch/dvdai_mit/alecz/checkpoints`.

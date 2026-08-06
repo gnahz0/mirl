@@ -19,7 +19,6 @@ from torch.utils.data import DataLoader
 
 from .data import AlignmentDataset, FamilyBalancedBatchSampler, collate_alignment
 from .model import MultimodalAlignmentModel
-from .smellnet_gcms import SmellNetGCMSBank, load_smellnet_gcms
 
 logger = logging.getLogger("alignment.trainer")
 
@@ -45,7 +44,7 @@ def resolve_dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def init_distributed() -> tuple[int, int, int]:
+def init_distributed() -> tuple[int, int, int, dist.ProcessGroup]:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -55,10 +54,13 @@ def init_distributed() -> tuple[int, int, int]:
         device_id=torch.device("cuda", local_rank),
         timeout=timedelta(minutes=60),
     )
-    return rank, local_rank, world_size
+    control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=60))
+    return rank, local_rank, world_size, control_group
 
 
 def allreduce_grad_average(params: list[torch.nn.Parameter], world_size: int) -> None:
+    if world_size == 1:
+        return
     for param in params:
         if param.grad is None:
             param.grad = torch.zeros_like(param)
@@ -151,6 +153,8 @@ def build_loaders(
         val_ds,
         batch_size=cfg.train.val_batch_size,
         ts_per_family=cfg.data.val_ts_per_family_per_batch,
+        rank=rank,
+        world_size=world_size,
         seed=seed + 1,
     )
     val_loader = DataLoader(
@@ -161,7 +165,7 @@ def build_loaders(
         pin_memory=True,
     )
     logger.info(
-        "val dataset: %d rows, batch=%d, batches/eval=%s (%.1fs)",
+        "val dataset: %d rows, batch/rank=%d, batches/eval=%s (%.1fs)",
         len(val_ds),
         cfg.train.val_batch_size,
         "all" if val_batches is None else val_batches,
@@ -172,27 +176,18 @@ def build_loaders(
 
 def build_model(
     cfg: DictConfig,
-    train_ds: AlignmentDataset,
     device: torch.device,
     visual_dtype: torch.dtype,
-) -> tuple[MultimodalAlignmentModel, SmellNetGCMSBank | None]:
-    gcms_path = cfg.data.get("smellnet_gcms_path")
-    gcms_cpu = (
-        load_smellnet_gcms(str(gcms_path), train_ds.ts_label_vocabs["smell"])
-        if gcms_path
-        else None
-    )
+) -> MultimodalAlignmentModel:
     started = time.time()
     model = MultimodalAlignmentModel(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
         shared_dim=cfg.projection.shared_dim,
-        proj_hidden_dim=cfg.projection.hidden_dim,
         visual_dtype=visual_dtype,
         gradient_checkpointing=bool(cfg.model.get("gradient_checkpointing", False)),
         ecg_normalization=cfg.model.ecg_normalization,
         tactile_delta_channels=cfg.model.tactile_delta_channels,
-        gcms_input_dim=gcms_cpu.features.shape[1] if gcms_cpu is not None else None,
         contrastive_temperature=cfg.loss.temperature,
     ).to(device)
     trainable = [param for param in model.parameters() if param.requires_grad]
@@ -204,9 +199,7 @@ def build_model(
         time.time() - started,
         sum(param.numel() for param in trainable) / 1e6,
     )
-    if gcms_cpu is None:
-        return model, None
-    return model, SmellNetGCMSBank(labels=gcms_cpu.labels, features=gcms_cpu.features.to(device))
+    return model
 
 
 def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_steps: int):
@@ -235,19 +228,6 @@ def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_step
     return optimizer, scheduler
 
 
-def log_param_summary(model: MultimodalAlignmentModel) -> None:
-    total = sum(param.numel() for param in model.parameters())
-    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
-    logger.info("parameters: %.1fM total, %.1fM trainable", total / 1e6, trainable / 1e6)
-    for name in ("trainable_visual", "frozen_visual", "label_text_model", "proj_visual", "proj_text", "proj_gcms"):
-        module = getattr(model, name)
-        if module is None:
-            continue
-        count = sum(param.numel() for param in module.parameters())
-        learned = sum(param.numel() for param in module.parameters() if param.requires_grad)
-        logger.info("  %-20s %.1fM total %.1fM trainable", name, count / 1e6, learned / 1e6)
-
-
 def save_checkpoint(model: MultimodalAlignmentModel, path: Path, cfg: DictConfig, step: int) -> None:
     path.mkdir(parents=True, exist_ok=True)
     state = {
@@ -257,8 +237,6 @@ def save_checkpoint(model: MultimodalAlignmentModel, path: Path, cfg: DictConfig
         "log_logit_scale": model.log_logit_scale.detach().cpu(),
         "step": step,
     }
-    if model.proj_gcms is not None:
-        state["proj_gcms"] = model.proj_gcms.state_dict()
     torch.save(state, path / "alignment_state.pt")
     OmegaConf.save(cfg, path / "config.yaml")
     logger.info("checkpoint saved to %s (step=%d)", path, step)
@@ -270,8 +248,6 @@ def load_checkpoint(model: MultimodalAlignmentModel, path: Path) -> int:
     model.trainable_visual.load_state_dict(state["trainable_visual"])
     model.proj_visual.load_state_dict(state["proj_visual"])
     model.proj_text.load_state_dict(state["proj_text"])
-    if model.proj_gcms is not None and "proj_gcms" in state:
-        model.proj_gcms.load_state_dict(state["proj_gcms"])
     with torch.no_grad():
         model.log_logit_scale.copy_(state["log_logit_scale"].to(model.log_logit_scale.device))
     logger.info("loaded %s at step %d", ckpt_file, state["step"])

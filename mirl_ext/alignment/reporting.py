@@ -12,7 +12,6 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from .metrics import _METRIC_FAMILY_NAMES, _training_metric_groups
-from .objective import _run_validation
 from .runtime import save_checkpoint
 
 
@@ -69,29 +68,14 @@ def report_train_step(
 
 def report_validation(
     model,
-    val_loader,
     cfg: DictConfig,
-    device: torch.device,
-    visual_dtype: torch.dtype,
-    amp_dtype: torch.dtype,
-    prototype_bank,
-    gcms_bank,
+    metrics: dict[str, float],
+    per_class: dict[str, list[dict[str, object]]],
     out_dir: Path,
     wandb_run,
     step: int,
     best_value: float,
 ) -> float:
-    metrics, per_class = _run_validation(
-        model,
-        val_loader,
-        cfg,
-        device,
-        visual_dtype,
-        amp_dtype,
-        n_batches=cfg.train.val_batches,
-        prototype_bank=prototype_bank,
-        gcms_bank=gcms_bank,
-    )
     core = " ".join(f"{key}={value:.4f}" for key, value in sorted(metrics.items()) if key.startswith("val-core/"))
     aux = " ".join(
         f"{key}={value:.4f}"

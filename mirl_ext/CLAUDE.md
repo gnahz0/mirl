@@ -38,16 +38,21 @@ initializes to `log(1 / 0.07)` and is a 0-dim no-decay parameter.
 
 **The clean baseline is sensor-to-text only.** SmellNet and ECG use fixed
 SigLIP2 class prototypes. Tactile uses its complete annotated answer as a paired
-SigLIP target within the gathered global batch. The optional SmellNet GC-MS path
-is an ablation, not part of the baseline; it loads only when a config provides
-`data.smellnet_gcms_path`. Mixture rows never enter either objective.
+SigLIP target within the gathered global batch. SmellNet mixtures and GC-MS do
+not enter the dataset, model, or objective.
+
+**Visual rows are preservation anchors, not QA examples.** Their annotation text
+is ignored, so `AlignmentDataset` keeps one row per image/video path. The one-pass
+sampler consumes every unique media path and sensor recording once per epoch.
 
 **Classes and families are balanced explicitly.** Duplicate class anchors share
 that class's total row weight for the SmellNet/ECG prototype loss. Tactile uses
 ordinary paired-caption positives, and the three family losses are averaged.
 
 **Distributed is hand-rolled — there is no `DistributedDataParallel`.** Each
-rank holds a full replica; gradients are averaged manually. Three spots deadlock
+rank holds a full replica; gradients are averaged manually. Tensor collectives
+use NCCL; string metadata and rank-0 reporting barriers use a separate Gloo group.
+Four spots deadlock
 if edited casually:
 1. `_allreduce_grad_average` materializes a zero grad for params with
    `grad is None`, so every rank issues an identical collective sequence.
@@ -56,6 +61,8 @@ if edited casually:
 3. `_gather_ts_embeddings` is differentiable and every rank must enter it even when
    its local shard has zero TS rows. Replacing it with `dist.all_gather` silently
    detaches remote embeddings; branching before it deadlocks.
+4. Validation is sharded across every rank. All rank samplers have the same number
+   of batches, and an empty local tail must still enter `_compute_losses`.
 
 **Selection metrics match the supervision.** W&B publishes accuracy, macro
 precision/recall/F1, and validation per-class precision/recall/F1 for SmellNet
@@ -127,8 +134,8 @@ Runs (val/f1 on the protocol noted; "fixed" = original val mix, n_ts=519):
 
 ## 2026-07-30 diagnosis — the plateau is DIMENSIONAL COLLAPSE
 
-`probe_ts_collapse.py` (new; run it before any further loss tuning) measured the
-v9/best checkpoint and the pristine tower on 96 val recordings per family:
+Historical measurements on the v9/best checkpoint and pristine tower used 96
+validation recordings per family:
 
 | family | classes | eff-dim VE raw | eff-dim projected | offdiag cos | top-1 | baseline |
 |---|---|---|---|---|---|---|
@@ -199,8 +206,9 @@ Measured lessons (do not re-derive; re-measure if the regime changes):
   loss/distill_img < ~0.01 (image cosine > 0.99).
 - **Video pipeline history:** process_video kwarg bug meant NO run before v5
   ever decoded video; fixing it surfaced host-RAM OOM (num_workers x prefetch
-  buffers decoded video), NCCL watchdog on rank-0-only validation, and step-time
-  changes. num_workers/prefetch is a RAM multiplier, not throughput.
+  buffers decoded video), a historical NCCL watchdog from rank-0-only validation
+  (validation is now sharded), and step-time changes. num_workers/prefetch is a RAM
+  multiplier, not throughput.
 - **Cluster:** exclude b0028,b0024 (no CUDA) and b0012 (NVLink fault — passes
   single-GPU checks, dies under tp>1). Fairshare is shared-account and has no
   age factor; a running allocation is precious. Slurm spools sbatch at submit —

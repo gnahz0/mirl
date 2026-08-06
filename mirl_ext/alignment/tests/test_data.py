@@ -90,6 +90,33 @@ def test_tactile_uses_complete_ground_truth_instead_of_filename_stem(tmp_path):
     }
 
 
+def test_visual_annotations_are_deduplicated_by_media_path(tmp_path):
+    rows = [
+        {
+            "data_source": "tactile",
+            "images": None,
+            "videos": [{"video": "/data/shared.mp4"}],
+            "reward_model": {"ground_truth": answer},
+        }
+        for answer in ("A", "B", "C")
+    ]
+    rows += [
+        {
+            "data_source": "climb",
+            "images": [{"image": "/data/shared.png"}],
+            "videos": None,
+            "reward_model": {"ground_truth": answer},
+        }
+        for answer in ("normal", "abnormal")
+    ]
+
+    dataset = _dataset(tmp_path, "visual", rows)
+
+    assert len(dataset) == 2
+    assert len(dataset.sampling_groups["img"]) == 2
+    assert all("reward_model" not in row for row in dataset.rows)
+
+
 def test_collate_keeps_complete_native_signals():
     signal = torch.arange(12, dtype=torch.float32).reshape(2, 6)
     tactile = torch.arange(24 * 4, dtype=torch.float32).reshape(24, 2, 2)
@@ -128,12 +155,13 @@ class _GroupedDataset:
             "img": list(range(36, 60)),
         }
 
+
 def _group_counts(dataset, batch):
     owner = {index: family for family, indices in dataset.sampling_groups.items() for index in indices}
     return {family: sum(owner[index] == family for index in batch) for family in dataset.sampling_groups}
 
 
-def test_family_balanced_sampler_has_exact_disjoint_rank_quotas():
+def test_family_balanced_sampler_consumes_all_rows_once_across_ranks():
     dataset = _GroupedDataset()
     rank0 = FamilyBalancedBatchSampler(
         dataset,
@@ -154,24 +182,30 @@ def test_family_balanced_sampler_has_exact_disjoint_rank_quotas():
 
     seen = []
     for batch0, batch1 in zip(rank0, rank1, strict=True):
-        assert _group_counts(dataset, batch0) == {
-            "smell": 2,
-            "ecg": 2,
-            "tactile": 2,
-            "img": 2,
-        }
-        assert _group_counts(dataset, batch1) == {
-            "smell": 2,
-            "ecg": 2,
-            "tactile": 2,
-            "img": 2,
-        }
+        assert len(batch0) <= 8 and len(batch1) <= 8
+        for counts in (_group_counts(dataset, batch0), _group_counts(dataset, batch1)):
+            assert all(counts[family] <= 2 for family in ("smell", "ecg", "tactile"))
         assert set(batch0).isdisjoint(batch1)
         seen.extend(batch0)
         seen.extend(batch1)
 
     assert len(seen) == len(set(seen))
-    assert set(range(36)).issubset(seen)
+    assert set(seen) == set(range(60))
+
+
+def test_distributed_sampler_keeps_tail_ranks_in_lockstep():
+    dataset = _GroupedDataset()
+    dataset.sampling_groups = {
+        "smell": list(range(5)),
+        "ecg": list(range(5, 9)),
+        "tactile": list(range(9, 13)),
+        "img": [],
+    }
+    rank0 = list(FamilyBalancedBatchSampler(dataset, 6, 2, rank=0, world_size=2, seed=3))
+    rank1 = list(FamilyBalancedBatchSampler(dataset, 6, 2, rank=1, world_size=2, seed=3))
+
+    assert len(rank0) == len(rank1) == 2
+    assert set(index for batch in rank0 + rank1 for index in batch) == set(range(13))
 
 
 def test_family_balanced_sampler_is_deterministic_per_epoch():
@@ -181,8 +215,7 @@ def test_family_balanced_sampler_is_deterministic_per_epoch():
     assert first == list(FamilyBalancedBatchSampler(dataset, 8, 2, seed=11))
     flattened = [index for batch in first for index in batch]
     assert len(flattened) == len(set(flattened))
-    assert set(range(36)).issubset(flattened)
-    assert len(set(flattened) & set(range(36, 60))) == 12
+    assert set(flattened) == set(range(60))
 
     sampler.set_epoch(1)
     assert first != list(sampler)
@@ -195,7 +228,9 @@ def test_family_balanced_sampler_does_not_recycle_smaller_families():
     batches = list(sampler)
     flattened = [index for batch in batches for index in batch]
 
-    assert len(batches) == 6
+    assert len(batches) == 7
     assert len(flattened) == len(set(flattened))
-    assert set(dataset.sampling_groups["smell"]).issubset(flattened)
+    assert set(flattened) == set().union(*map(set, dataset.sampling_groups.values()))
     assert sum(index in dataset.sampling_groups["smell"] for index in flattened) == 4
+    smell_batches = [i for i, batch in enumerate(batches) if set(batch) & set(dataset.sampling_groups["smell"])]
+    assert smell_batches[-1] > smell_batches[0] + 1

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import heapq
 import logging
 import os
 import random
@@ -32,12 +33,44 @@ def _canonical_label_text(text: str) -> str:
 
 
 def _label_text(sample: dict) -> str:
-    """Use the complete annotated answer as the sensor's text target."""
     return _canonical_label_text(sample["reward_model"]["ground_truth"])
 
 
+def _visual_key(row: dict) -> tuple[str, str] | None:
+    """Identify the physical image or video while ignoring its QA annotation."""
+    for column, path_key in (("images", "image"), ("videos", "video")):
+        entries = row.get(column) or []
+        if not entries:
+            continue
+        entry = entries[0]
+        if isinstance(entry, str):
+            return column, entry
+        path = entry.get(path_key) or entry.get("path")
+        return (column, str(path)) if path else None
+    return None
+
+
+def _deduplicate_visual_rows(rows: list[dict]) -> tuple[list[dict], int]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict] = []
+    removed = 0
+    for row in rows:
+        key = None if row.get("signals") else _visual_key(row)
+        if key is not None and key in seen:
+            removed += 1
+            continue
+        if key is not None:
+            seen.add(key)
+            row = {
+                "data_source": row["data_source"],
+                "images": row.get("images") or [],
+                "videos": row.get("videos") or [],
+            }
+        unique.append(row)
+    return unique, removed
+
+
 def _load_image(img_entry) -> Image.Image | None:
-    """Load one image, dropping unreadable rows."""
     try:
         from verl.utils.dataset.vision_utils import process_image
 
@@ -51,14 +84,9 @@ def _signal_family(sig_entry: dict) -> str:
 
 
 def _load_signal_csv(path: str) -> torch.Tensor:
-    """Load CSV sensor values as (channels, time), excluding time columns."""
     with open(path) as f:
         header = f.readline().strip().split(",")
-    keep_idx = [
-        i
-        for i, name in enumerate(header)
-        if "time" not in name.casefold()
-    ]
+    keep_idx = [i for i, name in enumerate(header) if "time" not in name.casefold()]
     data = np.genfromtxt(
         path,
         delimiter=",",
@@ -73,7 +101,6 @@ def _load_tactile_pt(
     path: str,
     key: str,
 ) -> dict[str, torch.Tensor]:
-    """Load tactile maps plus time-aligned right-hand force channels."""
     d = torch.load(path, map_location="cpu", weights_only=False)
     t = torch.as_tensor(d["tactile"][key]).float()
 
@@ -117,7 +144,6 @@ def _suppress_fd_stderr():
 
 
 def _load_video_entry(video_entry: dict, max_frames: int):
-    """Decode a video with a timeout, returning ``None`` on failure."""
     from verl.utils.dataset.vision_utils import process_video
 
     old_handler = signal.signal(signal.SIGALRM, _video_timeout_handler)
@@ -164,6 +190,9 @@ class AlignmentDataset(Dataset):
             rows = [row for row in rows if row["data_source"] in sources]
 
         rows = [row for row in rows if row["data_source"] not in _EXCLUDED_DATA_SOURCES]
+        rows, removed = _deduplicate_visual_rows(rows)
+        if removed:
+            logger.info("removed %d repeated image/video annotation rows", removed)
 
         vocab_sets = {family: set() for family in _SIGNAL_FAMILIES}
         for row in rows:
@@ -189,7 +218,13 @@ class AlignmentDataset(Dataset):
             signals = row.get("signals") or []
             group = _signal_family(signals[0]) if signals else "img"
             self.sampling_groups[group].append(index)
-        logger.info("AlignmentDataset: %d rows from %d files", len(self.rows), len(data_files))
+        group_sizes = {name: len(indices) for name, indices in self.sampling_groups.items()}
+        logger.info(
+            "AlignmentDataset: %d unique rows from %d files; groups=%s",
+            len(self.rows),
+            len(data_files),
+            group_sizes,
+        )
 
     def _balanced_sample(self, rows: list[dict], n: int) -> list[dict]:
         rng = random.Random(self.seed)
@@ -252,7 +287,7 @@ class AlignmentDataset(Dataset):
 
 
 class FamilyBalancedBatchSampler(Sampler[list[int]]):
-    """Consume each sensor row once, with balanced family quotas while available."""
+    """Consume every row once and spread small sensor families across the epoch."""
 
     def __init__(
         self,
@@ -270,10 +305,19 @@ class FamilyBalancedBatchSampler(Sampler[list[int]]):
         self.world_size = world_size
         self.seed = seed
         self.epoch = 0
-        self.img_per_batch = batch_size - self.ts_per_family * len(_SIGNAL_FAMILIES)
-        global_ts_quota = self.ts_per_family * self.world_size
-        max_family_size = max(len(self.groups[family]) for family in _SIGNAL_FAMILIES)
-        self.num_batches = (max_family_size + global_ts_quota - 1) // global_ts_quota
+        self.batch_size = batch_size
+        if ts_per_family * len(_SIGNAL_FAMILIES) > batch_size:
+            raise ValueError("sensor family quotas exceed the per-rank batch size")
+
+        global_family_quota = ts_per_family * world_size
+        family_batches = max(
+            (len(self.groups[family]) + global_family_quota - 1) // global_family_quota
+            for family in _SIGNAL_FAMILIES
+        )
+        total_rows = sum(len(indices) for indices in self.groups.values())
+        global_batch = batch_size * world_size
+        full_batches = (total_rows + global_batch - 1) // global_batch
+        self.num_batches = max(family_batches, full_batches)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -288,18 +332,32 @@ class FamilyBalancedBatchSampler(Sampler[list[int]]):
         for values in pools.values():
             rng.shuffle(values)
 
-        ts_quota = self.ts_per_family * self.world_size
-        img_quota = self.img_per_batch * self.world_size
+        slot_count = self.num_batches * self.world_size
+        batches: list[list[int]] = [[] for _ in range(slot_count)]
+        for family in _SIGNAL_FAMILIES:
+            rows = pools[family]
+            for position, row in enumerate(rows):
+                slot = position * slot_count // len(rows)
+                batches[slot].append(row)
+
+        slot_order = list(range(slot_count))
+        rng.shuffle(slot_order)
+        tie_break = {slot: order for order, slot in enumerate(slot_order)}
+        available = [
+            (len(batch), tie_break[slot], slot)
+            for slot, batch in enumerate(batches)
+            if len(batch) < self.batch_size
+        ]
+        heapq.heapify(available)
+        for row in pools["img"]:
+            size, tie, slot = heapq.heappop(available)
+            batches[slot].append(row)
+            if size + 1 < self.batch_size:
+                heapq.heappush(available, (size + 1, tie, slot))
+
         for batch_index in range(self.num_batches):
-            batch: list[int] = []
-            for family in _SIGNAL_FAMILIES:
-                start = batch_index * ts_quota
-                global_rows = pools[family][start : start + ts_quota]
-                batch.extend(global_rows[self.rank :: self.world_size])
-            start = batch_index * img_quota
-            global_rows = pools["img"][start : start + img_quota]
-            batch.extend(global_rows[self.rank :: self.world_size])
-            random.Random(epoch_seed + batch_index * 10_007 + self.rank).shuffle(batch)
+            batch = batches[batch_index * self.world_size + self.rank]
+            rng.shuffle(batch)
             yield batch
 
 

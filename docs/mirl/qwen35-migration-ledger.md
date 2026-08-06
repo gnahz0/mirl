@@ -177,7 +177,7 @@ The runnable Qwen3.5 port now lives below `mirl_ext.alignment`; the old
 | Historical Stage-1 path | Stage-5 target |
 |---|---|
 | `examples/alignment/run_stage1_qwen3vl_clip.sh` | Qwen3.5 alignment launcher. |
-| `examples/alignment/run_stage1_smoke.sh` | Bounded alignment smoke launcher. |
+| `examples/alignment/run_stage1_smoke.sh` | Removed; use production config overrides. |
 | `requirements.txt` | Replaced by the isolated Stage-2 environment specification and lock. |
 | `scripts/build_climb_stratified.py` | `mirl_ext.data` builder. |
 | `scripts/build_ecg_raw_jsonl.py` | `mirl_ext.data` raw builder. |
@@ -191,7 +191,7 @@ The runnable Qwen3.5 port now lives below `mirl_ext.alignment`; the old
 | `train_ve.sh` | Replaced by repository-owned Qwen3.5 alignment launchers. |
 | `verl/trainer/alignment/__init__.py` | `mirl_ext.alignment`. |
 | `verl/trainer/alignment/config/stage1_qwen3vl_clip.yaml` | Qwen3.5 Stage-1 config under the extension. |
-| `verl/trainer/alignment/config/stage1_smoke.yaml` | Bounded Qwen3.5 smoke config. |
+| `verl/trainer/alignment/config/stage1_smoke.yaml` | Removed; only the production config remains. |
 | `verl/trainer/alignment/data.py` | `mirl_ext.alignment.data`. |
 | `verl/trainer/alignment/losses.py` | `mirl_ext.alignment.losses`. |
 | `verl/trainer/alignment/model.py` | `mirl_ext.alignment.model`. |

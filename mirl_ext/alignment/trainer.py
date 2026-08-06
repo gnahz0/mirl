@@ -8,6 +8,7 @@ import logging
 import math
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -23,7 +24,7 @@ from .metrics import (
     group_grad_norms,
     new_counts,
 )
-from .objective import _build_text_prototype_bank, _compute_losses, _score_ts_collector
+from .objective import _build_text_prototype_bank, _compute_losses, _run_validation, _score_ts_collector
 from .reporting import report_train_step, report_validation
 from .runtime import (
     allreduce_grad_average,
@@ -31,7 +32,6 @@ from .runtime import (
     build_model,
     build_optimizer,
     init_distributed,
-    log_param_summary,
     maybe_init_wandb,
     resolve_dtype,
     save_checkpoint,
@@ -41,10 +41,14 @@ from .runtime import (
 logger = logging.getLogger("alignment.trainer")
 
 
+def _new_ts_collector() -> dict[str, list]:
+    return {"z": [], "labels": [], "families": [], "retrieval": []}
+
+
 def train(cfg: DictConfig) -> None:
     setup_logging(cfg.get("log_level", "INFO"))
     # torchrun owns one full model replica per GPU; gradients are synced manually.
-    rank, local_rank, world_size = init_distributed()
+    rank, local_rank, world_size, control_group = init_distributed()
     is_main = rank == 0
     seed = int(cfg.train.get("seed", 42))
     torch.manual_seed(seed)
@@ -67,7 +71,7 @@ def train(cfg: DictConfig) -> None:
     )
 
     train_ds, train_loader, train_sampler, val_loader = build_loaders(cfg, rank, world_size, seed)
-    model, gcms_bank = build_model(cfg, train_ds, device, visual_dtype)
+    model = build_model(cfg, device, visual_dtype)
     # The complete SigLIP2 label vocabulary acts as the classifier; no class head.
     families = tuple(cfg.loss.prototype_families)
     prototype_bank = _build_text_prototype_bank(
@@ -75,8 +79,6 @@ def train(cfg: DictConfig) -> None:
         {family: train_ds.ts_label_vocabs[family] for family in families},
         device,
     )
-    if is_main:
-        log_param_summary(model)
     free, total = torch.cuda.mem_get_info()
     logger.info(
         "GPU memory after load: %.2f / %.2f GiB",
@@ -114,10 +116,8 @@ def train(cfg: DictConfig) -> None:
     pbar = tqdm(total=total_steps, desc="stage1", dynamic_ncols=True, file=sys.stdout) if is_main else None
     trainable = [param for param in model.parameters() if param.requires_grad]
     counts = new_counts()
-    metric_sums: dict[str, float] = {}
-    metric_observations: dict[str, int] = {}
-    # Keep embeddings from the exact microbatches contributing to one update.
-    ts_eval = {"z": [], "labels": [], "families": [], "retrieval": []} if is_main else None
+    metric_values: defaultdict[str, list[float]] = defaultdict(list)
+    ts_eval = _new_ts_collector()
     opt_step = 0
     best_value = float("-inf")
     started = time.time()
@@ -128,7 +128,7 @@ def train(cfg: DictConfig) -> None:
         for batch_index, batch in enumerate(train_loader):
             window_start = (batch_index // grad_accum) * grad_accum
             window_size = min(grad_accum, micro_batches_per_epoch - window_start)
-            micro_eval = {"z": [], "labels": [], "families": [], "retrieval": []} if is_main else None
+            micro_eval = _new_ts_collector()
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 loss, metrics = _compute_losses(
                     model,
@@ -139,44 +139,36 @@ def train(cfg: DictConfig) -> None:
                     world_size=world_size,
                     ts_eval_collector=micro_eval,
                     prototype_bank=prototype_bank,
-                    gcms_bank=gcms_bank,
+                    metadata_group=control_group,
                 )
 
             counts["n/img_image"] += len(batch["img_image_pil"])
             counts["n/img_video"] += len(batch["img_video"])
             counts["n/ts_signal"] += len(batch["ts_signal"])
             add_ts_family_counts(counts, batch)
-            if is_main:
-                ts_eval["z"].extend(micro_eval["z"])
-                ts_eval["labels"].extend(micro_eval["labels"])
-                ts_eval["families"].extend(micro_eval["families"])
-                ts_eval["retrieval"].extend(micro_eval["retrieval"])
+            for key in ts_eval:
+                ts_eval[key].extend(micro_eval[key])
             for key, value in metrics.items():
-                metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-                metric_observations[key] = metric_observations.get(key, 0) + 1
+                metric_values[key].append(float(value))
 
             (loss / window_size).backward()
             end_of_epoch = batch_index + 1 == micro_batches_per_epoch
             if (batch_index + 1) % grad_accum and not end_of_epoch:
                 continue
 
-            metrics = {key: total / metric_observations[key] for key, total in metric_sums.items()}
-            # Score before optimizer.step so embeddings and prototypes use one model state.
-            window_metrics = (
-                _score_ts_collector(
-                    model,
-                    ts_eval,
-                    prototype_bank,
-                    gcms_bank=gcms_bank,
-                    paired_families=tuple(cfg.loss.get("paired_text_families") or ()),
-                )
-                if is_main
-                else {}
-            )
+            metrics = {key: sum(values) / len(values) for key, values in metric_values.items()}
             # Average first, then clip, so every replica applies the same update.
             allreduce_grad_average(trainable, world_size)
             metrics.update(group_grad_norms(model))
             metrics["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(trainable, cfg.train.grad_clip))
+            # Every rank scores the same globally gathered window before the update.
+            # Keeping this symmetric prevents faster ranks from waiting in NCCL.
+            window_metrics = _score_ts_collector(
+                model,
+                ts_eval,
+                prototype_bank,
+                paired_families=tuple(cfg.loss.paired_text_families),
+            )
             optimizer.step()
             lrs = {str(group["name"]).partition("_")[0]: float(group["lr"]) for group in optimizer.param_groups}
             scheduler.step()
@@ -203,31 +195,37 @@ def train(cfg: DictConfig) -> None:
                     validate_now,
                     epoch + (batch_index + 1) / micro_batches_per_epoch,
                 )
+            dist.barrier(group=control_group)
 
             if validate_now:
-                # Other ranks wait while rank 0 evaluates validation.
-                dist.barrier()
+                val_metrics, per_class = _run_validation(
+                    model,
+                    val_loader,
+                    cfg,
+                    device,
+                    visual_dtype,
+                    amp_dtype,
+                    n_batches=cfg.train.val_batches,
+                    prototype_bank=prototype_bank,
+                    world_size=world_size,
+                    metadata_group=control_group,
+                )
                 if is_main:
                     best_value = report_validation(
                         model,
-                        val_loader,
                         cfg,
-                        device,
-                        visual_dtype,
-                        amp_dtype,
-                        prototype_bank,
-                        gcms_bank,
+                        val_metrics,
+                        per_class,
                         out_dir,
                         wandb_run,
                         opt_step,
                         best_value,
                     )
-                dist.barrier()
+                dist.barrier(group=control_group)
 
             counts = new_counts()
-            metric_sums = {}
-            metric_observations = {}
-            ts_eval = {"z": [], "labels": [], "families": [], "retrieval": []} if is_main else None
+            metric_values.clear()
+            ts_eval = _new_ts_collector()
 
     if is_main:
         pbar.close()
@@ -240,7 +238,7 @@ def train(cfg: DictConfig) -> None:
             best_value,
             out_dir / "final",
         )
-    dist.barrier()
+    dist.barrier(group=control_group)
     dist.destroy_process_group()
 
 

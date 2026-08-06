@@ -18,15 +18,16 @@ from torch.utils.data import DataLoader
 from .losses import distill_cosine, siglip_sigmoid
 from .metrics import (
     _TS_FAMILIES,
+    _allreduce_counts,
+    _allreduce_metrics,
+    _is_ts_window_metric,
     _paired_retrieval_metrics,
-    _smellnet_gcms_top1_metrics,
     _ts_prediction_metrics,
     _validation_metric_groups,
     add_ts_family_counts,
     new_counts,
 )
 from .model import MultimodalAlignmentModel
-from .smellnet_gcms import SmellNetGCMSBank
 
 logger = logging.getLogger("alignment.trainer")
 
@@ -156,41 +157,11 @@ def _project_text_prototype_bank(
     }
 
 
-def _project_gcms_bank(
-    model: MultimodalAlignmentModel,
-    bank: SmellNetGCMSBank,
-) -> tuple[tuple[str, ...], torch.Tensor]:
-    """Project the fixed 50-class GC-MS bank into the normalized shared space."""
-    return bank.labels, model.project(model.proj_gcms, bank.features)
-
-
-def _paired_prototype_siglip_loss(
-    left: tuple[tuple[str, ...], torch.Tensor],
-    right: tuple[tuple[str, ...], torch.Tensor],
-    log_logit_scale: torch.Tensor,
-) -> torch.Tensor:
-    """SigLIP over two aligned one-prototype-per-class banks."""
-    left_labels, left_features = left
-    _, right_features = right
-    classes = len(left_labels)
-    positive_rate = 1.0 / classes
-    bias = left_features.new_tensor(math.log(positive_rate / (1.0 - positive_rate)))
-    positive = torch.eye(classes, device=left_features.device, dtype=torch.bool)
-    return siglip_sigmoid(
-        left_features,
-        right_features,
-        log_logit_scale,
-        bias,
-        pos_mask=positive,
-    )
-
-
 @torch.no_grad()
 def _score_ts_collector(
     model: MultimodalAlignmentModel,
     collector: dict[str, list],
     prototype_bank: dict[str, TextPrototypeFamily],
-    gcms_bank: Optional[SmellNetGCMSBank] = None,
     per_class_reports: Optional[dict[str, list[dict[str, object]]]] = None,
     paired_families: tuple[str, ...] = (),
 ) -> dict[str, float]:
@@ -225,39 +196,7 @@ def _score_ts_collector(
                 family,
             )
         )
-    if gcms_bank is not None:
-        text_smell = projected_bank.get("smell")
-        if text_smell is None:
-            raise ValueError("GC-MS metrics require SmellNet text prototypes")
-        metrics.update(
-            _smellnet_gcms_top1_metrics(
-                z,
-                labels,
-                families,
-                text_smell,
-                _project_gcms_bank(model, gcms_bank),
-            )
-        )
     return metrics
-
-
-def _sanitize_features(
-    feat: Optional[torch.Tensor],
-    feat_ref: Optional[torch.Tensor],
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Zero non-finite feature rows without changing label alignment."""
-    if feat is None or feat.numel() == 0:
-        return feat, feat_ref
-    bad = (~torch.isfinite(feat)).any(dim=-1)
-    if feat_ref is not None and feat_ref.numel() > 0:
-        bad = bad | (~torch.isfinite(feat_ref)).any(dim=-1)
-    if not bool(bad.any()):
-        return feat, feat_ref
-    good_mask = (~bad).to(feat.dtype).unsqueeze(-1)
-    feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0) * good_mask
-    if feat_ref is not None and feat_ref.numel() > 0:
-        feat_ref = torch.nan_to_num(feat_ref, nan=0.0, posinf=0.0, neginf=0.0) * good_mask
-    return feat, feat_ref
 
 
 @torch.no_grad()
@@ -270,7 +209,8 @@ def _run_validation(
     amp_dtype: torch.dtype,
     n_batches: Optional[int],
     prototype_bank: dict[str, TextPrototypeFamily],
-    gcms_bank: Optional[SmellNetGCMSBank] = None,
+    world_size: int = 1,
+    metadata_group: Optional[dist.ProcessGroup] = None,
 ) -> tuple[
     dict[str, float],
     dict[str, list[dict[str, object]]],
@@ -285,73 +225,50 @@ def _run_validation(
     counts: dict[str, int] = {}
     # Collect embeddings once, then score the validation set globally.
     ts_eval: dict[str, list] = {"z": [], "labels": [], "families": [], "retrieval": []}
-    # Track per-bucket totals across all val batches so users see what the
-    # validation distribution actually looked like.
     bucket_totals = new_counts()
     n_seen = 0
     for batch in val_loader:
-        n_img = len(batch["img_image_pil"]) + len(batch["img_video"])
         n_ts = len(batch.get("ts_signal") or [])
-        if n_img == 0 and n_ts == 0:
-            continue
         bucket_totals["n/img_image"] += len(batch["img_image_pil"])
         bucket_totals["n/img_video"] += len(batch["img_video"])
         bucket_totals["n/ts_signal"] += n_ts
-        # Per-family denominators. Without these the per-family accuracy/F1 below are
-        # uninterpretable: a family contributing 3 rows per batch produces a noisy
-        # number that looks exactly like one measured over 300.
         add_ts_family_counts(bucket_totals, batch)
         with autocast_ctx:
-            # world_size=1 DELIBERATELY: validation is rank-0-only, so gathering here
-            # would issue collectives no other rank answers and hang until the NCCL
-            # watchdog fires. The LOSS remains batch-local (~16 TS rows/batch), but
-            # accuracy/F1/gap are replaced below by one calculation over every TS row.
             _, metrics = _compute_losses(
                 model,
                 batch,
                 cfg,
                 device,
                 visual_dtype,
+                world_size=world_size,
                 ts_eval_collector=ts_eval,
                 prototype_bank=prototype_bank,
-                gcms_bank=gcms_bank,
+                metadata_group=metadata_group,
             )
         for k, v in metrics.items():
             if not isinstance(v, (int, float)):
                 continue
-            if k.startswith(
-                (
-                    "accuracy/",
-                    "precision_macro/",
-                    "recall_macro/",
-                    "f1_",
-                    "recall_at_",
-                    "map/",
-                    "gap/",
-                    "eff_dim/",
-                    "label_coverage/",
-                    "class_coverage/",
-                    "prediction_coverage/",
-                )
-            ):
+            if _is_ts_window_metric(k):
                 continue  # replaced by one global, sample-correct calculation below
-            # Every key present is a real measurement (no placeholders), so each
-            # is averaged over exactly the batches where its branch fired.
             sums[k] = sums.get(k, 0.0) + float(v)
             counts[k] = counts.get(k, 0) + 1
         n_seen += 1
         if n_batches is not None and n_seen >= n_batches:
             break
 
-    averaged = {key: (sums[key] / counts[key]) for key in sums}
+    averaged = _allreduce_metrics(
+        {key: sums[key] / counts[key] for key in sums},
+        device,
+        world_size,
+    )
+    bucket_totals = _allreduce_counts(bucket_totals, device, world_size)
     per_class_reports: dict[str, list[dict[str, object]]] = {}
     prediction_metrics = _score_ts_collector(
         model,
         ts_eval,
         prototype_bank,
-        gcms_bank=gcms_bank,
         per_class_reports=per_class_reports,
-        paired_families=tuple(cfg.loss.get("paired_text_families") or ()),
+        paired_families=tuple(cfg.loss.paired_text_families),
     )
 
     if was_training:
@@ -374,6 +291,7 @@ def _gather_ts_embeddings(
     device: torch.device,
     world_size: int,
     shared_dim: int,
+    metadata_group: Optional[dist.ProcessGroup] = None,
 ):
     """Differentiably gather uneven TS rows and metadata from every rank."""
     empty = z_ts is None
@@ -405,7 +323,11 @@ def _gather_ts_embeddings(
     # (label, family) travel as ONE list so a rank can never contribute a label
     # without its family, which would silently shift every downstream family split.
     payload = [None] * world_size
-    dist.all_gather_object(payload, list(zip(list(ts_text)[:local_n], list(ts_family)[:local_n], strict=True)))
+    dist.all_gather_object(
+        payload,
+        list(zip(list(ts_text)[:local_n], list(ts_family)[:local_n], strict=True)),
+        group=metadata_group,
+    )
 
     # Slice each rank's chunk to its real row count rather than masking the whole
     # concatenation. Slicing is autograd-safe and makes label/row misalignment
@@ -424,10 +346,9 @@ def _family_prototype_siglip_loss(
     prototype_bank: dict[str, tuple[tuple[str, ...], torch.Tensor]],
     enabled_families: tuple[str, ...],
     log_logit_scale: torch.Tensor,
-) -> tuple[Optional[torch.Tensor], dict[str, torch.Tensor], dict[str, float]]:
-    """Average class-balanced SigLIP losses over fixed family vocabularies."""
+) -> dict[str, torch.Tensor]:
+    """Compute class-balanced SigLIP for each enabled prototype family."""
     family_losses: dict[str, torch.Tensor] = {}
-    coverage: dict[str, float] = {}
     for family in enabled_families:
         global_rows = [i for i, value in enumerate(families) if value == family]
         if not global_rows:
@@ -442,7 +363,6 @@ def _family_prototype_siglip_loss(
 
         label_to_id = {label: idx for idx, label in enumerate(prototype_labels)}
         known_rows = [i for i in global_rows if labels[i] in label_to_id]
-        coverage[family] = len(known_rows) / len(global_rows)
         if not known_rows:
             continue
 
@@ -471,9 +391,7 @@ def _family_prototype_siglip_loss(
             pair_weight=row_weight,
         )
 
-    if not family_losses:
-        return None, {}, coverage
-    return torch.stack(tuple(family_losses.values())).mean(), family_losses, coverage
+    return family_losses
 
 
 def _family_paired_siglip_losses(
@@ -533,10 +451,11 @@ def _compute_losses(
     cfg: DictConfig,
     device: torch.device,
     visual_dtype: torch.dtype,
+    *,
+    prototype_bank: dict[str, TextPrototypeFamily],
+    ts_eval_collector: dict[str, list],
     world_size: int = 1,
-    ts_eval_collector: Optional[dict[str, list]] = None,
-    prototype_bank: Optional[dict[str, TextPrototypeFamily]] = None,
-    gcms_bank: Optional[SmellNetGCMSBank] = None,
+    metadata_group: Optional[dist.ProcessGroup] = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute prototype SigLIP and frozen-Qwen image-preservation losses."""
     metrics: dict[str, float] = {}
@@ -558,9 +477,6 @@ def _compute_losses(
     ts_text = list(batch["ts_signal_text"])
     ts_family = list(batch.get("ts_format") or [])
 
-    feat_img, feat_ref_img = _sanitize_features(feat_img, feat_ref_img)
-    feat_ts, _ = _sanitize_features(feat_ts, None)
-
     total = torch.zeros((), device=device, dtype=torch.float32)
     w = cfg.loss_weights
 
@@ -573,28 +489,23 @@ def _compute_losses(
             device,
             world_size,
             shared_dim=int(model.shared_dim),
+            metadata_group=metadata_group,
         )
     else:
         c_ts, c_labels, c_family = z_ts, list(ts_text), list(ts_family)
 
     if c_ts is not None and c_ts.shape[0] > 0:
-        if prototype_bank is None:
-            raise ValueError("TS alignment requires a fixed prototype_bank")
-        projected_families = set(c_family)
-        if gcms_bank is not None:
-            projected_families.add("smell")
         projected_bank = _project_text_prototype_bank(
             model,
             prototype_bank,
-            projected_families,
+            set(c_family),
         )
-        prototype_families = tuple(str(value) for value in (cfg.loss.get("prototype_families") or ()))
-        _, family_ts_losses, _ = _family_prototype_siglip_loss(
+        family_ts_losses = _family_prototype_siglip_loss(
             c_ts,
             c_labels,
             c_family,
             projected_bank,
-            prototype_families,
+            tuple(cfg.loss.prototype_families),
             model.log_logit_scale,
         )
         paired_losses, retrieval = _family_paired_siglip_losses(
@@ -602,7 +513,7 @@ def _compute_losses(
             c_ts,
             c_labels,
             c_family,
-            tuple(str(value) for value in (cfg.loss.get("paired_text_families") or ())),
+            tuple(cfg.loss.paired_text_families),
         )
         family_ts_losses.update(paired_losses)
         if family_ts_losses:
@@ -614,45 +525,6 @@ def _compute_losses(
                 for family, family_loss in family_ts_losses.items()
             })
 
-        if gcms_bank is not None:
-            text_smell = projected_bank.get("smell")
-            if text_smell is None:
-                raise ValueError("GC-MS alignment requires the SmellNet text vocabulary")
-            projected_gcms = _project_gcms_bank(model, gcms_bank)
-
-            sensor_gcms_weight = float(w.get("smell_sensor_gcms", 0.0))
-            if sensor_gcms_weight > 0.0:
-                l_sensor_gcms, _, _ = _family_prototype_siglip_loss(
-                    c_ts,
-                    c_labels,
-                    c_family,
-                    {"smell": projected_gcms},
-                    ("smell",),
-                    model.log_logit_scale,
-                )
-                if l_sensor_gcms is not None:
-                    total = total + sensor_gcms_weight * l_sensor_gcms
-                    metrics["loss/smell_sensor_gcms"] = float(l_sensor_gcms.detach())
-
-            gcms_text_weight = float(w.get("smell_gcms_text", 0.0))
-            if gcms_text_weight > 0.0:
-                l_gcms_text = _paired_prototype_siglip_loss(
-                    projected_gcms,
-                    text_smell,
-                    model.log_logit_scale,
-                )
-                total = total + gcms_text_weight * l_gcms_text
-                metrics["loss/smell_gcms_text"] = float(l_gcms_text.detach())
-
-            metrics.update(
-                _smellnet_gcms_top1_metrics(
-                    c_ts,
-                    c_labels,
-                    c_family,
-                    text_smell,
-                    projected_gcms,
-                )
-            )
         metrics.update(
             _ts_prediction_metrics(
                 c_ts,
@@ -661,11 +533,10 @@ def _compute_losses(
                 projected_bank,
             )
         )
-        if ts_eval_collector is not None:
-            ts_eval_collector["z"].append(c_ts.detach().float())
-            ts_eval_collector["labels"].extend(c_labels)
-            ts_eval_collector["families"].extend(c_family)
-            ts_eval_collector["retrieval"].extend(retrieval)
+        ts_eval_collector["z"].append(c_ts.detach().float())
+        ts_eval_collector["labels"].extend(c_labels)
+        ts_eval_collector["families"].extend(c_family)
+        ts_eval_collector["retrieval"].extend(retrieval)
 
     if feat_img is not None and feat_ref_img is not None and feat_img.shape[0] > 0:
         l_img = distill_cosine(

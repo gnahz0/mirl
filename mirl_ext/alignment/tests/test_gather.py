@@ -42,6 +42,7 @@ def _spawn(body_name: str, port: str, world: int = 3) -> dict:
 def _body_uneven(rank: int, world: int, out: dict) -> None:
     from mirl_ext.alignment.objective import _gather_ts_embeddings
 
+    metadata_group = dist.new_group(backend="gloo")
     counts = [2, 0, 1]
     families_by_rank = ["smell", "ecg", "tactile"]
     n = counts[rank]
@@ -56,6 +57,7 @@ def _body_uneven(rank: int, world: int, out: dict) -> None:
         torch.device("cpu"),
         world,
         shared_dim=SHARED_DIM,
+        metadata_group=metadata_group,
     )
     gathered.sum().backward()
     out[f"rows_{rank}"] = [
