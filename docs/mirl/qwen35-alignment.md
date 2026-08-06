@@ -146,6 +146,9 @@ produces 2,303 tokens.
 
 - Every microbatch contains one media kind and one `data_source`; SigLIP negatives
   still come from the complete family label bank.
+- Stage 1 expands multi-image or multi-video rows into one preservation anchor per
+  unique physical path because it ignores QA annotations. SFT and RL must instead
+  preserve row grouping and load all media in prompt order.
 - Visual rows and signal sources omitted from `train.signal_repeat_factors` are
   visited once per epoch. Configured low-resource signal sources repeat complete
   independently shuffled passes. Validation is always one-pass. Source groups

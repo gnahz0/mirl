@@ -45,11 +45,19 @@ not enter the dataset, model, or objective. Stored sensor labels are already
 clean and are passed to SigLIP2 verbatim; the loader does not alter casing.
 
 **Visual rows are preservation anchors, not QA examples.** Their annotation text
-is ignored, so `AlignmentDataset` keeps one row per image/video path. Visual rows
-remain one-pass; low-resource signal sources may repeat complete shuffled passes
-through integer `train.signal_repeat_factors`. Validation remains one-pass. The
-sampler skips source groups too small to give every rank a sample. Every global
-microbatch has one media kind and one `data_source`.
+is ignored, so `AlignmentDataset` expands multi-media rows and keeps one row per
+unique image/video path. Visual rows remain one-pass; low-resource signal sources
+may repeat complete shuffled passes through integer
+`train.signal_repeat_factors`. Validation remains one-pass. The sampler skips
+source groups too small to give every rank a sample. Every global microbatch has
+one media kind and one `data_source`.
+
+**Do not reuse Stage-1 media flattening for SFT or RL.** Those stages consume the
+annotation and must retain each dataset row as one example, load every image or
+video in its original order, and keep the media count aligned with the prompt
+placeholders. In the current CLIMB train data, multi-image rows contain either two
+or four images with the same number of `<image>` placeholders; using only
+`images[0]` would silently discard supervision.
 
 **Labels are balanced explicitly.** Anchors with the same label
 share that label's total row weight; unique tactile answers naturally receive

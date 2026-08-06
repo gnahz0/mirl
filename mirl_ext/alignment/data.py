@@ -22,36 +22,59 @@ os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 _SIGNAL_FAMILIES = ("smellnet", "ecg", "tactile")
 
 
-def _visual_key(row: dict) -> tuple[str, str] | None:
-    """Identify the physical image or video while ignoring its QA annotation."""
+def _visual_entries(row: dict) -> list[tuple[str, tuple[str, str], dict | str]]:
+    """Return every physical image/video entry and its path-based key."""
+    media: list[tuple[str, tuple[str, str], dict | str]] = []
     for column, path_key in (("images", "image"), ("videos", "video")):
         entries = row.get(column) or []
-        if not entries:
-            continue
-        entry = entries[0]
-        if isinstance(entry, str):
-            return column, entry
-        path = entry.get(path_key) or entry.get("path")
-        return (column, str(path)) if path else None
-    return None
+        for entry in entries:
+            if isinstance(entry, str):
+                path = entry
+            elif isinstance(entry, dict):
+                path = entry.get(path_key) or entry.get("path")
+            else:
+                continue
+            if path:
+                media.append((column, (column, str(path)), entry))
+    return media
 
 
-def _deduplicate_visual_rows(rows: list[dict]) -> tuple[list[dict], int]:
+def _visual_key(row: dict) -> tuple[str, str] | None:
+    """Identify the first physical image or video in an already flattened row."""
+    entries = _visual_entries(row)
+    return entries[0][1] if entries else None
+
+
+def _expand_and_deduplicate_visual_rows(rows: list[dict]) -> tuple[list[dict], int, int]:
+    """Make one Stage-1 anchor per unique physical image or video path."""
     seen: set[tuple[str, str]] = set()
     unique: list[dict] = []
+    repeated = 0
     for row in rows:
-        key = None if row.get("signals") else _visual_key(row)
-        if key is not None:
+        if row.get("signals"):
+            unique.append(row)
+            continue
+
+        # Stage 1 ignores QA text, so each physical item is an independent
+        # preservation anchor. SFT/RL must instead retain the complete ordered
+        # media list so it remains aligned with the prompt placeholders.
+        entries = _visual_entries(row)
+        if not entries:
+            unique.append(row)
+            continue
+        for column, key, entry in entries:
             if key in seen:
+                repeated += 1
                 continue
             seen.add(key)
-            row = {
-                "data_source": row["data_source"],
-                "images": row.get("images") or [],
-                "videos": row.get("videos") or [],
-            }
-        unique.append(row)
-    return unique, len(rows) - len(unique)
+            unique.append(
+                {
+                    "data_source": row["data_source"],
+                    "images": [entry] if column == "images" else [],
+                    "videos": [entry] if column == "videos" else [],
+                }
+            )
+    return unique, len(seen), repeated
 
 
 def _signal_family(sig_entry: dict) -> str:
@@ -87,9 +110,13 @@ class AlignmentDataset(Dataset):
             rows.extend(pq.read_table(path).to_pylist())
 
         rows = [row for row in rows if row["data_source"] != "smellnet_mixture"]
-        rows, removed = _deduplicate_visual_rows(rows)
-        if removed:
-            logger.info("removed %d repeated image/video annotation rows", removed)
+        rows, visual_paths, repeated = _expand_and_deduplicate_visual_rows(rows)
+        if visual_paths:
+            logger.info(
+                "kept %d unique image/video paths; removed %d repeated media entries",
+                visual_paths,
+                repeated,
+            )
 
         vocab_sets = {family: set() for family in _SIGNAL_FAMILIES}
         for row in rows:
