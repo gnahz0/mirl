@@ -24,13 +24,14 @@ matching note there.
 preserving image understanding. These are the things that look like style but
 are load-bearing:
 
-**Losses must stay O(1).** `siglip` (label-bank sigmoid) and
-`distill` (`1 - cos`) are weighted 1.0/1.0, which is only meaningful because
-both are order-1. Distillation uses `F.cosine_similarity` and
-`torch.segment_reduce` so every visual sample has equal weight despite different
-token counts. Sensor alignment uses `F.binary_cross_entropy_with_logits`,
-mean-reduced over each complete label bank and class-balanced over anchor rows.
-Changing either reduction silently rebalances training.
+**Loss reductions are load-bearing.** Distillation uses
+`F.cosine_similarity` and `torch.segment_reduce` so every visual sample has equal
+weight despite different token counts. Sensor alignment uses
+`F.binary_cross_entropy_with_logits` with SigLIP's reduction: sum candidate-pair
+losses per anchor, then take a class-balanced anchor mean. Do not mean-reduce all
+sample-label pairs; that introduces an extra `1 / K` gradient factor and starves
+families with large label banks. Changing either reduction silently rebalances
+training.
 
 **SigLIP uses one complete text-label bank per family and split.** The family
 bias is the log-odds of `1 / K`, where `K` is that split's family-vocabulary

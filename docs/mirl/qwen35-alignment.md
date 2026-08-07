@@ -19,8 +19,11 @@ Transformers computes SigLIP2 loss only inside the full model forward and assume
 a square one-image/one-text identity pairing. The sensor objective instead has a
 rectangular sample-by-label matrix, repeated positives, and class-balanced rows,
 so it uses PyTorch's equivalent `binary_cross_entropy_with_logits` primitive
-directly. Cosine preservation uses `cosine_similarity` and `segment_reduce`;
-there is no project-local loss module.
+directly. Following SigLIP's reduction, it sums pair losses across the complete
+label bank for each anchor before taking the class-balanced anchor mean; averaging
+all sample-label pairs would incorrectly weaken families with larger label banks.
+Cosine preservation uses `cosine_similarity` and `segment_reduce`; there is no
+project-local loss module.
 
 The Qwen tower is not replaced by Google's standalone vision tower. Qwen3.5
 uses a Qwen-specific `Qwen3_5VisionModel` whose exact final weights are loaded

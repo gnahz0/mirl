@@ -37,6 +37,32 @@ def test_label_loss_is_class_balanced():
     assert float(compute(2)) == pytest.approx(float(compute(20)), rel=1e-6)
 
 
+def test_label_loss_sums_candidates_before_averaging_anchors():
+    anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    candidate_labels = ("A", "B", "C")
+    labels = ["A", "B"]
+    log_scale = torch.tensor(math.log(2.0))
+
+    loss = _label_siglip_loss(
+        anchors,
+        labels,
+        candidate_labels,
+        prototypes,
+        log_scale,
+    )
+
+    bias = -math.log(len(candidate_labels) - 1)
+    logits = log_scale.exp() * (anchors @ prototypes.T) + bias
+    targets = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction="none",
+    ).sum(dim=1).mean()
+    assert loss == pytest.approx(expected)
+
+
 def test_label_loss_uses_absent_labels_as_negatives():
     anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])

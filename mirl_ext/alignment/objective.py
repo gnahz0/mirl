@@ -171,8 +171,10 @@ def _label_siglip_loss(
         weight=sample_weight[:, None],
         reduction="sum",
     )
-    # DDP averages rank gradients, so scale local rows back to the global mean.
-    denominator = (class_count > 0).sum() * num_labels
+    # Match SigLIP's reduction: sum candidate-pair losses for each anchor, then
+    # average anchors. Here the anchor mean is class-balanced, and DDP averages
+    # rank gradients, so scale local rows back to the global supported-class mean.
+    denominator = (class_count > 0).sum()
     return local_sum * world_size / denominator
 
 
