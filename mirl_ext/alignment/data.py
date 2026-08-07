@@ -145,6 +145,29 @@ def _factor_aligned_video_size(height: int, width: int, factor: int = 32) -> tup
     return target_height, target_width
 
 
+def _process_image_with_truncated_fallback(image: dict | str):
+    """Retry otherwise valid truncated images without hiding unrelated failures."""
+    from verl.utils.dataset.vision_utils import process_image
+
+    try:
+        return process_image(image)
+    except OSError as error:
+        message = str(error).casefold()
+        if "broken data stream" not in message and "image file is truncated" not in message:
+            raise
+
+    from PIL import ImageFile
+
+    path = image if isinstance(image, str) else image.get("image") or image.get("path")
+    logger.warning("loading truncated image %s", path)
+    previous = ImageFile.LOAD_TRUNCATED_IMAGES
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        return process_image(image)
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+
+
 def _process_video_with_extreme_aspect_fallback(video: dict, max_frames: int):
     """Process a video, resizing only when Qwen rejects its raw aspect ratio."""
     from verl.utils.dataset.vision_utils import process_video
@@ -280,9 +303,7 @@ class AlignmentDataset(Dataset):
 
         images = sample.get("images") or []
         if images:
-            from verl.utils.dataset.vision_utils import process_image
-
-            return {"kind": "image", "media": process_image(images[0])}
+            return {"kind": "image", "media": _process_image_with_truncated_fallback(images[0])}
 
         video = sample["videos"][0]
         return {

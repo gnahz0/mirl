@@ -50,7 +50,9 @@ unique image/video path. Visual rows remain one-pass; low-resource signal source
 may repeat complete shuffled passes through integer
 `train.signal_repeat_factors`. Validation remains one-pass. The sampler skips
 source groups too small to give every rank a sample. Every global microbatch has
-one media kind and one `data_source`.
+one media kind and one `data_source`. Images that PIL identifies specifically as
+truncated get one scoped permissive-decode retry; unrelated media errors still
+fail loudly.
 
 **Do not reuse Stage-1 media flattening for SFT or RL.** Those stages consume the
 annotation and must retain each dataset row as one example, load every image or

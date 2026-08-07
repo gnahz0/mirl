@@ -4,11 +4,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
+from PIL import ImageFile
 
 from mirl_ext.alignment.data import (
     AlignmentDataset,
     HomogeneousBatchSampler,
     _factor_aligned_video_size,
+    _process_image_with_truncated_fallback,
     collate_alignment,
 )
 
@@ -195,6 +197,35 @@ def test_extreme_video_size_is_retained_with_safe_factor_alignment():
     assert _factor_aligned_video_size(512, 2) == (512, 32)
     assert _factor_aligned_video_size(2, 512) == (32, 512)
     assert _factor_aligned_video_size(480, 640) == (480, 640)
+
+
+def test_truncated_image_retry_is_scoped(monkeypatch, caplog):
+    calls = []
+
+    def process_image(image):
+        calls.append((image, ImageFile.LOAD_TRUNCATED_IMAGES))
+        if not ImageFile.LOAD_TRUNCATED_IMAGES:
+            raise OSError("broken data stream when reading image file")
+        return "decoded"
+
+    monkeypatch.setattr("verl.utils.dataset.vision_utils.process_image", process_image)
+    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", False)
+    image = {"image": "/data/truncated.jpg"}
+
+    assert _process_image_with_truncated_fallback(image) == "decoded"
+    assert calls == [(image, False), (image, True)]
+    assert ImageFile.LOAD_TRUNCATED_IMAGES is False
+    assert "/data/truncated.jpg" in caplog.text
+
+
+def test_image_retry_does_not_hide_unrelated_os_errors(monkeypatch):
+    def process_image(_image):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("verl.utils.dataset.vision_utils.process_image", process_image)
+
+    with pytest.raises(OSError, match="permission denied"):
+        _process_image_with_truncated_fallback({"image": "/data/unreadable.jpg"})
 
 
 def test_collate_keeps_complete_source_homogeneous_signals():
