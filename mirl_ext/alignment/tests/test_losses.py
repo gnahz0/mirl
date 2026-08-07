@@ -138,26 +138,33 @@ def test_macro_f1_exposes_single_class_prediction_collapse():
     assert metrics["prediction_coverage"] == pytest.approx(1 / 7)
 
 
-def test_prediction_metrics_are_per_family_and_overall_only_supervised_families():
+def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
     labels = ["a", "b"] * 3
     families = ["smellnet", "smellnet", "ecg", "ecg", "tactile", "tactile"]
     z = torch.eye(6)
     bank = {
-        family: (("a", "b"), z[[start, start + 1]])
-        for family, start in (("smellnet", 0), ("ecg", 2), ("tactile", 4))
+        "smellnet": (("a", "b"), z[[0, 1]]),
+        "ecg": (("a", "b"), z[[2, 3]]),
+        # Reverse tactile candidates so its top-1 metrics are zero while
+        # Recall@5 remains one for this two-candidate example.
+        "tactile": (("a", "b"), z[[5, 4]]),
     }
     reports = {}
     metrics = _ts_prediction_metrics(z, labels, families, bank, reports)
 
-    for family in ("smellnet", "ecg"):
-        assert metrics[f"accuracy/ts_{family}"] == 1.0
-        assert metrics[f"f1_macro/ts_{family}"] == 1.0
-    assert "accuracy/ts_tactile" not in metrics
-    assert "f1_macro/ts_tactile" not in metrics
-    assert metrics["recall_at_1/ts_tactile"] == 1.0
+    for family in ("smellnet", "ecg", "tactile"):
+        for stat in ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map"):
+            assert f"{stat}/ts_{family}" in metrics
+    assert metrics["accuracy/ts_tactile"] == 0.0
+    assert metrics["f1_macro/ts_tactile"] == 0.0
+    assert metrics["recall_at_1/ts_tactile"] == 0.0
     assert metrics["recall_at_5/ts_tactile"] == 1.0
-    assert metrics["map/ts_tactile"] == 1.0
-    assert metrics["accuracy/overall"] == metrics["f1_macro/overall"] == 1.0
+    assert metrics["map/ts_tactile"] == 0.5
+    assert metrics["accuracy/overall"] == pytest.approx(2 / 3)
+    assert metrics["f1_macro/overall"] == pytest.approx(2 / 3)
+    assert metrics["recall_at_1/overall"] == pytest.approx(2 / 3)
+    assert metrics["recall_at_5/overall"] == 1.0
+    assert metrics["map/overall"] == pytest.approx(5 / 6)
     assert set(reports) == {"smellnet", "ecg"}
 
 
@@ -183,13 +190,20 @@ def test_validation_metrics_keep_a_compact_core():
         prediction_metrics={
             "accuracy/ts_smellnet": 0.5,
             "f1_macro/ts_smellnet": 0.4,
+            "recall_at_1/ts_smellnet": 0.5,
             "recall_at_5/ts_smellnet": 0.8,
             "prediction_coverage/ts_smellnet": 0.25,
             "accuracy/overall": 0.5,
             "f1_macro/overall": 0.4,
+            "recall_at_1/overall": 0.3,
+            "recall_at_5/overall": 0.7,
+            "map/overall": 0.45,
+            "accuracy/ts_tactile": 0.1,
+            "f1_macro/ts_tactile": 0.05,
             "recall_at_1/ts_tactile": 0.1,
             "recall_at_5/ts_tactile": 0.3,
             "map/ts_tactile": 0.2,
+            "prediction_coverage/ts_tactile": 0.4,
         },
     )
 
@@ -198,11 +212,16 @@ def test_validation_metrics_keep_a_compact_core():
     assert metrics["val-core/recall_at_5/smellnet"] == 0.8
     assert metrics["val-core/accuracy/overall"] == 0.5
     assert metrics["val-core/f1_macro/overall"] == 0.4
-    assert "val-core/f1_macro/tactile" not in metrics
+    assert metrics["val-core/recall_at_1/overall"] == 0.3
+    assert metrics["val-core/recall_at_5/overall"] == 0.7
+    assert metrics["val-core/map/overall"] == 0.45
+    assert metrics["val-core/accuracy/tactile"] == 0.1
+    assert metrics["val-core/f1_macro/tactile"] == 0.05
     assert metrics["val-core/recall_at_1/tactile"] == 0.1
     assert metrics["val-core/recall_at_5/tactile"] == 0.3
     assert metrics["val-core/map/tactile"] == 0.2
     assert metrics["val-aux/prediction_coverage/smellnet"] == 0.25
+    assert metrics["val-aux/prediction_coverage/tactile"] == 0.4
     assert metrics["val-core/loss/aggregate"] == 0.25
     assert metrics["val-core/loss/smellnet"] == 0.14
     assert metrics["val-core/loss/ecg"] == 0.16
@@ -215,9 +234,13 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     metrics = {
         "accuracy/ts_smellnet": 0.5,
         "f1_macro/ts_smellnet": 0.4,
+        "recall_at_1/ts_smellnet": 0.5,
         "recall_at_5/ts_smellnet": 0.8,
         "accuracy/overall": 0.5,
         "f1_macro/overall": 0.4,
+        "recall_at_1/overall": 0.45,
+        "recall_at_5/overall": 0.75,
+        "map/overall": 0.55,
         "prediction_coverage/ts_smellnet": 0.2,
         "loss/siglip": 0.75,
         "loss/ts_smellnet": 0.7,
@@ -228,6 +251,9 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "recall_at_1/ts_tactile": 0.25,
         "recall_at_5/ts_tactile": 0.75,
         "map/ts_tactile": 0.5,
+        "accuracy/ts_tactile": 0.25,
+        "f1_macro/ts_tactile": 0.2,
+        "prediction_coverage/ts_tactile": 0.1,
         "grad_norm": 2.0,
         "logit_scale": 10.0,
     }
@@ -238,11 +264,17 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
 
     assert grouped["train-core/accuracy/smellnet"] == 0.5
     assert grouped["train-core/f1_macro/overall"] == 0.4
+    assert grouped["train-core/recall_at_1/overall"] == 0.45
+    assert grouped["train-core/recall_at_5/overall"] == 0.75
+    assert grouped["train-core/map/overall"] == 0.55
     assert grouped["train-core/recall_at_5/smellnet"] == 0.8
+    assert grouped["train-core/accuracy/tactile"] == 0.25
+    assert grouped["train-core/f1_macro/tactile"] == 0.2
     assert grouped["train-core/recall_at_1/tactile"] == 0.25
     assert grouped["train-core/recall_at_5/tactile"] == 0.75
     assert grouped["train-core/map/tactile"] == 0.5
     assert grouped["train-aux/prediction_coverage/smellnet"] == 0.2
+    assert grouped["train-aux/prediction_coverage/tactile"] == 0.1
     assert grouped["train-aux/n/img"] == 3.0
     assert grouped["train-core/loss/aggregate"] == 1.25
     assert grouped["train-core/loss/smellnet"] == 0.7

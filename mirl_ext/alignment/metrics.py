@@ -9,8 +9,6 @@ import torch.distributed as dist
 # Metric reduction order must be identical on every rank.
 _TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
 _CLASSIFICATION_FAMILIES = ("smellnet", "ecg")
-_CLASSIFICATION_STATS = ("accuracy", "f1_macro", "recall_at_5")
-_RETRIEVAL_STATS = ("recall_at_1", "recall_at_5", "map")
 _PUBLIC_STATS = ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
 
 _REDUCED_METRIC_KEYS = (
@@ -190,15 +188,11 @@ def _ts_prediction_metrics(
             world_size=world_size,
             per_class_out=report_rows,
         )
-        if family in _CLASSIFICATION_FAMILIES:
-            family_scores[family] = family_metrics
-            published = (*_CLASSIFICATION_STATS, "prediction_coverage")
-        else:
-            published = _RETRIEVAL_STATS
-        for stat in published:
+        family_scores[family] = family_metrics
+        for stat in (*_PUBLIC_STATS, "prediction_coverage"):
             metrics[f"{stat}/ts_{family}"] = family_metrics[stat]
 
-    for stat in ("accuracy", "f1_macro"):
+    for stat in _PUBLIC_STATS:
         values = [scores[stat] for scores in family_scores.values() if stat in scores]
         if values:
             metrics[f"{stat}/overall"] = sum(values) / len(values)
@@ -236,7 +230,7 @@ def _metric_groups(
             out[f"{aux}/prediction_coverage/{family}"] = prediction_metrics[coverage_key]
         out[f"{aux}/n/{family}"] = float(counts[f"n/ts_{family}"])
 
-    for stat in ("accuracy", "f1_macro"):
+    for stat in _PUBLIC_STATS:
         key = f"{stat}/overall"
         if key in prediction_metrics:
             out[f"{core}/{stat}/overall"] = prediction_metrics[key]

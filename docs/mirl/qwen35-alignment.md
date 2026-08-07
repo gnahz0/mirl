@@ -172,6 +172,7 @@ produces 2,303 tokens.
 - The production schedule is one sampler epoch. Validation runs every 200 steps
   over the complete one-pass sensor validation sampler, visiting every SmellNet,
   ECG, and tactile validation recording once.
-- Checkpoint selection uses the SmellNet/ECG validation macro-F1 at
-  `val-core/f1_macro/overall`. Tactile logs sensor-to-text Recall@1, Recall@5,
-  and mAP over all 635 validation recordings.
+- Every signal family logs accuracy, macro-F1, Recall@1, Recall@5, and mAP.
+  `overall` is their equal-family mean across SmellNet, ECG, and tactile;
+  checkpoint selection uses `val-core/f1_macro/overall`. Tactile Recall@1/5 and
+  mAP remain the primary interpretation because its 635 captions are unique.

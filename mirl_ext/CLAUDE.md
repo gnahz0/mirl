@@ -71,12 +71,15 @@ samples. One small class-count reduction preserves exact global class weighting;
 prediction metrics reduce count statistics. There is no embedding gather, string
 metadata gather, Gloo side group, or manual parameter-gradient loop.
 
-**Selection metrics match the supervision.** W&B publishes accuracy, macro-F1,
-Recall@5, and validation per-class precision/recall/F1 for SmellNet and ECG;
-`overall` weights those two families equally. Tactile publishes sensor-to-text
-Recall@1, Recall@5, and mAP instead of pretending unique captions are classes.
-Training retrieval covers an effective optimization batch; validation retrieval
-is computed jointly over the complete validation set.
+**Selection metrics use one uniform family surface.** W&B publishes accuracy,
+macro-F1, Recall@1, Recall@5, mAP, and prediction coverage for SmellNet, ECG, and
+tactile. `overall` is the equal-family mean across all three modalities. Accuracy
+and Recall@1 are identical in this single-label ranking setup; both names remain
+available for dashboard consistency. Tactile captions are unique, so its
+Recall@1/5 and mAP remain the primary interpretation; its class-style accuracy
+and macro-F1 are additional assignment diagnostics. Training metrics cover only
+modalities present in that effective optimization batch, while validation metrics
+are computed jointly over the complete validation set.
 
 **Metrics carry no placeholder values.** A key is present iff its branch fired.
 Never pre-populate `loss/*` with `0.0`: a placeholder is indistinguishable from
@@ -121,9 +124,9 @@ Start a new lineage: bump `WANDB_RUN_ID` *and* the checkpoint dir in the sbatch.
 similarities rather than the loss. Aggregate and per-family losses live with selection metrics under
 `val-core/`; component losses, coverage, and per-class diagnostics
 live under `val-aux/`.
-`val-core/{accuracy,f1_macro}/overall` is the equal-family mean over tasks with
-reusable labels (SmellNet and ECG). Macro-F1 excludes classes absent from that
-validation sample. Tactile uses sensor-to-text retrieval metrics instead.
+`val-core/{accuracy,f1_macro,recall_at_1,recall_at_5,map}/overall` is the
+equal-family mean across SmellNet, ECG, and tactile. Macro-F1 excludes classes
+absent from that validation sample.
 
 ## Experiment log (2026-07-27..30) — what was tried, with verdicts
 
