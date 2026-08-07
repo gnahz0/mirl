@@ -24,7 +24,9 @@ _REDUCED_METRIC_KEYS = (
 _COUNT_KEYS: tuple[str, ...] = (
     "n/img_image",
     "n/img_video",
-) + tuple(f"n/ts_{family}" for family in _TS_FAMILIES)
+) + tuple(f"n/ts_{family}" for family in _TS_FAMILIES) + tuple(
+    f"n/skipped_{kind}" for kind in ("image", "video", "signal")
+)
 
 
 def _allreduce_metrics(metrics: dict, device: torch.device, world_size: int) -> dict:
@@ -66,6 +68,9 @@ def _allreduce_counts(counts: dict, device: torch.device, world_size: int) -> di
 
 def add_batch_counts(counts: dict, batch: dict) -> None:
     """Count one source-homogeneous local batch."""
+    for kind, value in batch.get("skipped", {}).items():
+        if value:
+            counts[f"n/skipped_{kind}"] += int(value)
     size = len(batch["media"])
     if batch["kind"] == "signal":
         counts[f"n/ts_{batch['family']}"] += size
@@ -211,6 +216,19 @@ def _metric_groups(
     core = f"{split}-core"
     aux = f"{split}-aux"
     out: dict[str, float] = {f"{core}/loss/aggregate": loss_metrics["loss/total"]}
+
+    skipped = {
+        kind: counts.get(f"n/skipped_{kind}", 0)
+        for kind in ("image", "video", "signal")
+    }
+    skipped_total = sum(skipped.values())
+    valid_total = counts.get("n/img_image", 0) + counts.get("n/img_video", 0) + sum(
+        counts.get(f"n/ts_{family}", 0) for family in _TS_FAMILIES
+    )
+    for kind, value in skipped.items():
+        out[f"{aux}/n/skipped/{kind}"] = float(value)
+    out[f"{aux}/n/skipped/total"] = float(skipped_total)
+    out[f"{aux}/skipped_fraction"] = skipped_total / max(valid_total + skipped_total, 1)
 
     for name in ("siglip", "distill"):
         key = f"loss/{name}"

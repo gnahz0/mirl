@@ -51,8 +51,11 @@ may repeat complete shuffled passes through integer
 `train.signal_repeat_factors`. Validation remains one-pass. The sampler skips
 source groups too small to give every rank a sample. Every global microbatch has
 one media kind and one `data_source`. Images that PIL identifies specifically as
-truncated get one scoped permissive-decode retry; unrelated media errors still
-fail loudly.
+truncated get one scoped permissive-decode retry. Remaining recognized media-load
+errors are logged and filtered per item; W&B reports per-kind, total, cumulative,
+and fractional skip statistics. An entirely unreadable rank-local batch still
+fails rather than passing an empty batch into DDP. Programming and schema errors
+remain visible.
 
 **Do not reuse Stage-1 media flattening for SFT or RL.** Those stages consume the
 annotation and must retain each dataset row as one example, load every image or

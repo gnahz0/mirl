@@ -258,7 +258,15 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "logit_scale": 10.0,
     }
     counts = Counter()
-    counts.update({"n/img_image": 2, "n/img_video": 1, "n/ts_smellnet": 8})
+    counts.update(
+        {
+            "n/img_image": 2,
+            "n/img_video": 1,
+            "n/ts_smellnet": 8,
+            "n/skipped_image": 1,
+            "n/skipped_video": 2,
+        }
+    )
 
     grouped = _metric_groups("train", metrics, counts)
 
@@ -276,6 +284,11 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     assert grouped["train-aux/prediction_coverage/smellnet"] == 0.2
     assert grouped["train-aux/prediction_coverage/tactile"] == 0.1
     assert grouped["train-aux/n/img"] == 3.0
+    assert grouped["train-aux/n/skipped/image"] == 1.0
+    assert grouped["train-aux/n/skipped/video"] == 2.0
+    assert grouped["train-aux/n/skipped/signal"] == 0.0
+    assert grouped["train-aux/n/skipped/total"] == 3.0
+    assert grouped["train-aux/skipped_fraction"] == 3 / 14
     assert grouped["train-core/loss/aggregate"] == 1.25
     assert grouped["train-core/loss/smellnet"] == 0.7
     assert grouped["train-core/loss/ecg"] == 0.8
@@ -291,6 +304,11 @@ def test_loss_registration_and_batch_counts_fail_closed():
     counts = Counter()
     add_batch_counts(
         counts,
-        {"kind": "signal", "media": [1, 2, 3], "family": "smellnet"},
+        {
+            "kind": "signal",
+            "media": [1, 2, 3],
+            "family": "smellnet",
+            "skipped": {"image": 0, "video": 0, "signal": 1},
+        },
     )
-    assert counts == {"n/ts_smellnet": 3}
+    assert counts == {"n/ts_smellnet": 3, "n/skipped_signal": 1}

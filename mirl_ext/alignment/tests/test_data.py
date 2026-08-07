@@ -228,6 +228,58 @@ def test_image_retry_does_not_hide_unrelated_os_errors(monkeypatch):
         _process_image_with_truncated_fallback({"image": "/data/unreadable.jpg"})
 
 
+def test_dataset_marks_unreadable_image_for_logged_skip(tmp_path, monkeypatch, caplog):
+    dataset = _dataset(
+        tmp_path,
+        "unreadable",
+        [
+            {
+                "data_source": "chest_xray",
+                "images": [{"image": "/data/unreadable.jpg"}],
+                "videos": None,
+                "signals": None,
+            }
+        ],
+    )
+
+    def process_image(_image):
+        raise OSError("decoder rejected image")
+
+    monkeypatch.setattr("mirl_ext.alignment.data._process_image_with_truncated_fallback", process_image)
+
+    assert dataset[0] == {
+        "kind": "skipped",
+        "failed_kind": "image",
+        "path": "/data/unreadable.jpg",
+    }
+    assert "source=chest_xray" in caplog.text
+
+
+def test_collate_filters_failed_items_and_counts_them():
+    batch = collate_alignment(
+        [
+            {"kind": "image", "media": "valid-a"},
+            {"kind": "skipped", "failed_kind": "image", "path": "/bad-a.jpg"},
+            {"kind": "image", "media": "valid-b"},
+        ]
+    )
+
+    assert batch == {
+        "kind": "image",
+        "media": ["valid-a", "valid-b"],
+        "family": None,
+        "text": [],
+        "skipped": {"image": 1, "video": 0, "signal": 0},
+    }
+
+
+def test_collate_rejects_an_entirely_unreadable_local_batch():
+    with pytest.raises(RuntimeError, match="refusing an empty DDP batch"):
+        collate_alignment(
+            [{"kind": "skipped", "failed_kind": "video", "path": "/bad.mp4"}]
+        )
+
+
 def test_collate_keeps_complete_source_homogeneous_signals():
     signals = [
         torch.arange(12, dtype=torch.float32).reshape(2, 6),
@@ -249,6 +301,7 @@ def test_collate_keeps_complete_source_homogeneous_signals():
     assert batch["family"] == "smellnet"
     assert all(actual is expected for actual, expected in zip(batch["media"], signals, strict=True))
     assert batch["text"] == ["apple", "pear"]
+    assert batch["skipped"] == {"image": 0, "video": 0, "signal": 0}
 
 
 class _GroupedDataset:

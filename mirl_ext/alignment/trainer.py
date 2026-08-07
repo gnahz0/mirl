@@ -128,6 +128,7 @@ def train(cfg: DictConfig) -> None:
 
     trainable = [param for param in model.parameters() if param.requires_grad]
     window = AccumulationWindow()
+    cumulative_counts: Counter[str] = Counter()
     opt_step = 0
     best_value = float("-inf")
     optimizer.zero_grad(set_to_none=True)
@@ -172,13 +173,33 @@ def train(cfg: DictConfig) -> None:
 
             metrics = _allreduce_metrics(metrics, device, world_size)
             counts = _allreduce_counts(window.counts, device, world_size)
+            cumulative_counts.update(counts)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
                 metrics.update(window_metrics)
                 if wandb_run is not None:
+                    payload = _metric_groups("train", metrics, counts)
+                    skipped_total = sum(
+                        cumulative_counts[f"n/skipped_{kind}"]
+                        for kind in ("image", "video", "signal")
+                    )
+                    valid_total = (
+                        cumulative_counts["n/img_image"]
+                        + cumulative_counts["n/img_video"]
+                        + cumulative_counts["n/ts_signal"]
+                    )
+                    for kind in ("image", "video", "signal"):
+                        payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(
+                            cumulative_counts[f"n/skipped_{kind}"]
+                        )
+                    payload["train-aux/n/skipped_cumulative/total"] = float(skipped_total)
+                    payload["train-aux/skipped_fraction_cumulative"] = skipped_total / max(
+                        valid_total + skipped_total,
+                        1,
+                    )
                     wandb_run.log(
                         {
-                            **_metric_groups("train", metrics, counts),
+                            **payload,
                             "train-aux/lr/model": lrs["model"],
                             "train-aux/lr/scalar": lrs["scalar"],
                             "train-aux/epoch": epoch + (batch_index + 1) / micro_batches_per_epoch,
@@ -232,9 +253,13 @@ def train(cfg: DictConfig) -> None:
         if wandb_run is not None:
             wandb_run.finish()
         logger.info(
-            "training complete: best %s=%.4f; final=%s",
+            "training complete: best %s=%.4f; skipped=%s; final=%s",
             cfg.train.best_metric,
             best_value,
+            {
+                kind: cumulative_counts[f"n/skipped_{kind}"]
+                for kind in ("image", "video", "signal")
+            },
             out_dir / "final",
         )
     accelerator.wait_for_everyone()

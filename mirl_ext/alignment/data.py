@@ -20,6 +20,7 @@ os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 
 
 _SIGNAL_FAMILIES = ("smellnet", "ecg", "tactile")
+_SKIPPABLE_LOAD_ERRORS = (OSError, ValueError, RuntimeError, EOFError)
 
 
 def _rewrite_path(path: str, rewrites: tuple[tuple[str, str], ...]) -> str:
@@ -168,6 +169,30 @@ def _process_image_with_truncated_fallback(image: dict | str):
         ImageFile.LOAD_TRUNCATED_IMAGES = previous
 
 
+def _entry_path(entry: dict | str, primary_key: str) -> str:
+    if isinstance(entry, str):
+        return entry
+    return str(entry.get(primary_key) or entry.get("path") or "<unknown>")
+
+
+def _skipped_item(kind: str, entry: dict | str, source: str, error: Exception) -> dict:
+    primary_key = {"image": "image", "video": "video", "signal": "signal"}[kind]
+    path = _entry_path(entry, primary_key)
+    logger.warning(
+        "skipping unreadable %s source=%s path=%s (%s: %s)",
+        kind,
+        source,
+        path,
+        type(error).__name__,
+        str(error)[:240],
+    )
+    return {
+        "kind": "skipped",
+        "failed_kind": kind,
+        "path": path,
+    }
+
+
 def _process_video_with_extreme_aspect_fallback(video: dict, max_frames: int):
     """Process a video, resizing only when Qwen rejects its raw aspect ratio."""
     from verl.utils.dataset.vision_utils import process_video
@@ -293,7 +318,10 @@ class AlignmentDataset(Dataset):
         sample = self.rows[idx]
         signals = sample.get("signals") or []
         if signals:
-            media, family = self._load_signal(signals[0])
+            try:
+                media, family = self._load_signal(signals[0])
+            except _SKIPPABLE_LOAD_ERRORS as error:
+                return _skipped_item("signal", signals[0], sample["data_source"], error)
             return {
                 "kind": "signal",
                 "media": media,
@@ -303,12 +331,20 @@ class AlignmentDataset(Dataset):
 
         images = sample.get("images") or []
         if images:
-            return {"kind": "image", "media": _process_image_with_truncated_fallback(images[0])}
+            try:
+                media = _process_image_with_truncated_fallback(images[0])
+            except _SKIPPABLE_LOAD_ERRORS as error:
+                return _skipped_item("image", images[0], sample["data_source"], error)
+            return {"kind": "image", "media": media}
 
         video = sample["videos"][0]
+        try:
+            media = _process_video_with_extreme_aspect_fallback(video, self.max_video_frames)
+        except _SKIPPABLE_LOAD_ERRORS as error:
+            return _skipped_item("video", video, sample["data_source"], error)
         return {
             "kind": "video",
-            "media": _process_video_with_extreme_aspect_fallback(video, self.max_video_frames),
+            "media": media,
         }
 
 
@@ -423,10 +459,22 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
 
 def collate_alignment(batch: list[dict]) -> dict:
     """Keep variable-shape media as one source-homogeneous list."""
-    kind = batch[0]["kind"]
+    skipped = [item for item in batch if item["kind"] == "skipped"]
+    valid = [item for item in batch if item["kind"] != "skipped"]
+    if not valid:
+        paths = ", ".join(item["path"] for item in skipped[:3])
+        raise RuntimeError(
+            f"all {len(batch)} rank-local samples failed to load; refusing an empty DDP batch: {paths}"
+        )
+    kind = valid[0]["kind"]
+    skipped_counts = {
+        failed_kind: sum(item["failed_kind"] == failed_kind for item in skipped)
+        for failed_kind in ("image", "video", "signal")
+    }
     return {
         "kind": kind,
-        "media": [item["media"] for item in batch],
-        "family": batch[0].get("family"),
-        "text": [item["text"] for item in batch] if kind == "signal" else [],
+        "media": [item["media"] for item in valid],
+        "family": valid[0].get("family"),
+        "text": [item["text"] for item in valid] if kind == "signal" else [],
+        "skipped": skipped_counts,
     }
