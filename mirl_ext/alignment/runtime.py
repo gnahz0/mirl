@@ -128,7 +128,6 @@ def build_model(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
         visual_dtype=visual_dtype,
-        gradient_checkpointing=bool(cfg.model.gradient_checkpointing),
         contrastive_temperature=cfg.loss.temperature,
         max_tokens_per_sample=int(cfg.data.max_tokens_per_sample),
     ).to(device)

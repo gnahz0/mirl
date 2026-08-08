@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from mirl_ext.alignment.model import MultimodalAlignmentModel, _enable_block_checkpointing
+from mirl_ext.alignment.model import MultimodalAlignmentModel
 
 
 def _renderer() -> MultimodalAlignmentModel:
@@ -65,19 +65,3 @@ def test_text_encoder_truncates_each_text_to_model_context():
     encoded = model.encode_text(["short", "long"], torch.device("cpu"))
 
     assert torch.equal(encoded, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
-
-
-def test_block_checkpointing_preserves_state_dict_keys():
-    class Visual(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
-
-        def forward(self, value):
-            return self.blocks[0](value)
-
-    visual = Visual()
-    keys = set(visual.state_dict())
-    assert _enable_block_checkpointing(visual) == 1
-    assert set(visual.state_dict()) == keys
-    visual(torch.ones(1, 2, requires_grad=True)).sum().backward()

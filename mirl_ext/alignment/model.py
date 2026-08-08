@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-from functools import partial
 from pathlib import Path
 
 import torch
@@ -37,32 +36,12 @@ def _load_qwen_visual(path_or_repo: str, dtype: torch.dtype) -> nn.Module:
     )
 
 
-def _enable_block_checkpointing(visual: nn.Module) -> int:
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-        CheckpointImpl,
-        apply_activation_checkpointing,
-        checkpoint_wrapper,
-    )
-
-    blocks = set(visual.blocks)
-    apply_activation_checkpointing(
-        visual,
-        checkpoint_wrapper_fn=partial(
-            checkpoint_wrapper,
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        ),
-        check_fn=blocks.__contains__,
-    )
-    return len(blocks)
-
-
 class MultimodalAlignmentModel(nn.Module):
     def __init__(
         self,
         qwen35_path: str,
         siglip2_text_path: str,
         visual_dtype: torch.dtype,
-        gradient_checkpointing: bool,
         contrastive_temperature: float,
         max_tokens_per_sample: int,
     ):
@@ -73,8 +52,6 @@ class MultimodalAlignmentModel(nn.Module):
         self.qwen_processor = AutoProcessor.from_pretrained(qwen_root, local_files_only=True)
         self.trainable_visual = _load_qwen_visual(str(qwen_root), visual_dtype)
         self.trainable_visual.merger.requires_grad_(False)
-        if gradient_checkpointing:
-            _enable_block_checkpointing(self.trainable_visual)
 
         config = self.trainable_visual.config
         merger_cell = int(config.patch_size) * int(config.spatial_merge_size)

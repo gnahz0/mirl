@@ -19,8 +19,6 @@ data:
 model:
   qwen35_path: ${oc.env:MIRL_QWEN35_PATH,/orcd/scratch/orcd/010/alecz/mirl-qwen35/models/qwen35-ve}
   siglip2_text_path: ${oc.env:MIRL_SIGLIP2_PATH,/orcd/scratch/orcd/010/alecz/mirl-qwen35/models/siglip2-text}
-  gradient_checkpointing: true
-
 loss:
   temperature: 0.07
   siglip_weight: 1.0

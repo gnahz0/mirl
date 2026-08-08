@@ -9,7 +9,7 @@
 #SBATCH --partition=b200-batch
 #SBATCH --account=ppliang_mit
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=896G
 #SBATCH --time=24:00:00
@@ -58,5 +58,5 @@ python -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' ||
 
 echo "Stage-1 job=$SLURM_JOB_ID node=$(hostname) output=$MIRL_OUTPUT_DIR"
 CONFIG="$PWD/mirl_ext/alignment/config/stage1_qwen35_siglip2.yaml" \
-NUM_GPUS=4 \
+NUM_GPUS=2 \
 bash examples/alignment/run_stage1_qwen35_siglip2.sh "$@"

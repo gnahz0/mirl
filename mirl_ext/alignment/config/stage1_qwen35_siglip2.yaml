@@ -13,8 +13,6 @@ data:
 model:
   qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
   siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
-  gradient_checkpointing: true
-
 loss:
   temperature: 0.07
   siglip_weight: 1.0
