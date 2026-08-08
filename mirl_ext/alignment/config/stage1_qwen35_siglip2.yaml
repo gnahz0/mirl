@@ -7,8 +7,19 @@ data:
   root: ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}
   train_files:
     - ${data.root}/haptic_ts_train.parquet
+  train_annotation_files:
+    - ${data.root}/tactile_train.parquet
   val_files:
     - ${data.root}/haptic_ts_valid.parquet
+  val_annotation_files:
+    - ${data.root}/tactile_valid.parquet
+  tasks:
+    - initial_fingers
+    - highest_pressure
+    - force_level
+    - grip_stability
+    - contact_feature
+    - local_shape
   max_tokens_per_sample: 1024
 model:
   qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
@@ -21,9 +32,7 @@ train:
   seed: 42
   init_checkpoint: null
   resume_checkpoint: null
-  signal_repeat_factors:
-    haptic_tactile: 5
-  # Four GPUs and two-step accumulation give a global batch of up to 256.
+  # Two GPUs and two-step accumulation give a global batch of up to 128.
   batch_size: 32
   grad_accum_steps: 2
   num_workers: 4
@@ -31,17 +40,17 @@ train:
   scalar_lr: 3.0e-3
   weight_decay: 0.05
   # Optimizer steps are derived from the sampler and accumulation.
-  num_train_epochs: 1
+  num_train_epochs: 5
   warmup_ratio: 0.03
   # val_every is measured in optimizer steps.
   grad_clip: 1.0
   amp_dtype: bf16
   val_every: 200
   val_batch_size: 256
-  best_metric: val-core/map/tactile
-  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/tactile_ablation}
+  best_metric: val-core/f1_macro/tactile
+  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/tactile_structured}
 
 wandb:
   enable: true
   project: mirl-alignment
-  name: ${oc.env:WANDB_RUN_ID,tactile_ablation}
+  name: ${oc.env:WANDB_RUN_ID,tactile_structured}

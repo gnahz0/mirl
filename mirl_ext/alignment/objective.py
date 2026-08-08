@@ -1,91 +1,88 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Stage-1 alignment objective, text-label banks, and evaluation."""
+"""Structured tactile SigLIP objective and evaluation."""
 
 from __future__ import annotations
 
 import logging
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from accelerate import Accelerator
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from .metrics import (
-    _TS_FAMILIES,
     _allreduce_counts,
     _allreduce_metrics,
-    _metric_groups,
-    _ts_prediction_metrics,
     add_batch_counts,
+    metric_groups,
+    task_prediction_metrics,
 )
 from .model import MultimodalAlignmentModel
 
 logger = logging.getLogger("alignment.trainer")
 
-LabelBank = dict[str, tuple[tuple[str, ...], torch.Tensor]]
-TSEval = tuple[torch.Tensor | None, list[str], list[str]]
+LabelBank = dict[str, tuple[tuple[str, ...], torch.Tensor, float]]
+TaskEval = tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]
 
 
 @torch.no_grad()
-def _build_text_label_bank(
+def build_text_label_bank(
     model: MultimodalAlignmentModel,
-    vocabularies: dict[str, tuple[str, ...]],
+    task_labels: dict[str, tuple[str, ...]],
+    positive_rates: dict[str, float],
     device: torch.device,
-    batch_size: int = 256,
 ) -> LabelBank:
-    """Encode each split's complete family label vocabulary once with SigLIP2."""
     bank: LabelBank = {}
-    for family in _TS_FAMILIES:
-        labels = tuple(vocabularies.get(family, ()))
-        if not labels:
-            continue
-        chunks = [
-            model.encode_text(list(labels[start : start + batch_size]), device=device).float()
-            for start in range(0, len(labels), batch_size)
-        ]
-        bank[family] = (labels, torch.cat(chunks, dim=0).detach())
-        logger.info("text label bank: family=%s labels=%d", family, len(labels))
+    for task, labels in task_labels.items():
+        text_embeddings = model.encode_text(list(labels), device=device).float().detach()
+        positive_rate = positive_rates[task]
+        bias = math.log(positive_rate / (1 - positive_rate))
+        bank[task] = (labels, text_embeddings, bias)
+        logger.info(
+            "text label bank: task=%s labels=%d positive_rate=%.4f bias=%.4f",
+            task,
+            len(labels),
+            positive_rate,
+            bias,
+        )
     return bank
 
 
 @torch.no_grad()
-def _score_ts(
+def score_tasks(
     embeddings: list[torch.Tensor],
-    labels: list[str],
-    families: list[str],
+    target_chunks: dict[str, list[torch.Tensor]],
+    mask_chunks: dict[str, list[torch.Tensor]],
     label_bank: LabelBank,
+    log_logit_scale: torch.Tensor,
+    *,
     world_size: int = 1,
-    per_class_reports: dict[str, list[dict[str, object]]] | None = None,
+    per_label_out: list[dict[str, object]] | None = None,
 ) -> dict[str, float]:
-    """Score one sensor sample set against the frozen text-label bank."""
     if not embeddings:
         return {}
-    return _ts_prediction_metrics(
+    return task_prediction_metrics(
         torch.cat(embeddings),
-        labels,
-        families,
+        {task: torch.cat(chunks) for task, chunks in target_chunks.items()},
+        {task: torch.cat(chunks) for task, chunks in mask_chunks.items()},
         label_bank,
+        log_logit_scale,
         world_size=world_size,
-        per_class_reports=per_class_reports,
+        per_label_out=per_label_out,
     )
 
 
 @torch.no_grad()
-def _run_validation(
+def run_validation(
     model: MultimodalAlignmentModel,
     val_loader: DataLoader,
     cfg: DictConfig,
     accelerator: Accelerator,
     label_bank: LabelBank,
-) -> tuple[
-    dict[str, float],
-    dict[str, list[dict[str, object]]],
-]:
-    """Evaluate losses and prediction metrics over validation batches."""
+) -> tuple[dict[str, float], list[dict[str, object]]]:
     was_training = model.training
     model.eval()
     device = accelerator.device
@@ -93,124 +90,97 @@ def _run_validation(
 
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}
-    ts_embeddings: list[torch.Tensor] = []
-    ts_labels: list[str] = []
-    ts_families: list[str] = []
-    bucket_totals: Counter[str] = Counter()
+    embeddings: list[torch.Tensor] = []
+    target_chunks: dict[str, list[torch.Tensor]] = defaultdict(list)
+    mask_chunks: dict[str, list[torch.Tensor]] = defaultdict(list)
+    sample_counts: Counter[str] = Counter()
     for batch in val_loader:
-        add_batch_counts(bucket_totals, batch)
+        add_batch_counts(sample_counts, batch)
         with accelerator.autocast():
-            _, metrics, batch_eval = _compute_losses(
-                model,
-                batch,
-                cfg,
-                world_size=world_size,
-                label_bank=label_bank,
-            )
-        embeddings, labels, families = batch_eval
-        if embeddings is not None:
-            ts_embeddings.append(embeddings)
-            ts_labels.extend(labels)
-            ts_families.extend(families)
+            _, metrics, task_eval = compute_losses(model, batch, cfg, label_bank=label_bank)
+        z, targets, masks = task_eval
+        embeddings.append(z)
+        for task in label_bank:
+            target_chunks[task].append(targets[task])
+            mask_chunks[task].append(masks[task])
         for key, value in metrics.items():
             sums[key] = sums.get(key, 0.0) + float(value)
             counts[key] = counts.get(key, 0) + 1
+
     averaged = _allreduce_metrics(
         {key: sums[key] / counts[key] for key in sums},
         device,
         world_size,
     )
-    bucket_totals = _allreduce_counts(bucket_totals, device, world_size)
-    per_class_reports: dict[str, list[dict[str, object]]] = {}
-    prediction_metrics = _score_ts(
-        ts_embeddings,
-        ts_labels,
-        ts_families,
+    sample_counts = _allreduce_counts(sample_counts, device, world_size)
+    per_label: list[dict[str, object]] = []
+    base_model = accelerator.unwrap_model(model)
+    predictions = score_tasks(
+        embeddings,
+        target_chunks,
+        mask_chunks,
         label_bank,
+        base_model.log_logit_scale,
         world_size=world_size,
-        per_class_reports=per_class_reports,
+        per_label_out=per_label,
     )
 
     if was_training:
         model.train()
-        base_model = accelerator.unwrap_model(model)
         base_model.label_text_model.eval()
-
-    out = _metric_groups("val", averaged, bucket_totals, prediction_metrics)
-    return out, per_class_reports
+    return metric_groups("val", averaged, sample_counts, predictions), per_label
 
 
-def _label_siglip_loss(
-    z_ts: torch.Tensor,
-    labels: list[str],
-    candidate_labels: tuple[str, ...],
+def task_siglip_loss(
+    z: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
     text_embeddings: torch.Tensor,
+    bias: float,
     log_logit_scale: torch.Tensor,
-    world_size: int = 1,
-) -> torch.Tensor:
-    """Compute class-balanced SigLIP against one complete text-label bank."""
-    num_labels = len(candidate_labels)
-    label_to_id = {label: idx for idx, label in enumerate(candidate_labels)}
-    targets = torch.tensor(
-        [label_to_id[label] for label in labels],
-        device=z_ts.device,
-        dtype=torch.long,
-    )
-    # Repeated labels contribute the same total anchor weight as unique labels.
-    class_count = torch.bincount(targets, minlength=num_labels).float()
-    if world_size > 1:
-        dist.all_reduce(class_count, op=dist.ReduceOp.SUM)
-    sample_weight = class_count.index_select(0, targets).reciprocal()
-    bias = z_ts.new_tensor(-math.log(num_labels - 1))
-    logits = log_logit_scale.float().exp() * (z_ts.float() @ text_embeddings.float().t()) + bias
-    positives = F.one_hot(targets, num_classes=num_labels).to(dtype=logits.dtype)
-    local_sum = F.binary_cross_entropy_with_logits(
-        logits,
-        positives,
-        weight=sample_weight[:, None],
-        reduction="sum",
-    )
-    # Match SigLIP's reduction: sum candidate-pair losses for each anchor, then
-    # average anchors. Here the anchor mean is class-balanced, and DDP averages
-    # rank gradients, so scale local rows back to the global supported-class mean.
-    denominator = (class_count > 0).sum()
-    return local_sum * world_size / denominator
+) -> torch.Tensor | None:
+    mask = mask.to(z.device)
+    if not mask.any():
+        return None
+    target = targets.to(z.device)[mask]
+    logits = log_logit_scale.float().exp() * (z[mask].float() @ text_embeddings.to(z.device).float().t()) + bias
+    return F.binary_cross_entropy_with_logits(logits, target)
 
 
-def _compute_losses(
+def compute_losses(
     model: MultimodalAlignmentModel,
     batch: dict,
     cfg: DictConfig,
     *,
     label_bank: LabelBank,
-    world_size: int = 1,
-) -> tuple[torch.Tensor, dict, TSEval]:
-    """Compute family label-bank SigLIP and frozen-Qwen preservation losses."""
-    metrics: dict[str, float] = {}
-
-    media = batch["media"]
-    family = batch["family"]
-    labels = batch["text"]
-    feat_ts, log_logit_scale = model(media)
-
-    total = log_logit_scale.float() * 0.0
-
-    z_ts = F.normalize(feat_ts.float(), dim=-1, eps=1e-6) if feat_ts is not None else None
-    if z_ts is not None:
-        candidate_labels, text_embeddings = label_bank[family]
-        l_ts = _label_siglip_loss(
-            z_ts,
-            labels,
-            candidate_labels,
+) -> tuple[torch.Tensor, dict[str, float], TaskEval]:
+    features, log_logit_scale = model(batch["media"])
+    z = F.normalize(features.float(), dim=-1, eps=1e-6)
+    task_losses: dict[str, torch.Tensor] = {}
+    targets: dict[str, torch.Tensor] = {}
+    masks: dict[str, torch.Tensor] = {}
+    for task, (_, text_embeddings, bias) in label_bank.items():
+        target = batch["targets"][task].to(z.device)
+        mask = batch["masks"][task].to(z.device)
+        loss = task_siglip_loss(
+            z,
+            target,
+            mask,
             text_embeddings,
+            bias,
             log_logit_scale,
-            world_size,
         )
-        total = total + float(cfg.loss.siglip_weight) * l_ts
-        metrics["loss/siglip"] = l_ts.detach().item()
-        metrics[f"loss/ts_{family}"] = l_ts.detach().item()
+        if loss is not None:
+            task_losses[task] = loss
+        targets[task] = target.detach()
+        masks[task] = mask.detach()
 
-    metrics["loss/total"] = total.detach().item()
-    metrics["logit_scale"] = log_logit_scale.detach().exp().item()
-    ts_eval = (z_ts.detach(), labels, [family] * len(labels)) if z_ts is not None else (None, [], [])
-    return total, metrics, ts_eval
+    siglip = torch.stack(tuple(task_losses.values())).mean()
+    total = float(cfg.loss.siglip_weight) * siglip
+    metrics = {
+        "loss/siglip": siglip.detach().item(),
+        "loss/total": total.detach().item(),
+        "logit_scale": log_logit_scale.detach().exp().item(),
+        **{f"loss/task/{task}": loss.detach().item() for task, loss in task_losses.items()},
+    }
+    return total, metrics, (z.detach(), targets, masks)

@@ -18,14 +18,14 @@ from omegaconf import DictConfig, OmegaConf
 from .metrics import (
     _allreduce_counts,
     _allreduce_metrics,
-    _metric_groups,
     add_batch_counts,
+    metric_groups,
 )
 from .objective import (
-    _build_text_label_bank,
-    _compute_losses,
-    _run_validation,
-    _score_ts,
+    build_text_label_bank,
+    compute_losses,
+    run_validation,
+    score_tasks,
 )
 from .runtime import (
     build_loaders,
@@ -45,17 +45,17 @@ logger = logging.getLogger("alignment.trainer")
 class AccumulationWindow:
     counts: Counter[str] = field(default_factory=Counter)
     metric_values: dict[str, list[float]] = field(default_factory=dict)
-    ts_embeddings: list[torch.Tensor] = field(default_factory=list)
-    ts_labels: list[str] = field(default_factory=list)
-    ts_families: list[str] = field(default_factory=list)
+    embeddings: list[torch.Tensor] = field(default_factory=list)
+    target_chunks: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+    mask_chunks: dict[str, list[torch.Tensor]] = field(default_factory=dict)
 
-    def add(self, batch: dict, metrics: dict, ts_eval: tuple) -> None:
+    def add(self, batch: dict, metrics: dict, task_eval: tuple) -> None:
         add_batch_counts(self.counts, batch)
-        embeddings, labels, families = ts_eval
-        if embeddings is not None:
-            self.ts_embeddings.append(embeddings)
-            self.ts_labels.extend(labels)
-            self.ts_families.extend(families)
+        embeddings, targets, masks = task_eval
+        self.embeddings.append(embeddings)
+        for task in targets:
+            self.target_chunks.setdefault(task, []).append(targets[task])
+            self.mask_chunks.setdefault(task, []).append(masks[task])
         for key, value in metrics.items():
             self.metric_values.setdefault(key, []).append(float(value))
 
@@ -98,9 +98,12 @@ def train(cfg: DictConfig) -> None:
         load_checkpoint(model, str(init_checkpoint or resume_checkpoint))
         if init_checkpoint:
             logger.info("warm start uses a fresh optimizer and schedule")
-    # Encode each split's complete label banks once.
-    train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
-    val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
+    label_bank = build_text_label_bank(
+        model,
+        train_ds.task_labels,
+        train_ds.task_positive_rates,
+        device,
+    )
     free, total = torch.cuda.mem_get_info()
     logger.info(
         "GPU memory after load: %.2f / %.2f GiB",
@@ -150,13 +153,8 @@ def train(cfg: DictConfig) -> None:
 
     trainable = [param for param in model.parameters() if param.requires_grad]
     window = AccumulationWindow()
-    cumulative_counts: Counter[str] = Counter()
     opt_step = int(resume_progress["step"]) if resume_progress else 0
-    best_value = (
-        float(resume_progress.get("best_value", float("-inf")))
-        if resume_progress
-        else float("-inf")
-    )
+    best_value = float(resume_progress.get("best_value", float("-inf"))) if resume_progress else float("-inf")
     start_epoch = int(resume_progress.get("next_epoch", 0)) if resume_progress else 0
     start_batch_index = int(resume_progress.get("next_batch_index", 0)) if resume_progress else 0
     if start_batch_index % grad_accum:
@@ -187,12 +185,11 @@ def train(cfg: DictConfig) -> None:
             sync_context = nullcontext() if sync_now else accelerator.no_sync(model)
             with sync_context:
                 with accelerator.autocast():
-                    loss, metrics, micro_eval = _compute_losses(
+                    loss, metrics, micro_eval = compute_losses(
                         model,
                         batch,
                         cfg,
-                        world_size=world_size,
-                        label_bank=train_label_bank,
+                        label_bank=label_bank,
                     )
                 window.add(batch, metrics, micro_eval)
                 accelerator.backward(loss / window_size)
@@ -202,11 +199,12 @@ def train(cfg: DictConfig) -> None:
 
             metrics = {key: sum(values) / len(values) for key, values in window.metric_values.items()}
             metrics["grad_norm"] = float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
-            window_metrics = _score_ts(
-                window.ts_embeddings,
-                window.ts_labels,
-                window.ts_families,
-                train_label_bank,
+            window_metrics = score_tasks(
+                window.embeddings,
+                window.target_chunks,
+                window.mask_chunks,
+                label_bank,
+                base_model.log_logit_scale,
                 world_size=world_size,
             )
             optimizer.step()
@@ -217,30 +215,11 @@ def train(cfg: DictConfig) -> None:
 
             metrics = _allreduce_metrics(metrics, device, world_size)
             counts = _allreduce_counts(window.counts, device, world_size)
-            cumulative_counts.update(counts)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
                 metrics.update(window_metrics)
                 if wandb_run is not None:
-                    payload = _metric_groups("train", metrics, counts)
-                    skipped_total = sum(
-                        cumulative_counts[f"n/skipped_{kind}"]
-                        for kind in ("image", "video", "signal")
-                    )
-                    valid_total = (
-                        cumulative_counts["n/img_image"]
-                        + cumulative_counts["n/img_video"]
-                        + cumulative_counts["n/ts_signal"]
-                    )
-                    for kind in ("image", "video", "signal"):
-                        payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(
-                            cumulative_counts[f"n/skipped_{kind}"]
-                        )
-                    payload["train-aux/n/skipped_cumulative/total"] = float(skipped_total)
-                    payload["train-aux/skipped_fraction_cumulative"] = skipped_total / max(
-                        valid_total + skipped_total,
-                        1,
-                    )
+                    payload = metric_groups("train", metrics, counts)
                     wandb_run.log(
                         {
                             **payload,
@@ -253,12 +232,12 @@ def train(cfg: DictConfig) -> None:
                     )
 
             if validate_now:
-                val_metrics, per_class = _run_validation(
+                val_metrics, per_label = run_validation(
                     model,
                     val_loader,
                     cfg,
                     accelerator,
-                    label_bank=val_label_bank,
+                    label_bank=label_bank,
                 )
                 if is_main:
                     current = val_metrics[cfg.train.best_metric]
@@ -273,20 +252,18 @@ def train(cfg: DictConfig) -> None:
                         if is_best:
                             payload.update({"best/metric": current, "best/step": opt_step})
                         columns = (
-                            "class_id",
+                            "task",
                             "label",
                             "support",
                             "predicted",
                             "precision",
                             "recall",
                             "f1",
-                            "recall_at_5",
                         )
-                        for family, rows in per_class.items():
-                            payload[f"val-aux/per_class/{family}"] = wandb.Table(
-                                columns=list(columns),
-                                data=[[row[column] for column in columns] for row in rows],
-                            )
+                        payload["val-aux/per_label/tactile"] = wandb.Table(
+                            columns=list(columns),
+                            data=[[row[column] for column in columns] for row in per_label],
+                        )
                         wandb_run.log(payload, step=opt_step, commit=True)
                     save_checkpoint(
                         base_model,
@@ -312,13 +289,9 @@ def train(cfg: DictConfig) -> None:
         if wandb_run is not None:
             wandb_run.finish()
         logger.info(
-            "training complete: best %s=%.4f; skipped=%s; final=%s",
+            "training complete: best %s=%.4f; final=%s",
             cfg.train.best_metric,
             best_value,
-            {
-                kind: cumulative_counts[f"n/skipped_{kind}"]
-                for kind in ("image", "video", "signal")
-            },
             out_dir / "final",
         )
     accelerator.wait_for_everyone()

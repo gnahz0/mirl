@@ -4,8 +4,8 @@
 #   sbatch examples/mirl/slurm/run_stage1_b200.sbatch
 #
 # The YAML is the experiment definition; this file only supplies cluster paths,
-# credentials, caches, and four-GPU launch settings.
-#SBATCH --job-name=tactile_4tok
+# credentials, caches, and two-GPU launch settings.
+#SBATCH --job-name=tactile_structured
 #SBATCH --partition=b200-batch
 #SBATCH --account=ppliang_mit
 #SBATCH --nodes=1
@@ -15,8 +15,8 @@
 #SBATCH --time=24:00:00
 #SBATCH --exclude=b0028,b0024,b0012
 #SBATCH --chdir=/tmp
-#SBATCH --output=/work/mit/ppliang_mit/alecz/mirl-qwen35-tactile/logs/tactile_%j.out
-#SBATCH --error=/work/mit/ppliang_mit/alecz/mirl-qwen35-tactile/logs/tactile_%j.out
+#SBATCH --output=/work/mit/ppliang_mit/alecz/mirl-qwen35-tactile/logs/tactile_structured_%j.out
+#SBATCH --error=/work/mit/ppliang_mit/alecz/mirl-qwen35-tactile/logs/tactile_structured_%j.out
 
 set -eo pipefail
 ulimit -n 65536 2>/dev/null || true
@@ -35,9 +35,9 @@ export XDG_CACHE_HOME="$MIRL_CLUSTER_ROOT/.cache/xdg"
 export WANDB_DIR=/scratch/dvdai_mit/alecz/wandb
 export WANDB_PROJECT=mirl-alignment
 export WANDB_ENTITY=aleczhang-massachusetts-institute-of-technology
-export WANDB_RUN_ID="tactile-4token-${SLURM_JOB_ID}"
+export WANDB_RUN_ID="tactile-structured-${SLURM_JOB_ID}"
 export WANDB_RESUME=never
-export MIRL_OUTPUT_DIR="/scratch/dvdai_mit/alecz/checkpoints/tactile_4token_${SLURM_JOB_ID}"
+export MIRL_OUTPUT_DIR="/scratch/dvdai_mit/alecz/checkpoints/tactile_structured_${SLURM_JOB_ID}"
 mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
   "$XDG_CACHE_HOME" "$WANDB_DIR" "$MIRL_OUTPUT_DIR"
 

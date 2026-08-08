@@ -64,6 +64,8 @@ def build_loaders(
     started = time.time()
     train_ds = AlignmentDataset(
         list(cfg.data.train_files),
+        list(cfg.data.train_annotation_files),
+        list(cfg.data.tasks),
         path_rewrites=dict(cfg.data.get("path_rewrites", {})),
     )
     logger.info("train dataset: %d rows (%.1fs)", len(train_ds), time.time() - started)
@@ -74,7 +76,6 @@ def build_loaders(
         rank=rank,
         world_size=world_size,
         seed=seed,
-        signal_repeat_factors=dict(cfg.train.get("signal_repeat_factors", {})),
     )
     train_kwargs = {
         "batch_sampler": train_sampler,
@@ -93,6 +94,8 @@ def build_loaders(
     started = time.time()
     val_ds = AlignmentDataset(
         list(cfg.data.val_files),
+        list(cfg.data.val_annotation_files),
+        list(cfg.data.tasks),
         path_rewrites=dict(cfg.data.get("path_rewrites", {})),
     )
     val_sampler = HomogeneousBatchSampler(

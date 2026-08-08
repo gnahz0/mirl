@@ -20,43 +20,33 @@ matching note there.
 
 ## Stage-1 alignment invariants
 
-`alignment/` trains the Qwen3.5 vision tower on time-series pseudo-videos while
-preserving image understanding. These are the things that look like style but
-are load-bearing:
+On `tactile-ablation`, `alignment/` trains the Qwen3.5 vision tower only on
+right-glove tactile pseudo-videos. These are the load-bearing choices:
 
-**Loss reductions are load-bearing.** Distillation uses
-`F.cosine_similarity` and `torch.segment_reduce` so every visual sample has equal
-weight despite different token counts. Sensor alignment uses
-`F.binary_cross_entropy_with_logits` with SigLIP's reduction: sum candidate-pair
-losses per anchor, then take a class-balanced anchor mean. Do not mean-reduce all
-sample-label pairs; that introduces an extra `1 / K` gradient factor and starves
-families with large label banks. Changing either reduction silently rebalances
-training.
+**Loss reductions are load-bearing.** Each closed-response task uses masked
+`F.binary_cross_entropy_with_logits` over its candidate bank. The six observed
+task losses are then averaged equally so tasks with more candidates do not
+dominate. There is no classification head, projection, distillation, or video
+alignment loss.
 
-**SigLIP uses one complete text-label bank per family and split.** The family
-bias is the log-odds of `1 / K`, where `K` is that split's family-vocabulary
-size. This is 50 labels for SmellNet, 7 for ECG, and one unique open answer per
-tactile recording. `log_logit_scale` initializes to `log(1 / 0.07)` and is a
-0-dim no-decay parameter.
+**SigLIP uses one canonical text bank per tactile task.** Initial contact and
+highest pressure are six-way multi-label tasks. Force, grip stability, contact
+geometry, and local shape are single-label tasks. The frozen SigLIP2 tower
+encodes each bank once; the same train-derived bank and fixed positive-rate
+log-odds bias are used for training and validation. `log_logit_scale` initializes
+to `log(1 / 0.07)` and is a 0-dim no-decay parameter.
 
-**The clean baseline is sensor-to-text only.** SmellNet and ECG use fixed
-SigLIP2 class labels; tactile uses its complete annotated answer. All three run
-through the same family label-bank SigLIP path. SmellNet mixtures and GC-MS do
-not enter the dataset, model, or objective. Stored sensor labels are already
-clean and are passed to SigLIP2 verbatim; the loader does not alter casing.
+**The tactile baseline is sensor-to-closed-label only.** The signal parquet
+provides `glove_right`; the raw QA parquet provides the six closed-response
+annotations joined by recording stem. Open responses and video columns are not
+loaded. Duplicate identical answers collapse to one target; conflicting answers
+mask that task for that recording. A recording is retained when at least one
+selected task is observed.
 
-**Visual rows are preservation anchors, not QA examples.** Their annotation text
-is ignored, so `AlignmentDataset` expands multi-media rows and keeps one row per
-unique image/video path. Visual rows remain one-pass; low-resource signal sources
-may repeat complete shuffled passes through integer
-`train.signal_repeat_factors`. Validation remains one-pass. The sampler skips
-source groups too small to give every rank a sample. Every global microbatch has
-one media kind and one `data_source`. Images that PIL identifies specifically as
-truncated get one scoped permissive-decode retry. Remaining recognized media-load
-errors are logged and filtered per item; W&B reports per-kind, total, cumulative,
-and fractional skip statistics. An entirely unreadable rank-local batch still
-fails rather than passing an empty batch into DDP. Programming and schema errors
-remain visible.
+**Every epoch is one shuffled tactile pass.** There is no repeat factor,
+windowing, temporal crop, paired video, or free-caption row. The distributed
+batch sampler partitions each global batch across ranks without padding or
+duplicating examples. Validation also covers its complete split once.
 
 **Do not reuse Stage-1 media flattening for SFT or RL.** Those stages consume the
 annotation and must retain each dataset row as one example, load every image or
@@ -65,27 +55,23 @@ placeholders. In the current CLIMB train data, multi-image rows contain either t
 or four images with the same number of `<image>` placeholders; using only
 `images[0]` would silently discard supervision.
 
-**Labels are balanced explicitly.** Anchors with the same label
-share that label's total row weight; unique tactile answers naturally receive
-one full row weight each. Class counts are global within each source-homogeneous
-microbatch.
+**Targets keep the annotation's task structure.** Initial-contact and
+highest-pressure letter lists become multi-hot targets. The other four answers
+become one-hot targets. Candidate text includes its task context, so the same
+letter never ambiguously names labels from different questions.
 
 **Distributed uses Accelerate's standard DDP wrapper.** DDP buckets gradient
 reductions and `no_sync` skips communication during accumulation. Sensor rows
-stay local because their negatives are the complete frozen label bank, not other
-samples. One small class-count reduction preserves exact global class weighting;
-prediction metrics reduce count statistics. There is no embedding gather, string
-metadata gather, Gloo side group, or manual parameter-gradient loop.
+stay local because their negatives are fixed task banks, not other samples.
+Prediction metrics reduce only their sufficient statistics. There is no
+embedding gather, string metadata gather, Gloo side group, or manual
+parameter-gradient loop.
 
-**Selection metrics use one uniform family surface.** W&B publishes accuracy,
-macro-F1, Recall@1, Recall@5, mAP, and prediction coverage for SmellNet, ECG, and
-tactile. `overall` is the equal-family mean across all three modalities. Accuracy
-and Recall@1 are identical in this single-label ranking setup; both names remain
-available for dashboard consistency. Tactile captions are unique, so its
-Recall@1/5 and mAP remain the primary interpretation; its class-style accuracy
-and macro-F1 are additional assignment diagnostics. Training metrics cover only
-modalities present in that effective optimization batch, while validation metrics
-are computed jointly over the complete validation set.
+**Selection metrics match the task types.** W&B publishes per-task macro-F1,
+Recall@1, and mAP; single-label tasks also publish accuracy. The tactile core
+metrics are equal-task means of macro-F1, Recall@1, and mAP. Per-label support,
+prediction count, precision, recall, and F1 are logged as one validation table.
+The best checkpoint uses `val-core/f1_macro/tactile`.
 
 **Metrics carry no placeholder values.** A key is present iff its branch fired.
 Never pre-populate `loss/*` with `0.0`: a placeholder is indistinguishable from
@@ -94,10 +80,10 @@ cross-rank loss reduction uses the **static** `_REDUCED_METRIC_KEYS` list —
 deriving keys from a step's dict deadlocks when ranks disagree. Losses are
 averaged over ranks that computed them; `n/*` counts are summed.
 
-**Model construction order matters.** `frozen_visual` is a `deepcopy` of the
-freshly loaded trainable tower. Trainable encoder weights are upcast to fp32
-(bf16 mantissa rounding froze ~25% of params in an earlier run), the Qwen merger
-stays frozen, and feature normalization uses `eps=1e-6` for mixed precision.
+**Model construction order matters.** Trainable encoder weights are upcast to
+fp32 (bf16 mantissa rounding froze parameters in an earlier run), the Qwen
+merger and SigLIP2 text tower stay frozen, and feature normalization uses
+`eps=1e-6` for mixed precision.
 
 **Pseudo-videos use Qwen's own video processor.** Resize, rescale, and image
 normalization stay disabled because sensor tiles are already normalized and
@@ -136,12 +122,9 @@ schedule as the saved `last/` state.
 
 Start a new lineage: bump `WANDB_RUN_ID` *and* the checkpoint dir in the sbatch.
 `loss/*` is not comparable across objectives; prediction metrics read cosine
-similarities rather than the loss. Aggregate and per-family losses live with selection metrics under
-`val-core/`; component losses, coverage, and per-class diagnostics
-live under `val-aux/`.
-`val-core/{accuracy,f1_macro,recall_at_1,recall_at_5,map}/overall` is the
-equal-family mean across SmellNet, ECG, and tactile. Macro-F1 excludes classes
-absent from that validation sample.
+similarities rather than the loss. Aggregate loss and equal-task selection
+metrics live under `val-core/`; task losses and per-label diagnostics live under
+`val-aux/`. Macro-F1 excludes labels absent from the validation split.
 
 ## Experiment log (2026-07-27..30) — what was tried, with verdicts
 
@@ -188,12 +171,11 @@ Chapman 10 / CPSC 12; AF: Georgia 14 vs Chapman 1021), so part of any margin is
 predicting the source corpus's prior. Always quote the margin over the MAJORITY
 baseline — the probe prints both.
 
-**Raw tactile captions are retrieval labels, not reusable classes.** They are unique per row
-(1575/1575 train, 635/635 valid), and every row is included. Use each
-`ground_truth` answer as the positive for its tactile recording. Filename stems
-are metadata only and never become supervision. SigLIP2 truncates each answer to
-its 64-token text context and encodes it once. Report retrieval metrics, not
-tactile class accuracy/F1.
+**Raw tactile captions were a poor Stage-1 target.** They are unique per row
+(1575/1575 train, 635/635 valid), often exceed SigLIP2's text context, and contain
+details unavailable from pressure alone. The tactile ablation therefore uses
+the six reusable closed-response tasks above. Open responses are reserved for
+later SFT; filename stems remain join metadata only.
 
 **SmellNet's old raster destroyed its most informative channels.** Measured
 37.3% padding, 38.7% saturated, only 4.3 post-merger tokens/recording. Mechanism
