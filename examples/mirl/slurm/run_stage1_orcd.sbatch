@@ -3,6 +3,8 @@
 # Submit a fresh allocation with:
 #   sbatch examples/mirl/slurm/run_stage1_orcd.sbatch
 # Or launch it inside an existing allocation with srun.
+# OmegaConf overrides may be appended, for example:
+#   bash "$0" train.num_train_epochs=2 train.lr=3e-6
 #SBATCH --job-name=stage1-qwen35-ve
 #SBATCH --partition=pi_ppliang
 #SBATCH --account=mit_general
@@ -73,4 +75,5 @@ exec "$PYTHON_BIN" -m torch.distributed.run \
   --nnodes=1 \
   --nproc_per_node="$NUM_GPUS" \
   -m mirl_ext.alignment.trainer \
-  --config "$CONFIG"
+  --config "$CONFIG" \
+  "$@"

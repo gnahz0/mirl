@@ -31,6 +31,8 @@ from .runtime import (
     build_loaders,
     build_model,
     build_optimizer,
+    load_checkpoint,
+    load_training_state,
     maybe_init_wandb,
     save_checkpoint,
     setup_logging,
@@ -85,8 +87,17 @@ def train(cfg: DictConfig) -> None:
         out_dir,
     )
 
+    init_checkpoint = cfg.train.get("init_checkpoint")
+    resume_checkpoint = cfg.train.get("resume_checkpoint")
+    if init_checkpoint and resume_checkpoint:
+        raise ValueError("train.init_checkpoint and train.resume_checkpoint are mutually exclusive")
+
     train_ds, val_ds, train_loader, train_sampler, val_loader = build_loaders(cfg, rank, world_size, seed)
     model = build_model(cfg, device, visual_dtype)
+    if init_checkpoint or resume_checkpoint:
+        load_checkpoint(model, str(init_checkpoint or resume_checkpoint))
+        if init_checkpoint:
+            logger.info("warm start uses a fresh optimizer and schedule")
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
@@ -105,6 +116,18 @@ def train(cfg: DictConfig) -> None:
     optimizer, scheduler = build_optimizer(model, cfg, total_steps)
     model, optimizer = accelerator.prepare(model, optimizer)
     base_model = accelerator.unwrap_model(model)
+    resume_progress = None
+    if resume_checkpoint:
+        resume_progress = load_training_state(str(resume_checkpoint), optimizer, scheduler)
+        saved_steps_per_epoch = int(resume_progress["steps_per_epoch"])
+        saved_total_steps = int(resume_progress["total_steps"])
+        if saved_steps_per_epoch != steps_per_epoch or saved_total_steps != total_steps:
+            raise ValueError(
+                "resume checkpoint schedule does not match this run: "
+                f"steps_per_epoch {saved_steps_per_epoch} != {steps_per_epoch} or "
+                f"total_steps {saved_total_steps} != {total_steps}; use "
+                "train.init_checkpoint for a weights-only continuation"
+            )
     wandb_run = maybe_init_wandb(cfg) if is_main else None
     model.train()
     base_model.frozen_visual.eval()
@@ -129,13 +152,35 @@ def train(cfg: DictConfig) -> None:
     trainable = [param for param in model.parameters() if param.requires_grad]
     window = AccumulationWindow()
     cumulative_counts: Counter[str] = Counter()
-    opt_step = 0
-    best_value = float("-inf")
+    opt_step = int(resume_progress["step"]) if resume_progress else 0
+    best_value = (
+        float(resume_progress.get("best_value", float("-inf")))
+        if resume_progress
+        else float("-inf")
+    )
+    start_epoch = int(resume_progress.get("next_epoch", 0)) if resume_progress else 0
+    start_batch_index = int(resume_progress.get("next_batch_index", 0)) if resume_progress else 0
+    if start_batch_index % grad_accum:
+        raise ValueError("resume checkpoint is not at an optimizer-step boundary")
+    if start_epoch >= num_epochs:
+        raise ValueError(
+            f"resume checkpoint already completed epoch {start_epoch} of {num_epochs}; "
+            "use train.init_checkpoint to start a new schedule"
+        )
+    if resume_progress:
+        logger.info(
+            "resuming at optimizer step %d, epoch %d, microbatch %d",
+            opt_step,
+            start_epoch,
+            start_batch_index,
+        )
     optimizer.zero_grad(set_to_none=True)
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         train_sampler.set_epoch(epoch)
         for batch_index, batch in enumerate(train_loader):
+            if epoch == start_epoch and batch_index < start_batch_index:
+                continue
             window_start = (batch_index // grad_accum) * grad_accum
             window_size = min(grad_accum, micro_batches_per_epoch - window_start)
             end_of_epoch = batch_index + 1 == micro_batches_per_epoch
@@ -244,6 +289,21 @@ def train(cfg: DictConfig) -> None:
                                 data=[[row[column] for column in columns] for row in rows],
                             )
                         wandb_run.log(payload, step=opt_step, commit=True)
+                    save_checkpoint(
+                        base_model,
+                        out_dir / "last",
+                        cfg,
+                        opt_step,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        progress={
+                            "best_value": best_value,
+                            "next_epoch": epoch + int(end_of_epoch),
+                            "next_batch_index": 0 if end_of_epoch else batch_index + 1,
+                            "steps_per_epoch": steps_per_epoch,
+                            "total_steps": total_steps,
+                        },
+                    )
                 accelerator.wait_for_everyone()
 
             window = AccumulationWindow()

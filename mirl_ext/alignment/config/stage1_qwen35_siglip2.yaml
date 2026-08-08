@@ -39,6 +39,8 @@ loss:
 
 train:
   seed: 42
+  init_checkpoint: null
+  resume_checkpoint: null
   # Repeat complete shuffled passes over low-resource signal sources. Values are
   # positive integers; omitted sources and all visual sources repeat once.
   # Validation is always one-pass. These factors approximate square-root

@@ -104,6 +104,12 @@ normalization stay disabled because sensor tiles are already normalized and
 aligned. Semantic boundaries must land on 32px (patch 16 × merger 2×2) so a
 merged token never spans two sensors/leads.
 
+**Zero MAD falls back to the full standard deviation.** SmellNet quantization
+and sparse tactile traces can have `MAD=0` while `std>0`. In that case robust
+normalization uses `std`, not the usual `0.7 * MAD + 0.3 * std` blend; otherwise
+a one-count excursion is artificially amplified by `1 / 0.3`. Truly constant
+rows still map to zero.
+
 ## Running it
 
 ```bash
@@ -120,8 +126,11 @@ The trainer derives optimizer steps per epoch as
 `ceil(len(train_loader) / grad_accum_steps)` and flushes the final partial
 accumulation window. `val_every` is an optimizer-step interval; warmup is
 configured as a fraction of the complete run with `warmup_ratio`. Validation
-saves the best encoder and the run saves one final encoder; there is no partial
-optimizer state to present as a resumable checkpoint.
+saves the best encoder and a resumable `last/` checkpoint containing optimizer
+and scheduler state; the run also saves one lightweight final encoder.
+`train.init_checkpoint` is a weights-only continuation with a fresh schedule.
+`train.resume_checkpoint` requires the same sampler geometry and planned total
+schedule as the saved `last/` state.
 
 ## When changing the objective
 
@@ -186,7 +195,7 @@ are metadata only and never become supervision. SigLIP2 truncates each answer to
 its 64-token text context and encodes it once. Report retrieval metrics, not
 tactile class accuracy/F1.
 
-**SmellNet's raster is destroying its most informative channels.** Measured
+**SmellNet's old raster destroyed its most informative channels.** Measured
 37.3% padding, 38.7% saturated, only 4.3 post-merger tokens/recording. Mechanism
 (verified on raw CSVs, and NOT "dead sensors"): the base sensors are integer-valued
 with a 1-10 count dynamic range, so >50% of samples sit at exactly the median,
@@ -195,6 +204,8 @@ quantization step saturates to +-1. A truly constant channel renders 0 (harmless
 the killer is near-constant. Worst observed: `avocado_6` C2H5OH 47.6% saturated.
 Upstream's masking ablation ranks exactly these channels most important
 (LPG -28.9, Alcohol -26.5 with differencing on).
+The current temporal renderer keeps every native timestep and falls back to the
+full `std` whenever MAD is zero; the measurements above are historical.
 
 **ECG uses temporal tokens.** Every scalar-family token covers about 64 ordered
 timesteps from one channel. This replaced the coarse 1,024-step image raster and

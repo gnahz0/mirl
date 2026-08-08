@@ -89,11 +89,16 @@ The families share a `[-1, 1]` numeric contract. Smell sensor rows and tactile
 taxels use robust normalization over time. ECG uses `clip(x, -4, 4) / 4`
 because the stored tensors are already per-lead z-scored.
 
-Robustly normalized rows use:
+Robustly normalized rows normally use:
 
 `scale = 0.7 * (MAD / 0.6745) + 0.3 * std`
 
 `pixel = tanh((value - median) / (2 * scale))`
+
+When `MAD / 0.6745 <= 1e-6`, `scale` falls back to the full standard
+deviation. This preserves contrast in quantized or sparse traces instead of
+shrinking their scale to `0.3 * std`. If both statistics are zero, the scale is
+clamped to `1e-6` and the constant row maps exactly to zero.
 
 MAD is weighted over std (0.7/0.3) because outlier resistance is the whole point
 of using MAD; an even split re-injects the std's spike sensitivity. The tanh gain
@@ -175,6 +180,11 @@ produces 2,303 tokens.
 - The production schedule is one sampler epoch. Validation runs every 200 steps
   over the complete one-pass sensor validation sampler, visiting every SmellNet,
   ECG, and tactile validation recording once.
+- `train.init_checkpoint` warm-starts the encoder and learned temperature with a
+  fresh optimizer and schedule. `train.resume_checkpoint` additionally restores
+  optimizer and scheduler state from a matching `last/` checkpoint. Validation
+  overwrites `last/` at optimizer-step boundaries while `best/` and `final/`
+  remain lightweight model exports.
 - Every signal family logs accuracy, macro-F1, Recall@1, Recall@5, and mAP.
   `overall` is their equal-family mean across SmellNet, ECG, and tactile;
   checkpoint selection uses `val-core/f1_macro/overall`. Tactile Recall@1/5 and

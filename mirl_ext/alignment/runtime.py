@@ -8,6 +8,7 @@ import math
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -176,13 +177,75 @@ def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_step
     return optimizer, scheduler
 
 
-def save_checkpoint(model: MultimodalAlignmentModel, path: Path, cfg: DictConfig, step: int) -> None:
+def _checkpoint_file(path: str | Path, filename: str) -> Path:
+    path = Path(path)
+    return path / filename if path.is_dir() or not path.suffix else path
+
+
+def _atomic_torch_save(state: dict, path: Path) -> None:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    torch.save(state, temporary)
+    temporary.replace(path)
+
+
+def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> int:
+    """Warm-start trainable model weights from an alignment checkpoint."""
+    state_path = _checkpoint_file(path, "alignment_state.pt")
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
+    model.trainable_visual.load_state_dict(state["trainable_visual"], strict=True)
+    with torch.no_grad():
+        model.log_logit_scale.copy_(state["log_logit_scale"])
+        if "logit_bias" in state and hasattr(model, "logit_bias"):
+            model.logit_bias.copy_(state["logit_bias"])
+    step = int(state.get("step", 0))
+    logger.info("loaded alignment checkpoint %s (step=%d)", state_path, step)
+    return step
+
+
+def load_training_state(path: str | Path, optimizer, scheduler) -> dict[str, Any]:
+    """Restore optimizer/scheduler state saved at an optimizer-step boundary."""
+    state_path = _checkpoint_file(path, "trainer_state.pt")
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
+    optimizer.load_state_dict(state.pop("optimizer"))
+    scheduler.load_state_dict(state.pop("scheduler"))
+    logger.info("loaded trainer state %s (step=%d)", state_path, int(state["step"]))
+    return state
+
+
+def save_checkpoint(
+    model: MultimodalAlignmentModel,
+    path: Path,
+    cfg: DictConfig,
+    step: int,
+    *,
+    optimizer=None,
+    scheduler=None,
+    progress: dict[str, Any] | None = None,
+) -> None:
+    """Save model weights and, when supplied, resumable trainer state."""
     path.mkdir(parents=True, exist_ok=True)
     state = {
         "trainable_visual": model.trainable_visual.state_dict(),
         "log_logit_scale": model.log_logit_scale.detach().cpu(),
         "step": step,
     }
-    torch.save(state, path / "alignment_state.pt")
+    if hasattr(model, "logit_bias"):
+        state["logit_bias"] = model.logit_bias.detach().cpu()
+    _atomic_torch_save(state, path / "alignment_state.pt")
+    if (optimizer is None) != (scheduler is None):
+        raise ValueError("optimizer and scheduler must be saved together")
+    if optimizer is not None:
+        trainer_state = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step": step,
+            **(progress or {}),
+        }
+        _atomic_torch_save(trainer_state, path / "trainer_state.pt")
     OmegaConf.save(cfg, path / "config.yaml")
-    logger.info("checkpoint saved to %s (step=%d)", path, step)
+    logger.info(
+        "checkpoint saved to %s (step=%d, trainer_state=%s)",
+        path,
+        step,
+        optimizer is not None,
+    )

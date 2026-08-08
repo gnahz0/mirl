@@ -42,6 +42,11 @@ loss:
 
 train:
   seed: 42
+  # init_checkpoint loads encoder/scalar weights into a fresh optimizer and
+  # schedule. resume_checkpoint instead restores the matching `last/` trainer
+  # state and must use the same planned schedule and sampler geometry.
+  init_checkpoint: null
+  resume_checkpoint: null
   signal_repeat_factors:
     smellnet_base: 13
     haptic_tactile: 5

@@ -37,6 +37,19 @@ def test_scalar_rendering_preserves_values_geometry_and_missing_masks():
     assert torch.equal(frames[0, 0, 0, :7], expected[0])
 
 
+def test_robust_normalization_uses_std_when_mad_is_zero():
+    sparse = torch.tensor([[0.0, 0.0, 0.0, 10.0]])
+    constant = torch.full((1, 4), 5.0)
+    values = torch.cat((sparse, constant))
+
+    normalized = MultimodalAlignmentModel._robust_normalize_rows(values)
+    std = sparse.std(dim=-1, keepdim=True, unbiased=False)
+    expected_sparse = torch.tanh(sparse / (2.0 * std))
+
+    torch.testing.assert_close(normalized[0], expected_sparse[0])
+    assert torch.equal(normalized[1], torch.zeros_like(normalized[1]))
+
+
 def test_tactile_rendering_uses_one_rgb_cell_per_full_frame():
     model = _renderer()
     tactile = torch.randn(47, 16, 16)

@@ -206,14 +206,18 @@ class MultimodalAlignmentModel(nn.Module):
 
     @staticmethod
     def _robust_normalize_rows(x: torch.Tensor) -> torch.Tensor:
-        """Normalize each row with a median/MAD/std blend into ``[-1, 1]``."""
+        """Normalize each row with a robust scale and a std fallback."""
         x = torch.nan_to_num(x.float())
         median = x.median(dim=-1, keepdim=True).values
         centered = x - median
         mad = centered.abs().median(dim=-1, keepdim=True).values / 0.6745
         std = x.std(dim=-1, keepdim=True, unbiased=False)
         mad_blend, tanh_gain = 0.7, 2.0
-        scale = (mad_blend * mad + (1.0 - mad_blend) * std).clamp_min(1e-6)
+        blended = mad_blend * mad + (1.0 - mad_blend) * std
+        # Quantized or sparse traces can have MAD=0 despite carrying variation.
+        # In that case, use the full standard deviation instead of shrinking it
+        # by the blend's 0.3 coefficient. Constant rows still map exactly to 0.
+        scale = torch.where(mad > 1e-6, blended, std).clamp_min(1e-6)
         return torch.tanh(centered / (tanh_gain * scale))
 
     def _timeseries_frames(self, signal: torch.Tensor, prestandardized: bool = False) -> torch.Tensor:
