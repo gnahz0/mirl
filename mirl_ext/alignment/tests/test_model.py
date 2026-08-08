@@ -10,7 +10,7 @@ from mirl_ext.alignment.model import MultimodalAlignmentModel, _enable_block_che
 def _renderer() -> MultimodalAlignmentModel:
     model = MultimodalAlignmentModel.__new__(MultimodalAlignmentModel)
     torch.nn.Module.__init__(model)
-    model.frame_side = 32
+    model.frame_side = 64
     return model
 
 
@@ -27,12 +27,12 @@ def test_robust_normalization_uses_std_when_mad_is_zero():
     assert torch.equal(normalized[1], torch.zeros_like(normalized[1]))
 
 
-def test_tactile_rendering_uses_one_rgb_cell_per_full_frame():
+def test_tactile_rendering_uses_four_spatial_tokens_per_frame():
     model = _renderer()
     tactile = torch.randn(47, 16, 16)
     frames = model._tactile_frames(tactile)
 
-    assert frames.shape == (47, 3, 32, 32)
+    assert frames.shape == (47, 3, 64, 64)
     assert torch.equal(frames[:, 0], frames[:, 1])
     assert torch.equal(frames[:, 1], frames[:, 2])
     assert frames.min() >= -1 and frames.max() <= 1

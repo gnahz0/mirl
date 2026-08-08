@@ -76,7 +76,7 @@ class MultimodalAlignmentModel(nn.Module):
             _enable_block_checkpointing(self.trainable_visual)
 
         config = self.trainable_visual.config
-        self.frame_side = int(config.patch_size) * int(config.spatial_merge_size)
+        self.frame_side = 2 * int(config.patch_size) * int(config.spatial_merge_size)
         siglip_root = _resolve_snapshot(siglip2_text_path)
         self.label_tokenizer = AutoTokenizer.from_pretrained(siglip_root, local_files_only=True)
         self.label_text_model = Siglip2TextModel.from_pretrained(
