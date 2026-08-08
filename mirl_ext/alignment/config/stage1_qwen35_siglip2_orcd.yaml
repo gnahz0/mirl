@@ -8,6 +8,7 @@ data:
     - ${data.root}/haptic_ts_train.parquet
   val_files:
     - ${data.root}/haptic_ts_valid.parquet
+  max_tokens_per_sample: 1024
 
   # These Parquets were built on the previous cluster. Rewrite only embedded
   # paths in memory; the source indexes remain unchanged.

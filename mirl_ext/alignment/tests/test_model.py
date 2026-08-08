@@ -11,6 +11,7 @@ def _renderer() -> MultimodalAlignmentModel:
     model = MultimodalAlignmentModel.__new__(MultimodalAlignmentModel)
     torch.nn.Module.__init__(model)
     model.frame_side = 64
+    model.max_frames = 512
     return model
 
 
@@ -27,12 +28,12 @@ def test_robust_normalization_uses_std_when_mad_is_zero():
     assert torch.equal(normalized[1], torch.zeros_like(normalized[1]))
 
 
-def test_tactile_rendering_uses_four_spatial_tokens_per_frame():
+def test_tactile_rendering_uses_four_spatial_tokens_and_1024_token_cap():
     model = _renderer()
-    tactile = torch.randn(47, 16, 16)
-    frames = model._tactile_frames(tactile)
+    tactile = torch.randn(600, 16, 16)
+    frames = model._tactile_frames(tactile[: model.max_frames])
 
-    assert frames.shape == (47, 3, 64, 64)
+    assert frames.shape == (512, 3, 64, 64)
     assert torch.equal(frames[:, 0], frames[:, 1])
     assert torch.equal(frames[:, 1], frames[:, 2])
     assert frames.min() >= -1 and frames.max() <= 1

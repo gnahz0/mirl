@@ -130,6 +130,7 @@ def build_model(
         visual_dtype=visual_dtype,
         gradient_checkpointing=bool(cfg.model.gradient_checkpointing),
         contrastive_temperature=cfg.loss.temperature,
+        max_tokens_per_sample=int(cfg.data.max_tokens_per_sample),
     ).to(device)
     trainable = [param for param in model.parameters() if param.requires_grad]
     # Keep fp32 master weights while autocast handles bf16 forward operations.
