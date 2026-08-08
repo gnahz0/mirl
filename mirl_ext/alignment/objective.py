@@ -134,7 +134,6 @@ def _run_validation(
     if was_training:
         model.train()
         base_model = accelerator.unwrap_model(model)
-        base_model.frozen_visual.eval()
         base_model.label_text_model.eval()
 
     out = _metric_groups("val", averaged, bucket_totals, prediction_metrics)
@@ -189,16 +188,10 @@ def _compute_losses(
     """Compute family label-bank SigLIP and frozen-Qwen preservation losses."""
     metrics: dict[str, float] = {}
 
-    kind = batch["kind"]
     media = batch["media"]
     family = batch["family"]
     labels = batch["text"]
-    feat_img, feat_ref_img, img_token_counts, feat_ts, log_logit_scale = model(
-        kind,
-        media,
-        family,
-        int(cfg.data.max_image_tokens),
-    )
+    feat_ts, log_logit_scale = model(media)
 
     total = log_logit_scale.float() * 0.0
 
@@ -216,30 +209,6 @@ def _compute_losses(
         total = total + float(cfg.loss.siglip_weight) * l_ts
         metrics["loss/siglip"] = l_ts.detach().item()
         metrics[f"loss/ts_{family}"] = l_ts.detach().item()
-
-    visual_sample_loss = total.new_empty(0)
-    if feat_img is not None:
-        token_loss = 1.0 - F.cosine_similarity(
-            feat_img.float(),
-            feat_ref_img.detach().float(),
-            dim=-1,
-            eps=1e-6,
-        )
-        visual_sample_loss = torch.segment_reduce(
-            token_loss,
-            reduce="mean",
-            lengths=img_token_counts,
-        )
-
-    visual_count = log_logit_scale.new_tensor(visual_sample_loss.numel())
-    if world_size > 1:
-        dist.all_reduce(visual_count, op=dist.ReduceOp.SUM)
-    global_visual_count = int(visual_count.item())
-    if global_visual_count:
-        # DDP averages rank gradients; this preserves the exact global sample mean.
-        l_img = visual_sample_loss.sum() * world_size / global_visual_count
-        total = total + float(cfg.loss.distill_weight) * l_img
-        metrics["loss/distill"] = l_img.detach().item()
 
     metrics["loss/total"] = total.detach().item()
     metrics["logit_scale"] = log_logit_scale.detach().exp().item()

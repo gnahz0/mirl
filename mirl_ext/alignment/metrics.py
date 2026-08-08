@@ -7,16 +7,13 @@ import torch
 import torch.distributed as dist
 
 # Metric reduction order must be identical on every rank.
-_TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
-_CLASSIFICATION_FAMILIES = ("smellnet", "ecg")
-_PUBLIC_STATS = ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
+_TS_FAMILIES: tuple[str, ...] = ("tactile",)
+_CLASSIFICATION_FAMILIES: tuple[str, ...] = ()
+_PUBLIC_STATS = ("recall_at_1", "recall_at_5", "map")
 
 _REDUCED_METRIC_KEYS = (
     "loss/siglip",
-    "loss/ts_smellnet",
-    "loss/ts_ecg",
     "loss/ts_tactile",
-    "loss/distill",
     "loss/total",
 )
 
@@ -230,7 +227,7 @@ def _metric_groups(
     out[f"{aux}/n/skipped/total"] = float(skipped_total)
     out[f"{aux}/skipped_fraction"] = skipped_total / max(valid_total + skipped_total, 1)
 
-    for name in ("siglip", "distill"):
+    for name in ("siglip",):
         key = f"loss/{name}"
         if key in loss_metrics:
             out[f"{aux}/loss/{name}"] = loss_metrics[key]

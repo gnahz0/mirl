@@ -1,4 +1,4 @@
-# Stage 1: train Qwen3.5's vision encoder on native time series and preserve images.
+# Tactile ablation: train Qwen3.5's vision encoder only on native tactile signals.
 # Experiment history and rationale live in mirl_ext/CLAUDE.md.
 
 log_level: INFO
@@ -6,27 +6,9 @@ log_level: INFO
 data:
   root: ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}
   train_files:
-    - ${data.root}/smellnet_train_clean.parquet
-    - ${data.root}/ecg_train_nan_filtered.parquet
     - ${data.root}/haptic_ts_train.parquet
-    - ${data.root}/climb_train.parquet
-    - ${data.root}/human_behaviour_train.parquet
-    - ${data.root}/tactile_train.parquet
   val_files:
-    - ${data.root}/smellnet_valid_clean.parquet
-    - ${data.root}/ecg_valid_nan_filtered.parquet
     - ${data.root}/haptic_ts_valid.parquet
-    - ${data.root}/climb_valid.parquet
-    - ${data.root}/human_behaviour_valid.parquet
-    - ${data.root}/tactile_valid.parquet
-  # The loader excludes mixtures; Stage 1 learns the 50-way base-substance task.
-
-  # Batches contain one media kind and one data_source.
-
-  max_video_frames: 8
-  # Images use at most 1024 merged tokens; videos retain Qwen's native budgets.
-  max_image_tokens: 1024
-
 model:
   qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
   siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
@@ -35,18 +17,12 @@ model:
 loss:
   temperature: 0.07
   siglip_weight: 1.0
-  distill_weight: 1.0
 
 train:
   seed: 42
   init_checkpoint: null
   resume_checkpoint: null
-  # Repeat complete shuffled passes over low-resource signal sources. Values are
-  # positive integers; omitted sources and all visual sources repeat once.
-  # Validation is always one-pass. These factors approximate square-root
-  # balancing without requiring a sampling exponent.
   signal_repeat_factors:
-    smellnet_base: 13
     haptic_tactile: 5
   # Four GPUs and two-step accumulation give a global batch of up to 256.
   batch_size: 32
@@ -63,11 +39,10 @@ train:
   amp_dtype: bf16
   val_every: 200
   val_batch_size: 256
-  # Tactile uses retrieval metrics rather than class F1 because captions are unique.
-  best_metric: val-core/f1_macro/overall
-  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35}
+  best_metric: val-core/map/tactile
+  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/tactile_ablation}
 
 wandb:
   enable: true
   project: mirl-alignment
-  name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_siglip2}
+  name: ${oc.env:WANDB_RUN_ID,tactile_ablation}

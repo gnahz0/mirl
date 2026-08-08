@@ -1,26 +1,17 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Lazy media and native-signal loading for Stage-1 alignment."""
+"""Native tactile loading and source-homogeneous batching."""
 
 from __future__ import annotations
 
 import logging
-import os
 import random
 
-import numpy as np
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, Sampler
 
+_SIGNAL_FAMILIES = ("tactile",)
 logger = logging.getLogger(__name__)
-
-# Select the video backend before worker imports.
-os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
-os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
-
-
-_SIGNAL_FAMILIES = ("smellnet", "ecg", "tactile")
-_SKIPPABLE_LOAD_ERRORS = (OSError, ValueError, RuntimeError, EOFError)
 
 
 def _rewrite_path(path: str, rewrites: tuple[tuple[str, str], ...]) -> str:
@@ -32,319 +23,58 @@ def _rewrite_path(path: str, rewrites: tuple[tuple[str, str], ...]) -> str:
 
 
 def _rewrite_media_paths(row: dict, rewrites: tuple[tuple[str, str], ...]) -> int:
-    """Translate embedded image, video, and signal paths in one Parquet row."""
+    """Translate embedded tactile paths in one Parquet row."""
     changed = 0
-    for column, primary_key in (
-        ("images", "image"),
-        ("videos", "video"),
-        ("signals", "signal"),
-    ):
-        entries = row.get(column) or []
-        for index, entry in enumerate(entries):
-            if isinstance(entry, str):
-                rewritten = _rewrite_path(entry, rewrites)
-                entries[index] = rewritten
-                changed += rewritten != entry
+    for entry in row.get("signals") or []:
+        for key in ("signal", "path"):
+            path = entry.get(key)
+            if not path:
                 continue
-            if not isinstance(entry, dict):
-                continue
-            for key in (primary_key, "path"):
-                path = entry.get(key)
-                if not path:
-                    continue
-                rewritten = _rewrite_path(str(path), rewrites)
-                entry[key] = rewritten
-                changed += rewritten != path
+            rewritten = _rewrite_path(str(path), rewrites)
+            entry[key] = rewritten
+            changed += rewritten != path
     return changed
 
 
-def _visual_entries(row: dict) -> list[tuple[str, tuple[str, str], dict | str]]:
-    """Return every physical image/video entry and its path-based key."""
-    media: list[tuple[str, tuple[str, str], dict | str]] = []
-    for column, path_key in (("images", "image"), ("videos", "video")):
-        entries = row.get(column) or []
-        for entry in entries:
-            if isinstance(entry, str):
-                path = entry
-            elif isinstance(entry, dict):
-                path = entry.get(path_key) or entry.get("path")
-            else:
-                continue
-            if path:
-                media.append((column, (column, str(path)), entry))
-    return media
-
-
-def _visual_key(row: dict) -> tuple[str, str] | None:
-    """Identify the first physical image or video in an already flattened row."""
-    entries = _visual_entries(row)
-    return entries[0][1] if entries else None
-
-
-def _expand_and_deduplicate_visual_rows(rows: list[dict]) -> tuple[list[dict], int, int]:
-    """Make one Stage-1 anchor per unique physical image or video path."""
-    seen: set[tuple[str, str]] = set()
-    unique: list[dict] = []
-    repeated = 0
-    for row in rows:
-        if row.get("signals"):
-            unique.append(row)
-            continue
-
-        # Stage 1 ignores QA text, so each physical item is an independent
-        # preservation anchor. SFT/RL must instead retain the complete ordered
-        # media list so it remains aligned with the prompt placeholders.
-        entries = _visual_entries(row)
-        if not entries:
-            unique.append(row)
-            continue
-        for column, key, entry in entries:
-            if key in seen:
-                repeated += 1
-                continue
-            seen.add(key)
-            unique.append(
-                {
-                    "data_source": row["data_source"],
-                    "images": [entry] if column == "images" else [],
-                    "videos": [entry] if column == "videos" else [],
-                }
-            )
-    return unique, len(seen), repeated
-
-
-def _signal_family(sig_entry: dict) -> str:
-    return {"": "smellnet", "ts_pt": "ecg", "tactile_pt": "tactile"}[sig_entry["format"]]
-
-
-def _load_signal_csv(path: str) -> torch.Tensor:
-    with open(path) as f:
-        header = f.readline().strip().split(",")
-    keep_idx = [i for i, name in enumerate(header) if "time" not in name.casefold()]
-    data = np.genfromtxt(
-        path,
-        delimiter=",",
-        skip_header=1,
-        usecols=keep_idx,
-        dtype=np.float32,
-    )
-    return torch.from_numpy(np.ascontiguousarray(data.T))
-
-
-def _factor_aligned_video_size(height: int, width: int, factor: int = 32) -> tuple[int, int]:
-    """Make an extreme video aspect ratio acceptable to Qwen without dropping it."""
-    def ceil_factor(value: int) -> int:
-        return ((value + factor - 1) // factor) * factor
-
-    target_height = ceil_factor(max(height, factor))
-    target_width = ceil_factor(max(width, factor))
-    # qwen-vl-utils rejects ratios above 200; use 199 to avoid a rounding edge.
-    if target_height > 199 * target_width:
-        target_width = ceil_factor((target_height + 198) // 199)
-    elif target_width > 199 * target_height:
-        target_height = ceil_factor((target_width + 198) // 199)
-    return target_height, target_width
-
-
-def _process_image_with_truncated_fallback(image: dict | str):
-    """Retry otherwise valid truncated images without hiding unrelated failures."""
-    from verl.utils.dataset.vision_utils import process_image
-
-    try:
-        return process_image(image)
-    except OSError as error:
-        message = str(error).casefold()
-        if "broken data stream" not in message and "image file is truncated" not in message:
-            raise
-
-    from PIL import ImageFile
-
-    path = image if isinstance(image, str) else image.get("image") or image.get("path")
-    logger.warning("loading truncated image %s", path)
-    previous = ImageFile.LOAD_TRUNCATED_IMAGES
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-    try:
-        return process_image(image)
-    finally:
-        ImageFile.LOAD_TRUNCATED_IMAGES = previous
-
-
-def _entry_path(entry: dict | str, primary_key: str) -> str:
-    if isinstance(entry, str):
-        return entry
-    return str(entry.get(primary_key) or entry.get("path") or "<unknown>")
-
-
-def _skipped_item(kind: str, entry: dict | str, source: str, error: Exception) -> dict:
-    primary_key = {"image": "image", "video": "video", "signal": "signal"}[kind]
-    path = _entry_path(entry, primary_key)
-    logger.warning(
-        "skipping unreadable %s source=%s path=%s (%s: %s)",
-        kind,
-        source,
-        path,
-        type(error).__name__,
-        str(error)[:240],
-    )
-    return {
-        "kind": "skipped",
-        "failed_kind": kind,
-        "path": path,
-    }
-
-
-def _process_video_with_extreme_aspect_fallback(video: dict, max_frames: int):
-    """Process a video, resizing only when Qwen rejects its raw aspect ratio."""
-    from verl.utils.dataset.vision_utils import process_video
-
-    kwargs = {
-        "image_patch_size": 16,
-        "return_video_metadata": True,
-        "nframes": max_frames,
-    }
-    try:
-        return process_video(video, **kwargs)
-    except ValueError as error:
-        if "absolute aspect ratio must be smaller" not in str(error):
-            raise
-
-    from torchcodec.decoders import VideoDecoder
-
-    path = video["video"]
-    frame = VideoDecoder(path, num_ffmpeg_threads=1)[0]
-    height, width = (int(value) for value in frame.shape[-2:])
-    resized_height, resized_width = _factor_aligned_video_size(height, width)
-    adjusted = dict(video)
-    adjusted.update(resized_height=resized_height, resized_width=resized_width)
-    logger.warning(
-        "resizing extreme-aspect video %s from %dx%d to %dx%d",
-        path,
-        height,
-        width,
-        resized_height,
-        resized_width,
-    )
-    return process_video(adjusted, **kwargs)
-
-
 class AlignmentDataset(Dataset):
-    """Yield lazily loaded image, video, or native-signal samples."""
-
     def __init__(
         self,
         data_files: list[str],
-        max_video_frames: int = 8,
         path_rewrites: dict[str, str] | None = None,
     ):
-        self.max_video_frames = max_video_frames
-
-        rows: list[dict] = []
-        for path in data_files:
-            rows.extend(pq.read_table(path).to_pylist())
-
+        self.rows = [
+            row
+            for path in data_files
+            for row in pq.read_table(path).to_pylist()
+        ]
         rewrites = tuple(
             sorted(
-                (
-                    (str(old).rstrip("/"), str(new).rstrip("/"))
-                    for old, new in (path_rewrites or {}).items()
-                ),
+                ((str(old).rstrip("/"), str(new).rstrip("/")) for old, new in (path_rewrites or {}).items()),
                 key=lambda pair: len(pair[0]),
                 reverse=True,
             )
         )
-        rewritten = sum(_rewrite_media_paths(row, rewrites) for row in rows) if rewrites else 0
-        if rewritten:
-            logger.info("rewrote %d embedded media paths", rewritten)
-
-        rows = [row for row in rows if row["data_source"] != "smellnet_mixture"]
-        rows, visual_paths, repeated = _expand_and_deduplicate_visual_rows(rows)
-        if visual_paths:
-            logger.info(
-                "kept %d unique image/video paths; removed %d repeated media entries",
-                visual_paths,
-                repeated,
-            )
-
-        vocab_sets = {family: set() for family in _SIGNAL_FAMILIES}
-        for row in rows:
-            signals = row.get("signals") or []
-            if not signals:
-                continue
-            family = _signal_family(signals[0])
-            vocab_sets[family].add(row["reward_model"]["ground_truth"])
-        self.ts_label_vocabs = {
-            family: tuple(sorted(vocab_sets[family]))
-            for family in _SIGNAL_FAMILIES
-            if vocab_sets[family]
+        if rewrites:
+            sum(_rewrite_media_paths(row, rewrites) for row in self.rows)
+        labels = {row["reward_model"]["ground_truth"] for row in self.rows}
+        self.ts_label_vocabs = {"tactile": tuple(sorted(labels))}
+        self.sampling_groups = {
+            ("signal", "haptic_tactile"): list(range(len(self.rows)))
         }
-
-        self.rows = rows
-        self.sampling_groups: dict[tuple[str, str], list[int]] = {}
-        for index, row in enumerate(self.rows):
-            signals = row.get("signals") or []
-            if signals:
-                kind = "signal"
-            else:
-                kind = "image" if row.get("images") else "video"
-            group = (kind, row["data_source"])
-            self.sampling_groups.setdefault(group, []).append(index)
-        group_sizes = {
-            f"{kind}/{source}": len(indices)
-            for (kind, source), indices in self.sampling_groups.items()
-        }
-        logger.info(
-            "AlignmentDataset: %d unique rows from %d files; groups=%s",
-            len(self.rows),
-            len(data_files),
-            group_sizes,
-        )
 
     def __len__(self) -> int:
         return len(self.rows)
 
-    def _load_signal(self, sig_entry: dict) -> tuple[torch.Tensor, str]:
-        family = _signal_family(sig_entry)
-        path = sig_entry["signal"]
-        if family == "ecg":
-            signal = torch.load(path, map_location="cpu", weights_only=False)
-            return signal.float().contiguous(), family
-        if family == "tactile":
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            signal = torch.as_tensor(payload["tactile"][sig_entry["key"]])
-            return signal.float().contiguous(), family
-        return _load_signal_csv(path), family
-
-    def __getitem__(self, idx: int) -> dict:
-        sample = self.rows[idx]
-        signals = sample.get("signals") or []
-        if signals:
-            try:
-                media, family = self._load_signal(signals[0])
-            except _SKIPPABLE_LOAD_ERRORS as error:
-                return _skipped_item("signal", signals[0], sample["data_source"], error)
-            return {
-                "kind": "signal",
-                "media": media,
-                "family": family,
-                "text": sample["reward_model"]["ground_truth"],
-            }
-
-        images = sample.get("images") or []
-        if images:
-            try:
-                media = _process_image_with_truncated_fallback(images[0])
-            except _SKIPPABLE_LOAD_ERRORS as error:
-                return _skipped_item("image", images[0], sample["data_source"], error)
-            return {"kind": "image", "media": media}
-
-        video = sample["videos"][0]
-        try:
-            media = _process_video_with_extreme_aspect_fallback(video, self.max_video_frames)
-        except _SKIPPABLE_LOAD_ERRORS as error:
-            return _skipped_item("video", video, sample["data_source"], error)
+    def __getitem__(self, index: int) -> dict:
+        row = self.rows[index]
+        signal = row["signals"][0]
+        payload = torch.load(signal["signal"], map_location="cpu", weights_only=False)
+        tactile = torch.as_tensor(payload["tactile"][signal["key"]]).float().contiguous()
         return {
-            "kind": "video",
-            "media": media,
+            "kind": "signal",
+            "media": tactile,
+            "family": "tactile",
+            "text": row["reward_model"]["ground_truth"],
         }
 
 
@@ -458,23 +188,10 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
 
 
 def collate_alignment(batch: list[dict]) -> dict:
-    """Keep variable-shape media as one source-homogeneous list."""
-    skipped = [item for item in batch if item["kind"] == "skipped"]
-    valid = [item for item in batch if item["kind"] != "skipped"]
-    if not valid:
-        paths = ", ".join(item["path"] for item in skipped[:3])
-        raise RuntimeError(
-            f"all {len(batch)} rank-local samples failed to load; refusing an empty DDP batch: {paths}"
-        )
-    kind = valid[0]["kind"]
-    skipped_counts = {
-        failed_kind: sum(item["failed_kind"] == failed_kind for item in skipped)
-        for failed_kind in ("image", "video", "signal")
-    }
     return {
-        "kind": kind,
-        "media": [item["media"] for item in valid],
-        "family": valid[0].get("family"),
-        "text": [item["text"] for item in valid] if kind == "signal" else [],
-        "skipped": skipped_counts,
+        "kind": "signal",
+        "media": [item["media"] for item in batch],
+        "family": "tactile",
+        "text": [item["text"] for item in batch],
+        "skipped": {},
     }

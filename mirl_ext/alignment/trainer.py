@@ -130,7 +130,6 @@ def train(cfg: DictConfig) -> None:
             )
     wandb_run = maybe_init_wandb(cfg) if is_main else None
     model.train()
-    base_model.frozen_visual.eval()
     base_model.label_text_model.eval()
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed_all(seed + rank)

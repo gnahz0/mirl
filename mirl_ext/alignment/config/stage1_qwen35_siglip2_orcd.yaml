@@ -1,34 +1,19 @@
-# Stage 1 on MIT ORCD: two H200s, native signals, and visual preservation.
+# Tactile ablation on MIT ORCD.
 
 log_level: INFO
 
 data:
   root: ${oc.env:MIRL_DATA_ROOT,/orcd/scratch/orcd/010/alecz/mirl-qwen35/data}
   train_files:
-    - ${data.root}/smellnet_train_clean.parquet
-    - ${data.root}/ecg_train_nan_filtered.parquet
     - ${data.root}/haptic_ts_train.parquet
-    - ${data.root}/climb_train.parquet
-    - ${data.root}/tactile_train.parquet
   val_files:
-    - ${data.root}/smellnet_valid_clean.parquet
-    - ${data.root}/ecg_valid_nan_filtered.parquet
     - ${data.root}/haptic_ts_valid.parquet
-    - ${data.root}/climb_valid.parquet
-    - ${data.root}/tactile_valid.parquet
 
   # These Parquets were built on the previous cluster. Rewrite only embedded
   # paths in memory; the source indexes remain unchanged.
   path_rewrites:
-    /scratch/dvdai_mit/alecz/align_raw/SmellNet: /orcd/home/002/alecz/scratch/alecz/SmellNet
-    /scratch/dvdai_mit/alecz/align_raw/ecg_ts: /orcd/compute/ppliang/001/high_modality/ts
     /scratch/dvdai_mit/alecz/align_raw/3DHaptic: /orcd/compute/ppliang/001/raofu/3DHaptic
-    /scratch/dvdai_mit/alecz/data/high_modality: /orcd/compute/ppliang/001/high_modality
     /scratch/dvdai_mit/alecz/data/3DHaptic: /orcd/compute/ppliang/001/raofu/3DHaptic
-
-  # The human-behavior archive is not present on ORCD.
-  max_video_frames: 8
-  max_image_tokens: 1024
 
 model:
   qwen35_path: ${oc.env:MIRL_QWEN35_PATH,/orcd/scratch/orcd/010/alecz/mirl-qwen35/models/qwen35-ve}
@@ -38,7 +23,6 @@ model:
 loss:
   temperature: 0.07
   siglip_weight: 1.0
-  distill_weight: 1.0
 
 train:
   seed: 42
@@ -48,7 +32,6 @@ train:
   init_checkpoint: null
   resume_checkpoint: null
   signal_repeat_factors:
-    smellnet_base: 13
     haptic_tactile: 5
   # Two GPUs and four-step accumulation give an effective batch of 256.
   batch_size: 32
@@ -63,10 +46,10 @@ train:
   amp_dtype: bf16
   val_every: 200
   val_batch_size: 128
-  best_metric: val-core/f1_macro/overall
-  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/orcd/scratch/orcd/010/alecz/mirl-qwen35/checkpoints/alignment_qwen35_orcd}
+  best_metric: val-core/map/tactile
+  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/orcd/scratch/orcd/010/alecz/mirl-qwen35/checkpoints/tactile_ablation}
 
 wandb:
   enable: true
   project: mirl-alignment
-  name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_siglip2_orcd}
+  name: ${oc.env:WANDB_RUN_ID,tactile_ablation_orcd}
