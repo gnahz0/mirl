@@ -12,8 +12,6 @@ data:
     - ${data.root}/climb_train.parquet
     - ${data.root}/human_behaviour_train.parquet
     - ${data.root}/tactile_train.parquet
-  train_annotation_files:
-    - ${data.root}/tactile_train.parquet
   val_files:
     - ${data.root}/smellnet_valid_clean.parquet
     - ${data.root}/ecg_valid_nan_filtered.parquet
@@ -21,17 +19,8 @@ data:
     - ${data.root}/climb_valid.parquet
     - ${data.root}/human_behaviour_valid.parquet
     - ${data.root}/tactile_valid.parquet
-  val_annotation_files:
-    - ${data.root}/tactile_valid.parquet
-  # Join these closed QA tasks onto haptic_ts by recording stem. The tactile
-  # QA file remains in train_files/val_files as a visual-preservation source.
-  tasks:
-    - initial_fingers
-    - highest_pressure
-    - force_level
-    - grip_stability
-    - contact_feature
-    - local_shape
+  # tactile_{train,valid} supplies both closed QA labels for haptic_ts and
+  # visual-preservation anchors.
   # The loader excludes mixtures; Stage 1 learns the 50-way base-substance task.
 
   # Batches contain one media kind and one data_source.

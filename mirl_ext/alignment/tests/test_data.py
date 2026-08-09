@@ -11,6 +11,7 @@ from PIL import ImageFile
 from mirl_ext.alignment.data import (
     AlignmentDataset,
     HomogeneousBatchSampler,
+    _annotation_targets,
     _factor_aligned_video_size,
     _process_image_with_truncated_fallback,
     collate_alignment,
@@ -43,30 +44,6 @@ def test_smellnet_mixture_never_enters_rows_or_label_vocab(tmp_path):
     assert len(dataset) == 2
     assert {row["data_source"] for row in dataset.rows} == {"smellnet_base"}
     assert dataset.ts_label_vocabs == {"smellnet": ("apple", "pear")}
-
-
-def test_tactile_uses_complete_ground_truth_instead_of_filename_stem(tmp_path):
-    captions = (
-        "The participant quickly lifts the teapot while maintaining a stable grasp.",
-        "The mug slips during the lift.",
-    )
-    rows = [
-        {
-            "data_source": "haptic_tactile",
-            "signals": [{"signal": f"missing-{index}.pt", "format": "tactile_pt"}],
-            "reward_model": {"ground_truth": caption},
-            "extra_info": '{"stem":"2025-10-09_recognition_lift_idx0"}',
-        }
-        for index, caption in enumerate(captions)
-    ]
-    dataset = _dataset(tmp_path, "haptic", rows)
-
-    assert dataset.ts_label_vocabs == {
-        "tactile": (
-            "The mug slips during the lift.",
-            "The participant quickly lifts the teapot while maintaining a stable grasp.",
-        ),
-    }
 
 
 def _haptic_signal_row(tensor_path, stem, caption="unused open description"):
@@ -117,7 +94,11 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
         pa.Table.from_pylist(
             [
                 _tactile_annotation("recording", "initial_fingers", "A,B,F"),
+                _tactile_annotation("recording", "highest_pressure", "B,F"),
                 _tactile_annotation("recording", "force_level", "B"),
+                _tactile_annotation("recording", "grip_stability", "A"),
+                _tactile_annotation("recording", "contact_feature", "C"),
+                _tactile_annotation("recording", "local_shape", "B"),
                 _tactile_annotation("recording", "description", "ignored free text"),
             ]
         ),
@@ -125,25 +106,20 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     )
 
     dataset = AlignmentDataset(
-        [str(data_path)],
-        annotation_files=[str(annotation_path)],
-        tasks=["initial_fingers", "force_level"],
+        [str(data_path), str(annotation_path)],
     )
     sample = dataset[0]
 
     assert torch.equal(sample["media"], tactile)
-    assert sample["targets"] == {
-        "initial_fingers": (0, 1, 5),
-        "force_level": (1,),
-    }
-    assert dataset.task_positive_rates == {
-        "initial_fingers": 0.5,
-        "force_level": 0.25,
-    }
+    assert sample["targets"]["initial_fingers"] == (0, 1, 5)
+    assert sample["targets"]["force_level"] == (1,)
+    assert dataset.task_positive_rates["initial_fingers"] == 0.5
+    assert dataset.task_positive_rates["force_level"] == 0.25
     assert dataset.ts_label_vocabs == {"smellnet": ("apple",)}
     assert set(dataset.sampling_groups) == {
         ("signal", "haptic_tactile"),
         ("signal", "smellnet_base"),
+        ("video", "initial_fingers"),
     }
 
     batch = collate_alignment([sample])
@@ -154,45 +130,12 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     assert batch["masks"]["force_level"].tolist() == [True]
 
 
-def test_structured_tactile_join_masks_conflicting_duplicate_task(tmp_path):
-    tensor_path = tmp_path / "recording.pt"
-    other_tensor_path = tmp_path / "other.pt"
-    torch.save({"tactile": {"right": torch.randn(8, 16, 16)}}, tensor_path)
-    torch.save({"tactile": {"right": torch.randn(8, 16, 16)}}, other_tensor_path)
-    data_path = tmp_path / "signals.parquet"
-    annotation_path = tmp_path / "annotations.parquet"
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                _haptic_signal_row(tensor_path, "recording"),
-                _haptic_signal_row(other_tensor_path, "other"),
-            ]
-        ),
-        data_path,
-    )
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                _tactile_annotation("recording", "initial_fingers", "A,F"),
-                _tactile_annotation("recording", "initial_fingers", "A,F"),
-                _tactile_annotation("recording", "force_level", "A"),
-                _tactile_annotation("recording", "force_level", "B"),
-                _tactile_annotation("other", "force_level", "C"),
-            ]
-        ),
-        annotation_path,
-    )
-
-    dataset = AlignmentDataset(
-        [str(data_path)],
-        annotation_files=[str(annotation_path)],
-        tasks=["initial_fingers", "force_level"],
-    )
-    batch = collate_alignment([dataset[0]])
-
-    assert dataset[0]["targets"] == {"initial_fingers": (0, 5)}
-    assert batch["masks"]["initial_fingers"].tolist() == [True]
-    assert batch["masks"]["force_level"].tolist() == [False]
+def test_structured_tactile_join_masks_conflicting_answers():
+    rows = [
+        _tactile_annotation("recording", "force_level", "A"),
+        _tactile_annotation("recording", "force_level", "B"),
+    ]
+    assert _annotation_targets(rows, {"recording"})["recording"] == {}
 
 
 def test_visual_annotations_are_deduplicated_by_media_path(tmp_path):

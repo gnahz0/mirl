@@ -9,6 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from mirl_ext.alignment.data import TASK_LABELS  # noqa: E402
 from mirl_ext.alignment.metrics import (  # noqa: E402
     _allreduce_metrics,
     _label_ranking_metrics,
@@ -85,19 +86,6 @@ def test_label_loss_uses_absent_labels_as_negatives():
         prototypes,
         scale,
     )
-    assert torch.isfinite(loss)
-
-
-def test_label_bank_handles_unique_tactile_answers():
-    captions = ["the cup slips during the lift", "the grasp remains stable"]
-    loss = _label_siglip_loss(
-        torch.eye(2),
-        captions,
-        tuple(captions),
-        torch.eye(2),
-        torch.tensor(math.log(10.0)),
-    )
-
     assert torch.isfinite(loss)
 
 
@@ -195,7 +183,7 @@ def test_structured_tactile_metrics_merge_as_one_family():
 
     assert tactile["accuracy/task/initial_fingers"] == 1.0
     assert tactile["f1_macro/task/initial_fingers"] == 1.0
-    assert tactile["recall_at_1/ts_tactile"] == 1.0
+    assert tactile["recall_at_1/ts_tactile"] == 0.5
     assert tactile["map/ts_tactile"] == 1.0
     assert merged["f1_macro/overall"] == pytest.approx(0.75)
 
@@ -207,8 +195,7 @@ def test_structured_tactile_bank_bias_uses_train_positive_rate():
 
     bank = _build_tactile_label_bank(
         TextModel(),
-        {"force_level": ("a", "b", "c", "d")},
-        {"force_level": 0.25},
+        dict.fromkeys(TASK_LABELS, 0.25),
         torch.device("cpu"),
     )
 
@@ -301,7 +288,7 @@ def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
         "tactile": (("a", "b"), z[[5, 4]]),
     }
     reports = {}
-    metrics = _ts_prediction_metrics(z, labels, families, bank, reports)
+    metrics = _merge_prediction_metrics(_ts_prediction_metrics(z, labels, families, bank, reports))
 
     for family in ("smellnet", "ecg", "tactile"):
         for stat in ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map"):
@@ -419,7 +406,7 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         }
     )
 
-    grouped = _metric_groups("train", metrics, counts)
+    grouped = _metric_groups("train", metrics, counts, metrics)
 
     assert grouped["train-core/accuracy/smellnet"] == 0.5
     assert grouped["train-core/f1_macro/overall"] == 0.4

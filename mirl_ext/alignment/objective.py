@@ -1,29 +1,18 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Stage-1 alignment objective, text-label banks, and evaluation."""
+"""Stage-1 alignment losses and text-label banks."""
 
 from __future__ import annotations
 
 import logging
 import math
-from collections import Counter, defaultdict
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from accelerate import Accelerator
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
 
-from .metrics import (
-    _TS_FAMILIES,
-    _allreduce_counts,
-    _allreduce_metrics,
-    _merge_prediction_metrics,
-    _metric_groups,
-    _tactile_prediction_metrics,
-    _ts_prediction_metrics,
-    add_batch_counts,
-)
+from .data import TASK_LABELS
+from .metrics import _TS_FAMILIES
 from .model import MultimodalAlignmentModel
 
 logger = logging.getLogger("alignment.trainer")
@@ -64,16 +53,13 @@ def _build_text_label_bank(
 @torch.no_grad()
 def _build_tactile_label_bank(
     model: MultimodalAlignmentModel,
-    task_labels: dict[str, tuple[str, ...]],
     positive_rates: dict[str, float],
     device: torch.device,
 ) -> TactileLabelBank:
     """Encode the six structured tactile task vocabularies once."""
     bank: TactileLabelBank = {}
-    for task, labels in task_labels.items():
+    for task, labels in TASK_LABELS.items():
         positive_rate = float(positive_rates[task])
-        if not 0.0 < positive_rate < 1.0:
-            raise ValueError(f"structured tactile positive rate must be in (0, 1): {task}={positive_rate}")
         embeddings = model.encode_text(list(labels), device=device).float().detach()
         bias = math.log(positive_rate / (1.0 - positive_rate))
         bank[task] = (labels, embeddings, bias)
@@ -85,143 +71,6 @@ def _build_tactile_label_bank(
             bias,
         )
     return bank
-
-
-@torch.no_grad()
-def _score_ts(
-    embeddings: list[torch.Tensor],
-    labels: list[str],
-    families: list[str],
-    label_bank: LabelBank,
-    world_size: int = 1,
-    per_class_reports: dict[str, list[dict[str, object]]] | None = None,
-) -> dict[str, float]:
-    """Score one sensor sample set against the frozen text-label bank."""
-    if not embeddings:
-        return {}
-    return _ts_prediction_metrics(
-        torch.cat(embeddings),
-        labels,
-        families,
-        label_bank,
-        world_size=world_size,
-        per_class_reports=per_class_reports,
-    )
-
-
-@torch.no_grad()
-def _score_tactile(
-    embeddings: list[torch.Tensor],
-    target_chunks: dict[str, list[torch.Tensor]],
-    mask_chunks: dict[str, list[torch.Tensor]],
-    label_bank: TactileLabelBank,
-    log_logit_scale: torch.Tensor,
-    *,
-    world_size: int = 1,
-    per_label_out: list[dict[str, object]] | None = None,
-) -> dict[str, float]:
-    """Score structured tactile targets over one accumulation/eval window."""
-    if not embeddings:
-        return {}
-    return _tactile_prediction_metrics(
-        torch.cat(embeddings),
-        {task: torch.cat(target_chunks[task]) for task in label_bank},
-        {task: torch.cat(mask_chunks[task]) for task in label_bank},
-        label_bank,
-        log_logit_scale,
-        world_size=world_size,
-        per_label_out=per_label_out,
-    )
-
-
-@torch.no_grad()
-def _run_validation(
-    model: MultimodalAlignmentModel,
-    val_loader: DataLoader,
-    cfg: DictConfig,
-    accelerator: Accelerator,
-    label_bank: LabelBank,
-    tactile_label_bank: TactileLabelBank,
-) -> tuple[
-    dict[str, float],
-    dict[str, list[dict[str, object]]],
-    list[dict[str, object]],
-]:
-    """Evaluate losses and prediction metrics over validation batches."""
-    was_training = model.training
-    model.eval()
-    device = accelerator.device
-    world_size = accelerator.num_processes
-
-    sums: dict[str, float] = {}
-    counts: dict[str, int] = {}
-    ts_embeddings: list[torch.Tensor] = []
-    ts_labels: list[str] = []
-    ts_families: list[str] = []
-    tactile_embeddings: list[torch.Tensor] = []
-    tactile_target_chunks: dict[str, list[torch.Tensor]] = defaultdict(list)
-    tactile_mask_chunks: dict[str, list[torch.Tensor]] = defaultdict(list)
-    bucket_totals: Counter[str] = Counter()
-    for batch in val_loader:
-        add_batch_counts(bucket_totals, batch)
-        with accelerator.autocast():
-            _, metrics, batch_eval = _compute_losses(
-                model,
-                batch,
-                cfg,
-                world_size=world_size,
-                label_bank=label_bank,
-                tactile_label_bank=tactile_label_bank,
-            )
-        embeddings, labels, families, tactile_targets, tactile_masks = batch_eval
-        if embeddings is not None:
-            if tactile_targets:
-                tactile_embeddings.append(embeddings)
-                for task in tactile_label_bank:
-                    tactile_target_chunks[task].append(tactile_targets[task])
-                    tactile_mask_chunks[task].append(tactile_masks[task])
-            else:
-                ts_embeddings.append(embeddings)
-                ts_labels.extend(labels)
-                ts_families.extend(families)
-        for key, value in metrics.items():
-            sums[key] = sums.get(key, 0.0) + float(value)
-            counts[key] = counts.get(key, 0) + 1
-    averaged = _allreduce_metrics(
-        {key: sums[key] / counts[key] for key in sums},
-        device,
-        world_size,
-    )
-    bucket_totals = _allreduce_counts(bucket_totals, device, world_size)
-    per_class_reports: dict[str, list[dict[str, object]]] = {}
-    standard_metrics = _score_ts(
-        ts_embeddings,
-        ts_labels,
-        ts_families,
-        label_bank,
-        world_size=world_size,
-        per_class_reports=per_class_reports,
-    )
-    per_label_report: list[dict[str, object]] = []
-    base_model = accelerator.unwrap_model(model)
-    tactile_metrics = _score_tactile(
-        tactile_embeddings,
-        tactile_target_chunks,
-        tactile_mask_chunks,
-        tactile_label_bank,
-        base_model.log_logit_scale,
-        world_size=world_size,
-        per_label_out=per_label_report,
-    )
-    prediction_metrics = _merge_prediction_metrics(standard_metrics, tactile_metrics)
-
-    if was_training:
-        model.train()
-        base_model.frozen_visual.eval()
-        base_model.label_text_model.eval()
-
-    out = _metric_groups("val", averaged, bucket_totals, prediction_metrics)
-    return out, per_class_reports, per_label_report
 
 
 def _label_siglip_loss(
@@ -268,14 +117,20 @@ def _tactile_task_siglip_loss(
     text_embeddings: torch.Tensor,
     bias: float,
     log_logit_scale: torch.Tensor,
+    world_size: int = 1,
 ) -> torch.Tensor | None:
-    """Compute one masked multi-positive SigLIP-style tactile task loss."""
+    """Compute the global mean loss for one masked tactile task."""
     mask = mask.to(z_ts.device)
-    if not mask.any():
+    observed = mask.sum()
+    if world_size > 1:
+        dist.all_reduce(observed, op=dist.ReduceOp.SUM)
+    observed_count = int(observed.item())
+    if not observed_count:
         return None
     target = targets.to(z_ts.device)[mask]
     logits = log_logit_scale.float().exp() * (z_ts[mask].float() @ text_embeddings.to(z_ts.device).float().t()) + bias
-    return F.binary_cross_entropy_with_logits(logits, target)
+    local_sum = F.binary_cross_entropy_with_logits(logits, target, reduction="sum")
+    return local_sum * world_size / (observed_count * target.shape[1])
 
 
 def _compute_losses(
@@ -284,7 +139,7 @@ def _compute_losses(
     cfg: DictConfig,
     *,
     label_bank: LabelBank,
-    tactile_label_bank: TactileLabelBank | None = None,
+    tactile_label_bank: TactileLabelBank,
     world_size: int = 1,
 ) -> tuple[torch.Tensor, dict, TSEval]:
     """Compute family label-bank SigLIP and frozen-Qwen preservation losses."""
@@ -307,9 +162,7 @@ def _compute_losses(
 
     z_ts = F.normalize(feat_ts.float(), dim=-1, eps=1e-6) if feat_ts is not None else None
     if z_ts is not None:
-        if family == "tactile" and "targets" in batch:
-            if not tactile_label_bank:
-                raise ValueError("structured tactile batch has no tactile label bank")
+        if family == "tactile":
             task_losses: dict[str, torch.Tensor] = {}
             for task, (_, text_embeddings, bias) in tactile_label_bank.items():
                 target = batch["targets"][task].to(z_ts.device)
@@ -321,14 +174,13 @@ def _compute_losses(
                     text_embeddings,
                     bias,
                     log_logit_scale,
+                    world_size,
                 )
                 if task_loss is not None:
                     task_losses[task] = task_loss
                     metrics[f"loss/task/{task}"] = task_loss.detach().item()
                 tactile_targets[task] = target.detach()
                 tactile_masks[task] = mask.detach()
-            if not task_losses:
-                raise RuntimeError("tactile batch has no observed structured task targets")
             l_ts = torch.stack(tuple(task_losses.values())).mean()
         else:
             candidate_labels, text_embeddings = label_bank[family]

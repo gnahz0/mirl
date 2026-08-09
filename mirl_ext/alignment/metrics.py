@@ -26,12 +26,10 @@ _REDUCED_METRIC_KEYS = (
 
 # Derive n/ts_signal after reducing its family counts.
 _COUNT_KEYS: tuple[str, ...] = (
-    (
-        "n/img_image",
-        "n/img_video",
-    )
-    + tuple(f"n/ts_{family}" for family in _TS_FAMILIES)
-    + tuple(f"n/skipped_{kind}" for kind in ("image", "video", "signal"))
+    "n/img_image",
+    "n/img_video",
+    *(f"n/ts_{family}" for family in _TS_FAMILIES),
+    *(f"n/skipped_{kind}" for kind in ("image", "video", "signal")),
 )
 
 
@@ -176,9 +174,8 @@ def _ts_prediction_metrics(
     per_class_reports: dict[str, list[dict[str, object]]] | None = None,
     world_size: int = 1,
 ) -> dict[str, float]:
-    """Compute honest per-family metrics and an equal-family overall score."""
+    """Compute metrics for each single-label sensor family."""
     metrics: dict[str, float] = {}
-    family_scores: dict[str, dict[str, float]] = {}
     for family in _TS_FAMILIES:
         idx = [i for i, value in enumerate(families) if value == family]
         if not idx:
@@ -199,15 +196,8 @@ def _ts_prediction_metrics(
             world_size=world_size,
             per_class_out=report_rows,
         )
-        family_scores[family] = family_metrics
         for stat in (*_PUBLIC_STATS, "prediction_coverage"):
             metrics[f"{stat}/ts_{family}"] = family_metrics[stat]
-
-    for stat in _PUBLIC_STATS:
-        values = [scores[stat] for scores in family_scores.values() if stat in scores]
-        if values:
-            metrics[f"{stat}/overall"] = sum(values) / len(values)
-
     return metrics
 
 
@@ -233,10 +223,9 @@ def _tactile_task_metrics(
     ranked = similarities.argsort(dim=1, descending=True)
     top = ranked[:, 0]
     top_is_positive = target.gather(1, top[:, None]).squeeze(1)
-    top_five_is_positive = target.gather(
-        1,
-        ranked[:, : min(5, num_labels)],
-    ).any(dim=1)
+    positive_count = target.sum(dim=1).clamp_min(1)
+    recall_at_1 = top_is_positive.float() / positive_count
+    recall_at_5 = target.gather(1, ranked[:, : min(5, num_labels)]).sum(dim=1) / positive_count
 
     ranked_target = target.gather(1, ranked).float()
     ranks = torch.arange(1, num_labels + 1, device=z.device, dtype=torch.float32)
@@ -247,7 +236,6 @@ def _tactile_task_metrics(
         predicted_mask = logits > 0
     else:
         predicted_mask = F.one_hot(top, num_classes=num_labels).bool()
-    exact_match = (predicted_mask == target).all(dim=1)
     support = target.sum(dim=0).double()
     predicted = predicted_mask.sum(dim=0).double()
     true_positive = (target & predicted_mask).sum(dim=0).double()
@@ -256,9 +244,9 @@ def _tactile_task_metrics(
             support,
             predicted,
             true_positive,
-            exact_match.double().sum().reshape(1),
             top_is_positive.double().sum().reshape(1),
-            top_five_is_positive.double().sum().reshape(1),
+            recall_at_1.double().sum().reshape(1),
+            recall_at_5.double().sum().reshape(1),
             average_precision.double().sum().reshape(1),
             target.new_tensor([len(target)], dtype=torch.float64),
         )
@@ -351,10 +339,9 @@ def _metric_groups(
     split: str,
     loss_metrics: dict[str, float],
     counts: dict[str, int],
-    prediction_metrics: dict[str, float] | None = None,
+    prediction_metrics: dict[str, float],
 ) -> dict[str, float]:
     """Build the shared train/validation W&B metric surface."""
-    prediction_metrics = loss_metrics if prediction_metrics is None else prediction_metrics
     core = f"{split}-core"
     aux = f"{split}-aux"
     out: dict[str, float] = {f"{core}/loss/aggregate": loss_metrics["loss/total"]}

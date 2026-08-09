@@ -20,15 +20,14 @@ from .metrics import (
     _allreduce_metrics,
     _merge_prediction_metrics,
     _metric_groups,
+    _tactile_prediction_metrics,
+    _ts_prediction_metrics,
     add_batch_counts,
 )
 from .objective import (
     _build_tactile_label_bank,
     _build_text_label_bank,
     _compute_losses,
-    _run_validation,
-    _score_tactile,
-    _score_ts,
 )
 from .runtime import (
     build_loaders,
@@ -70,6 +69,86 @@ class AccumulationWindow:
                 self.ts_families.extend(families)
         for key, value in metrics.items():
             self.metric_values.setdefault(key, []).append(float(value))
+
+    def score(
+        self,
+        label_bank,
+        tactile_label_bank,
+        logit_scale,
+        world_size: int,
+        per_class=None,
+        per_label=None,
+    ) -> dict[str, float]:
+        standard = (
+            _ts_prediction_metrics(
+                torch.cat(self.ts_embeddings),
+                self.ts_labels,
+                self.ts_families,
+                label_bank,
+                world_size=world_size,
+                per_class_reports=per_class,
+            )
+            if self.ts_embeddings
+            else {}
+        )
+        tactile = (
+            _tactile_prediction_metrics(
+                torch.cat(self.tactile_embeddings),
+                {task: torch.cat(self.tactile_target_chunks[task]) for task in tactile_label_bank},
+                {task: torch.cat(self.tactile_mask_chunks[task]) for task in tactile_label_bank},
+                tactile_label_bank,
+                logit_scale,
+                world_size=world_size,
+                per_label_out=per_label,
+            )
+            if self.tactile_embeddings
+            else {}
+        )
+        return _merge_prediction_metrics(standard, tactile)
+
+
+@torch.no_grad()
+def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_label_bank):
+    """Evaluate the full sharded validation set."""
+    was_training = model.training
+    model.eval()
+    world_size = accelerator.num_processes
+    window = AccumulationWindow()
+    for batch in val_loader:
+        with accelerator.autocast():
+            _, metrics, batch_eval = _compute_losses(
+                model,
+                batch,
+                cfg,
+                world_size=world_size,
+                label_bank=label_bank,
+                tactile_label_bank=tactile_label_bank,
+            )
+        window.add(batch, metrics, batch_eval)
+
+    losses = _allreduce_metrics(
+        {key: sum(values) / len(values) for key, values in window.metric_values.items()},
+        accelerator.device,
+        world_size,
+    )
+    counts = _allreduce_counts(window.counts, accelerator.device, world_size)
+    per_class: dict[str, list[dict[str, object]]] = {}
+    per_label: list[dict[str, object]] = []
+    base_model = accelerator.unwrap_model(model)
+    prediction_metrics = window.score(
+        label_bank,
+        tactile_label_bank,
+        base_model.log_logit_scale,
+        world_size,
+        per_class,
+        per_label,
+    )
+
+    if was_training:
+        model.train()
+        base_model.frozen_visual.eval()
+        base_model.label_text_model.eval()
+    return _metric_groups("val", losses, counts, prediction_metrics), per_class, per_label
 
 
 def train(cfg: DictConfig) -> None:
@@ -113,11 +192,8 @@ def train(cfg: DictConfig) -> None:
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
-    if train_ds.task_labels != val_ds.task_labels:
-        raise ValueError("train and validation structured tactile tasks do not match")
     tactile_label_bank = _build_tactile_label_bank(
         model,
-        train_ds.task_labels,
         train_ds.task_positive_rates,
         device,
     )
@@ -220,24 +296,11 @@ def train(cfg: DictConfig) -> None:
 
             metrics = {key: sum(values) / len(values) for key, values in window.metric_values.items()}
             metrics["grad_norm"] = float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
-            standard_window_metrics = _score_ts(
-                window.ts_embeddings,
-                window.ts_labels,
-                window.ts_families,
+            window_metrics = window.score(
                 train_label_bank,
-                world_size=world_size,
-            )
-            tactile_window_metrics = _score_tactile(
-                window.tactile_embeddings,
-                window.tactile_target_chunks,
-                window.tactile_mask_chunks,
                 tactile_label_bank,
                 base_model.log_logit_scale,
-                world_size=world_size,
-            )
-            window_metrics = _merge_prediction_metrics(
-                standard_window_metrics,
-                tactile_window_metrics,
+                world_size,
             )
             optimizer.step()
             lrs = {str(group["name"]).partition("_")[0]: float(group["lr"]) for group in optimizer.param_groups}
@@ -250,9 +313,8 @@ def train(cfg: DictConfig) -> None:
             cumulative_counts.update(counts)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
-                metrics.update(window_metrics)
                 if wandb_run is not None:
-                    payload = _metric_groups("train", metrics, counts)
+                    payload = _metric_groups("train", metrics, counts, window_metrics)
                     skipped_total = sum(cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal"))
                     valid_total = (
                         cumulative_counts["n/img_image"]

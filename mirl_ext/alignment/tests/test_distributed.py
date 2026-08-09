@@ -27,7 +27,7 @@ class _ToyModel(torch.nn.Module):
 
 def _worker(rank: int, results: dict) -> None:
     from mirl_ext.alignment.metrics import _label_ranking_metrics
-    from mirl_ext.alignment.objective import _label_siglip_loss
+    from mirl_ext.alignment.objective import _label_siglip_loss, _tactile_task_siglip_loss
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29517"
@@ -44,24 +44,51 @@ def _worker(rank: int, results: dict) -> None:
                 embeddings, scale = model(inputs)
                 loss = _label_siglip_loss(embeddings, labels, candidates, text, scale, world_size=2)
                 (loss / 2).backward()
-        metrics = _label_ranking_metrics(
-            embeddings.detach(), labels, candidates, text, world_size=2
-        )
+        metrics = _label_ranking_metrics(embeddings.detach(), labels, candidates, text, world_size=2)
 
         reference = _ToyModel()
         all_inputs = torch.cat((torch.tensor([[1.0, 0.0], [0.8, 0.2]]), torch.tensor([[0.0, 1.0]])))
         all_embeddings, all_scale = reference(all_inputs)
-        reference_loss = _label_siglip_loss(
-            all_embeddings, ["A", "A", "B"], candidates, text, all_scale
-        )
+        reference_loss = _label_siglip_loss(all_embeddings, ["A", "A", "B"], candidates, text, all_scale)
         reference_loss.backward()
-        reference_metrics = _label_ranking_metrics(
-            all_embeddings.detach(), ["A", "A", "B"], candidates, text
-        )
-        results[rank] = (
+        reference_metrics = _label_ranking_metrics(all_embeddings.detach(), ["A", "A", "B"], candidates, text)
+        standard_result = (
             torch.allclose(model.module.weight.grad, reference.weight.grad, atol=1e-6),
             torch.allclose(model.module.log_scale.grad, reference.log_scale.grad, atol=1e-6),
             metrics == pytest.approx(reference_metrics),
+        )
+
+        model.zero_grad()
+        reference.zero_grad()
+        embeddings, scale = model(inputs)
+        tactile_targets = (torch.tensor([[1.0, 0.0], [1.0, 0.0]]), torch.tensor([[0.0, 1.0]]))[rank]
+        tactile_mask = (torch.tensor([True, True]), torch.tensor([False]))[rank]
+        tactile_loss = _tactile_task_siglip_loss(
+            embeddings,
+            tactile_targets,
+            tactile_mask,
+            text,
+            0.0,
+            scale,
+            world_size=2,
+        )
+        assert tactile_loss is not None
+        tactile_loss.backward()
+
+        reference_embeddings, reference_scale = reference(all_inputs[:2])
+        reference_loss = _tactile_task_siglip_loss(
+            reference_embeddings,
+            torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            torch.tensor([True, True]),
+            text,
+            0.0,
+            reference_scale,
+        )
+        assert reference_loss is not None
+        reference_loss.backward()
+        results[rank] = standard_result + (
+            torch.allclose(model.module.weight.grad, reference.weight.grad, atol=1e-6),
+            torch.allclose(model.module.log_scale.grad, reference.log_scale.grad, atol=1e-6),
         )
     finally:
         dist.destroy_process_group()

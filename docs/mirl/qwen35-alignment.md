@@ -7,23 +7,22 @@
 - **Anchor VE:** a frozen copy of that same loaded tower.
 - **Label encoder:** frozen text tower from
   `google/siglip2-so400m-patch16-naflex`.
-- **Time-series loss:** class-balanced **SigLIP sigmoid**
-  ([arXiv:2303.15343](https://arxiv.org/abs/2303.15343)) against each family's
-  complete fixed label vocabulary. SigLIP2 text features are cached once; their
-  normalization is fixed and the shared temperature remains trainable. Each
-  family derives its bias from `1 / number_of_classes`.
+- **Time-series loss:** **SigLIP sigmoid**
+  ([arXiv:2303.15343](https://arxiv.org/abs/2303.15343)) against cached SigLIP2
+  text labels. SmellNet and ECG use class-balanced 50- and 7-label banks with
+  bias derived from `1 / number_of_classes`. Tactile uses six closed QA banks,
+  multi-positive targets where appropriate, and measured positive-rate biases.
 - **Preservation loss:** sample-balanced cosine distance between every
   pre-merger student and anchor encoder token on real images/videos.
 
 Transformers computes SigLIP2 loss only inside the full model forward and assumes
 a square one-image/one-text identity pairing. The sensor objective instead has a
-rectangular sample-by-label matrix, repeated positives, and class-balanced rows,
-so it uses PyTorch's equivalent `binary_cross_entropy_with_logits` primitive
-directly. Following SigLIP's reduction, it sums pair losses across the complete
-label bank for each anchor before taking the class-balanced anchor mean; averaging
-all sample-label pairs would incorrectly weaken families with larger label banks.
-Cosine preservation uses `cosine_similarity` and `segment_reduce`; there is no
-project-local loss module.
+rectangular sample-by-label matrices and repeated positives, so it uses PyTorch's
+equivalent `binary_cross_entropy_with_logits` primitive directly. SmellNet and
+ECG sum each anchor's complete label bank before a class-balanced mean. Tactile
+uses a global observed-pair mean for each task and an equal mean across its six
+tasks. Cosine preservation uses `cosine_similarity` and `segment_reduce`; there
+is no project-local loss module.
 
 The Qwen tower is not replaced by Google's standalone vision tower. Qwen3.5
 uses a Qwen-specific `Qwen3_5VisionModel` whose exact final weights are loaded
@@ -161,20 +160,22 @@ produces 2,303 tokens.
   visited once per epoch. Configured low-resource signal sources repeat complete
   independently shuffled passes. Validation is always one-pass. Source groups
   smaller than the GPU count are skipped so every rank receives a sample.
+- Repeat factors approximate square-root sampling; the three sensor families are
+  not forced to equal exposure. The six tactile task losses are weighted equally.
 - SmellNet sampling and metrics use only the 50 base substances; mixture rows
   never enter the active dataset or W&B tables.
-- The clean baseline aligns every sensor family through one complete SigLIP2
-  text-label bank per split: 50 SmellNet labels, 7 ECG labels, and one annotated
-  open answer per tactile recording. Filename-derived task stems are not used;
-  stored label casing is preserved, and each answer is truncated to SigLIP2's
-  64-token context and encoded once.
+- SmellNet and ECG align to complete 50- and 7-label SigLIP2 banks. Tactile joins
+  six closed QA tasks to pressure recordings by shared recording stem: initial
+  contact, highest pressure, force level, grip stability, contact geometry, and
+  local shape. Their choices are verbalized and encoded once. Open answers are
+  reserved for SFT and tactile videos remain preservation anchors only.
 - SmellNet, ECG, and tactile all retain their complete native time axes in both
   training and validation. One dataset row produces one sensor embedding.
 - Frozen SigLIP2 embeddings and Qwen's 1152-D pre-merger states are compared
   directly.
 - Accelerate wraps the model with standard DDP. Sensor loss is evaluated on
-  rank-local rows against the complete label bank; only class counts and metric
-  statistics are reduced across ranks.
+  rank-local rows; only small class/observation counts and metric statistics are
+  reduced across ranks.
 - AdamW uses `1e-5` for Qwen, `3e-3` for the
   temperature, weight decay `0.05`, gradient clipping `1.0`, and 3% warmup.
 - The production schedule is one sampler epoch. Validation runs every 200 steps
@@ -186,6 +187,7 @@ produces 2,303 tokens.
   overwrites `last/` at optimizer-step boundaries while `best/` and `final/`
   remain lightweight model exports.
 - Every signal family logs accuracy, macro-F1, Recall@1, Recall@5, and mAP.
-  `overall` is their equal-family mean across SmellNet, ECG, and tactile;
-  checkpoint selection uses `val-core/f1_macro/overall`. Tactile Recall@1/5 and
-  mAP remain the primary interpretation because its 635 captions are unique.
+  Accuracy is an any-positive top-1 hit; Recall@k is the fraction of a sample's
+  positive labels recovered in the top k. They coincide at k=1 for single-label
+  tasks but not for multi-positive tactile tasks. `overall` is the equal-family
+  mean, and checkpoint selection uses `val-core/f1_macro/overall`.
