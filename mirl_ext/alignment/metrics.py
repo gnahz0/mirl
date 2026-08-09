@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+
+from .data import MULTILABEL_TASKS, TASK_LABELS
 
 # Metric reduction order must be identical on every rank.
 _TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
@@ -16,16 +19,19 @@ _REDUCED_METRIC_KEYS = (
     "loss/ts_smellnet",
     "loss/ts_ecg",
     "loss/ts_tactile",
+    *(f"loss/task/{task}" for task in TASK_LABELS),
     "loss/distill",
     "loss/total",
 )
 
 # Derive n/ts_signal after reducing its family counts.
 _COUNT_KEYS: tuple[str, ...] = (
-    "n/img_image",
-    "n/img_video",
-) + tuple(f"n/ts_{family}" for family in _TS_FAMILIES) + tuple(
-    f"n/skipped_{kind}" for kind in ("image", "video", "signal")
+    (
+        "n/img_image",
+        "n/img_video",
+    )
+    + tuple(f"n/ts_{family}" for family in _TS_FAMILIES)
+    + tuple(f"n/skipped_{kind}" for kind in ("image", "video", "signal"))
 )
 
 
@@ -205,6 +211,142 @@ def _ts_prediction_metrics(
     return metrics
 
 
+@torch.no_grad()
+def _tactile_task_metrics(
+    task: str,
+    z: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    labels: tuple[str, ...],
+    text_embeddings: torch.Tensor,
+    bias: float,
+    log_logit_scale: torch.Tensor,
+    world_size: int,
+    per_label_out: list[dict[str, object]] | None,
+) -> dict[str, float]:
+    """Score one structured tactile task, including multi-positive labels."""
+    num_labels = len(labels)
+    mask = mask.to(z.device)
+    target = targets.to(z.device)[mask].bool()
+    similarities = z[mask].float() @ text_embeddings.to(z.device).float().t()
+    logits = log_logit_scale.float().exp() * similarities + bias
+    ranked = similarities.argsort(dim=1, descending=True)
+    top = ranked[:, 0]
+    top_is_positive = target.gather(1, top[:, None]).squeeze(1)
+    top_five_is_positive = target.gather(
+        1,
+        ranked[:, : min(5, num_labels)],
+    ).any(dim=1)
+
+    ranked_target = target.gather(1, ranked).float()
+    ranks = torch.arange(1, num_labels + 1, device=z.device, dtype=torch.float32)
+    precision_at_rank = ranked_target.cumsum(dim=1) / ranks
+    average_precision = (precision_at_rank * ranked_target).sum(dim=1) / (ranked_target.sum(dim=1).clamp_min(1))
+
+    if task in MULTILABEL_TASKS:
+        predicted_mask = logits > 0
+    else:
+        predicted_mask = F.one_hot(top, num_classes=num_labels).bool()
+    exact_match = (predicted_mask == target).all(dim=1)
+    support = target.sum(dim=0).double()
+    predicted = predicted_mask.sum(dim=0).double()
+    true_positive = (target & predicted_mask).sum(dim=0).double()
+    packed = torch.cat(
+        (
+            support,
+            predicted,
+            true_positive,
+            exact_match.double().sum().reshape(1),
+            top_is_positive.double().sum().reshape(1),
+            top_five_is_positive.double().sum().reshape(1),
+            average_precision.double().sum().reshape(1),
+            target.new_tensor([len(target)], dtype=torch.float64),
+        )
+    )
+    if world_size > 1:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+
+    support, predicted, true_positive = packed[:-5].reshape(3, num_labels)
+    sample_count = packed[-1]
+    precision = true_positive / predicted.clamp_min(1)
+    recall = true_positive / support.clamp_min(1)
+    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
+    supported = support > 0
+
+    if per_label_out is not None:
+        per_label_out.extend(
+            {
+                "task": task,
+                "label": label,
+                "support": int(support[index].item()),
+                "predicted": int(predicted[index].item()),
+                "precision": float(precision[index].item()),
+                "recall": float(recall[index].item()),
+                "f1": float(f1[index].item()),
+            }
+            for index, label in enumerate(labels)
+        )
+
+    return {
+        "accuracy": float(packed[-5] / sample_count),
+        "f1_macro": float(f1[supported].mean()),
+        "recall_at_1": float(packed[-4] / sample_count),
+        "recall_at_5": float(packed[-3] / sample_count),
+        "map": float(packed[-2] / sample_count),
+        "prediction_coverage": float((predicted > 0).sum()) / num_labels,
+    }
+
+
+@torch.no_grad()
+def _tactile_prediction_metrics(
+    z: torch.Tensor,
+    targets: dict[str, torch.Tensor],
+    masks: dict[str, torch.Tensor],
+    label_bank: dict[str, tuple[tuple[str, ...], torch.Tensor, float]],
+    log_logit_scale: torch.Tensor,
+    *,
+    world_size: int = 1,
+    per_label_out: list[dict[str, object]] | None = None,
+) -> dict[str, float]:
+    """Compute equal-task structured metrics for the tactile family."""
+    metrics: dict[str, float] = {}
+    task_scores: dict[str, dict[str, float]] = {}
+    for task, (labels, text_embeddings, bias) in label_bank.items():
+        scores = _tactile_task_metrics(
+            task,
+            z,
+            targets[task],
+            masks[task],
+            labels,
+            text_embeddings,
+            bias,
+            log_logit_scale,
+            world_size,
+            per_label_out,
+        )
+        task_scores[task] = scores
+        for name, value in scores.items():
+            metrics[f"{name}/task/{task}"] = value
+
+    for stat in (*_PUBLIC_STATS, "prediction_coverage"):
+        metrics[f"{stat}/ts_tactile"] = sum(scores[stat] for scores in task_scores.values()) / len(task_scores)
+    return metrics
+
+
+def _merge_prediction_metrics(*metric_sets: dict[str, float]) -> dict[str, float]:
+    """Merge family metrics and recompute an equal-family overall score."""
+    merged: dict[str, float] = {}
+    for values in metric_sets:
+        merged.update(values)
+    for stat in _PUBLIC_STATS:
+        family_values = [merged[f"{stat}/ts_{family}"] for family in _TS_FAMILIES if f"{stat}/ts_{family}" in merged]
+        if family_values:
+            merged[f"{stat}/overall"] = sum(family_values) / len(family_values)
+        else:
+            merged.pop(f"{stat}/overall", None)
+    return merged
+
+
 def _metric_groups(
     split: str,
     loss_metrics: dict[str, float],
@@ -217,13 +359,12 @@ def _metric_groups(
     aux = f"{split}-aux"
     out: dict[str, float] = {f"{core}/loss/aggregate": loss_metrics["loss/total"]}
 
-    skipped = {
-        kind: counts.get(f"n/skipped_{kind}", 0)
-        for kind in ("image", "video", "signal")
-    }
+    skipped = {kind: counts.get(f"n/skipped_{kind}", 0) for kind in ("image", "video", "signal")}
     skipped_total = sum(skipped.values())
-    valid_total = counts.get("n/img_image", 0) + counts.get("n/img_video", 0) + sum(
-        counts.get(f"n/ts_{family}", 0) for family in _TS_FAMILIES
+    valid_total = (
+        counts.get("n/img_image", 0)
+        + counts.get("n/img_video", 0)
+        + sum(counts.get(f"n/ts_{family}", 0) for family in _TS_FAMILIES)
     )
     for kind, value in skipped.items():
         out[f"{aux}/n/skipped/{kind}"] = float(value)
@@ -247,6 +388,15 @@ def _metric_groups(
         if coverage_key in prediction_metrics:
             out[f"{aux}/prediction_coverage/{family}"] = prediction_metrics[coverage_key]
         out[f"{aux}/n/{family}"] = float(counts[f"n/ts_{family}"])
+
+    for task in TASK_LABELS:
+        loss_key = f"loss/task/{task}"
+        if loss_key in loss_metrics:
+            out[f"{aux}/loss/tactile/{task}"] = loss_metrics[loss_key]
+        for stat in (*_PUBLIC_STATS, "prediction_coverage"):
+            key = f"{stat}/task/{task}"
+            if key in prediction_metrics:
+                out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]
 
     for stat in _PUBLIC_STATS:
         key = f"{stat}/overall"

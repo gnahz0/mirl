@@ -66,6 +66,8 @@ def build_loaders(
         list(cfg.data.train_files),
         max_video_frames=cfg.data.max_video_frames,
         path_rewrites=dict(cfg.data.get("path_rewrites", {})),
+        annotation_files=list(cfg.data.get("train_annotation_files", [])),
+        tasks=list(cfg.data.get("tasks", [])),
     )
     logger.info("train dataset: %d rows (%.1fs)", len(train_ds), time.time() - started)
 
@@ -96,6 +98,8 @@ def build_loaders(
         list(cfg.data.val_files),
         max_video_frames=cfg.data.max_video_frames,
         path_rewrites=dict(cfg.data.get("path_rewrites", {})),
+        annotation_files=list(cfg.data.get("val_annotation_files", [])),
+        tasks=list(cfg.data.get("tasks", [])),
     )
     val_sampler = HomogeneousBatchSampler(
         val_ds,

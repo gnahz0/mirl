@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
+from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -22,12 +25,61 @@ os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 _SIGNAL_FAMILIES = ("smellnet", "ecg", "tactile")
 _SKIPPABLE_LOAD_ERRORS = (OSError, ValueError, RuntimeError, EOFError)
 
+# Closed-label tactile tasks. The haptic signal Parquets contain open-ended
+# descriptions; these labels are joined from the tactile QA Parquets by the
+# recording stem. SFT/RL should keep the original ordered QA rows instead.
+TASK_LABELS: dict[str, tuple[str, ...]] = {
+    "initial_fingers": (
+        "initial contact: thumb",
+        "initial contact: index finger",
+        "initial contact: middle finger",
+        "initial contact: ring finger",
+        "initial contact: pinky finger",
+        "initial contact: palm",
+    ),
+    "highest_pressure": (
+        "highest pressure: thumb",
+        "highest pressure: index finger",
+        "highest pressure: middle finger",
+        "highest pressure: ring finger",
+        "highest pressure: pinky finger",
+        "highest pressure: palm",
+    ),
+    "force_level": (
+        "force level: light, under 5 newtons",
+        "force level: moderate, 5 to 10 newtons",
+        "force level: firm, 10 to 20 newtons",
+        "force level: strong, over 20 newtons",
+    ),
+    "grip_stability": (
+        "grip stability: stable",
+        "grip stability: unstable",
+    ),
+    "contact_feature": (
+        "contact geometry: edge",
+        "contact geometry: flat surface",
+        "contact geometry: curved surface",
+        "contact geometry: corner",
+        "contact geometry: multiple edges",
+        "contact geometry: edge and surface",
+        "contact geometry: transitioning from edge to surface",
+        "contact geometry: complex geometry with multiple features",
+    ),
+    "local_shape": (
+        "local surface shape: flat",
+        "local surface shape: convex",
+        "local surface shape: concave",
+        "local surface shape: edge",
+    ),
+}
+MULTILABEL_TASKS = frozenset(("initial_fingers", "highest_pressure"))
+
 
 def _rewrite_path(path: str, rewrites: tuple[tuple[str, str], ...]) -> str:
     """Replace the longest matching path prefix."""
     for old, new in rewrites:
         if path == old or path.startswith(f"{old}/"):
-            return f"{new}{path[len(old):]}"
+            return f"{new}{path[len(old) :]}"
     return path
 
 
@@ -56,6 +108,81 @@ def _rewrite_media_paths(row: dict, rewrites: tuple[tuple[str, str], ...]) -> in
                 entry[key] = rewritten
                 changed += rewritten != path
     return changed
+
+
+def _extra_info(row: dict) -> dict:
+    """Normalize the JSON-or-struct extra_info column."""
+    value = row.get("extra_info") or {}
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _recording_stem(row: dict) -> str:
+    """Resolve the shared haptic/QA recording identifier."""
+    extra = _extra_info(row)
+    stem = extra.get("stem")
+    if stem:
+        return str(stem)
+    video_path = extra.get("video_path")
+    if not video_path:
+        raise ValueError("tactile row has neither extra_info.stem nor extra_info.video_path")
+    return Path(str(video_path)).stem
+
+
+def _parse_annotation_answer(answer: object, task: str) -> tuple[int, ...]:
+    """Convert comma-separated QA choices (for example ``A,B,F``) to IDs."""
+    labels = TASK_LABELS[task]
+    choices = [choice.strip().upper() for choice in str(answer).split(",")]
+    if not choices or any(len(choice) != 1 or not choice.isalpha() for choice in choices):
+        raise ValueError(f"invalid answer {answer!r}")
+    indices = tuple(sorted({ord(choice) - ord("A") for choice in choices}))
+    if not indices or indices[0] < 0 or indices[-1] >= len(labels):
+        raise ValueError(f"answer {answer!r} is outside A-{chr(ord('A') + len(labels) - 1)}")
+    if task not in MULTILABEL_TASKS and len(indices) != 1:
+        raise ValueError(f"exclusive task has {len(indices)} choices in {answer!r}")
+    return indices
+
+
+def _annotation_targets(
+    annotation_files: list[str],
+    tasks: tuple[str, ...],
+    valid_stems: set[str],
+) -> tuple[dict[str, dict[str, tuple[int, ...]]], dict[str, dict[str, int]]]:
+    """Join QA answers by recording stem, masking malformed/conflicting tasks."""
+    grouped: dict[str, dict[str, list[tuple[int, ...]]]] = defaultdict(lambda: defaultdict(list))
+    audit = {task: {"duplicates": 0, "conflicts": 0, "malformed": 0} for task in tasks}
+    for path in annotation_files:
+        table = pq.read_table(path, columns=["data_source", "reward_model", "extra_info"])
+        for row in table.to_pylist():
+            task = str(row["data_source"])
+            if task not in tasks:
+                continue
+            try:
+                stem = _recording_stem(row)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                audit[task]["malformed"] += 1
+                continue
+            if stem not in valid_stems:
+                continue
+            try:
+                answer = _parse_annotation_answer(row["reward_model"]["ground_truth"], task)
+            except (KeyError, TypeError, ValueError):
+                audit[task]["malformed"] += 1
+                continue
+            grouped[stem][task].append(answer)
+
+    resolved: dict[str, dict[str, tuple[int, ...]]] = defaultdict(dict)
+    for stem, task_rows in grouped.items():
+        for task, answers in task_rows.items():
+            if len(answers) > 1:
+                audit[task]["duplicates"] += 1
+            unique = set(answers)
+            if len(unique) == 1:
+                resolved[stem][task] = unique.pop()
+            else:
+                # Conflicting duplicate annotations are unknown for this task,
+                # not arbitrary positives or negatives.
+                audit[task]["conflicts"] += 1
+    return dict(resolved), audit
 
 
 def _visual_entries(row: dict) -> list[tuple[str, tuple[str, str], dict | str]]:
@@ -133,6 +260,7 @@ def _load_signal_csv(path: str) -> torch.Tensor:
 
 def _factor_aligned_video_size(height: int, width: int, factor: int = 32) -> tuple[int, int]:
     """Make an extreme video aspect ratio acceptable to Qwen without dropping it."""
+
     def ceil_factor(value: int) -> int:
         return ((value + factor - 1) // factor) * factor
 
@@ -235,8 +363,16 @@ class AlignmentDataset(Dataset):
         data_files: list[str],
         max_video_frames: int = 8,
         path_rewrites: dict[str, str] | None = None,
+        annotation_files: list[str] | None = None,
+        tasks: list[str] | None = None,
     ):
         self.max_video_frames = max_video_frames
+        self.tasks = tuple(tasks or ())
+        unknown = set(self.tasks) - TASK_LABELS.keys()
+        if unknown:
+            raise ValueError(f"unknown tactile tasks: {sorted(unknown)}")
+        if bool(annotation_files) != bool(self.tasks):
+            raise ValueError("annotation_files and tactile tasks must be configured together")
 
         rows: list[dict] = []
         for path in data_files:
@@ -244,10 +380,7 @@ class AlignmentDataset(Dataset):
 
         rewrites = tuple(
             sorted(
-                (
-                    (str(old).rstrip("/"), str(new).rstrip("/"))
-                    for old, new in (path_rewrites or {}).items()
-                ),
+                ((str(old).rstrip("/"), str(new).rstrip("/")) for old, new in (path_rewrites or {}).items()),
                 key=lambda pair: len(pair[0]),
                 reverse=True,
             )
@@ -257,6 +390,59 @@ class AlignmentDataset(Dataset):
             logger.info("rewrote %d embedded media paths", rewritten)
 
         rows = [row for row in rows if row["data_source"] != "smellnet_mixture"]
+
+        self.task_labels: dict[str, tuple[str, ...]] = {}
+        self.task_positive_rates: dict[str, float] = {}
+        if self.tasks:
+            tactile_rows = [
+                row for row in rows if (signals := row.get("signals") or []) and _signal_family(signals[0]) == "tactile"
+            ]
+            valid_stems = {_recording_stem(row) for row in tactile_rows}
+            annotations, audit = _annotation_targets(
+                list(annotation_files or ()),
+                self.tasks,
+                valid_stems,
+            )
+            joined_rows: list[dict] = []
+            unmatched = 0
+            for row in rows:
+                signals = row.get("signals") or []
+                if not signals or _signal_family(signals[0]) != "tactile":
+                    joined_rows.append(row)
+                    continue
+                targets = annotations.get(_recording_stem(row), {})
+                if not targets:
+                    unmatched += 1
+                    continue
+                row["_tactile_targets"] = targets
+                joined_rows.append(row)
+            rows = joined_rows
+            if unmatched:
+                logger.warning(
+                    "removed %d tactile signal rows with no usable structured annotation",
+                    unmatched,
+                )
+
+            self.task_labels = {task: TASK_LABELS[task] for task in self.tasks}
+            structured_rows = [row for row in rows if row.get("_tactile_targets") is not None]
+            for task, labels in self.task_labels.items():
+                observed = [row["_tactile_targets"][task] for row in structured_rows if task in row["_tactile_targets"]]
+                if not observed:
+                    raise ValueError(f"no usable structured tactile annotations for {task}")
+                positive_rate = sum(map(len, observed)) / (len(observed) * len(labels))
+                self.task_positive_rates[task] = positive_rate
+                logger.info(
+                    "tactile labels: task=%s observed=%d missing=%d duplicates=%d "
+                    "conflicts=%d malformed=%d positive_rate=%.4f",
+                    task,
+                    len(observed),
+                    len(structured_rows) - len(observed),
+                    audit[task]["duplicates"],
+                    audit[task]["conflicts"],
+                    audit[task]["malformed"],
+                    positive_rate,
+                )
+
         rows, visual_paths, repeated = _expand_and_deduplicate_visual_rows(rows)
         if visual_paths:
             logger.info(
@@ -271,11 +457,11 @@ class AlignmentDataset(Dataset):
             if not signals:
                 continue
             family = _signal_family(signals[0])
+            if family == "tactile" and self.tasks:
+                continue
             vocab_sets[family].add(row["reward_model"]["ground_truth"])
         self.ts_label_vocabs = {
-            family: tuple(sorted(vocab_sets[family]))
-            for family in _SIGNAL_FAMILIES
-            if vocab_sets[family]
+            family: tuple(sorted(vocab_sets[family])) for family in _SIGNAL_FAMILIES if vocab_sets[family]
         }
 
         self.rows = rows
@@ -288,10 +474,7 @@ class AlignmentDataset(Dataset):
                 kind = "image" if row.get("images") else "video"
             group = (kind, row["data_source"])
             self.sampling_groups.setdefault(group, []).append(index)
-        group_sizes = {
-            f"{kind}/{source}": len(indices)
-            for (kind, source), indices in self.sampling_groups.items()
-        }
+        group_sizes = {f"{kind}/{source}": len(indices) for (kind, source), indices in self.sampling_groups.items()}
         logger.info(
             "AlignmentDataset: %d unique rows from %d files; groups=%s",
             len(self.rows),
@@ -327,6 +510,14 @@ class AlignmentDataset(Dataset):
                 "media": media,
                 "family": family,
                 "text": sample["reward_model"]["ground_truth"],
+                **(
+                    {
+                        "targets": sample["_tactile_targets"],
+                        "tasks": self.tasks,
+                    }
+                    if family == "tactile" and self.tasks
+                    else {}
+                ),
             }
 
         images = sample.get("images") or []
@@ -379,24 +570,15 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
             raise ValueError(f"signal_repeat_factors contains unknown signal sources: {unknown}")
         for source, factor in self.signal_repeat_factors.items():
             if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
-                raise ValueError(
-                    "signal_repeat_factors values must be positive integers; "
-                    f"got {source}={factor!r}"
-                )
+                raise ValueError(f"signal_repeat_factors values must be positive integers; got {source}={factor!r}")
 
-        effective_sizes = {
-            group: len(rows) * self._repeat_factor(group)
-            for group, rows in self.groups.items()
-        }
+        effective_sizes = {group: len(rows) * self._repeat_factor(group) for group, rows in self.groups.items()}
         global_batch_size = self.batch_size * self.world_size
         batch_counts = {
-            group: (size + global_batch_size - 1) // global_batch_size
-            for group, size in effective_sizes.items()
+            group: (size + global_batch_size - 1) // global_batch_size for group, size in effective_sizes.items()
         }
         self.num_batches = sum(
-            count
-            for group, count in batch_counts.items()
-            if effective_sizes[group] >= self.world_size
+            count for group, count in batch_counts.items() if effective_sizes[group] >= self.world_size
         )
         dropped = sum(batch_counts.values()) - self.num_batches
         if dropped:
@@ -463,18 +645,32 @@ def collate_alignment(batch: list[dict]) -> dict:
     valid = [item for item in batch if item["kind"] != "skipped"]
     if not valid:
         paths = ", ".join(item["path"] for item in skipped[:3])
-        raise RuntimeError(
-            f"all {len(batch)} rank-local samples failed to load; refusing an empty DDP batch: {paths}"
-        )
+        raise RuntimeError(f"all {len(batch)} rank-local samples failed to load; refusing an empty DDP batch: {paths}")
     kind = valid[0]["kind"]
     skipped_counts = {
         failed_kind: sum(item["failed_kind"] == failed_kind for item in skipped)
         for failed_kind in ("image", "video", "signal")
     }
-    return {
+    collated = {
         "kind": kind,
         "media": [item["media"] for item in valid],
         "family": valid[0].get("family"),
         "text": [item["text"] for item in valid] if kind == "signal" else [],
         "skipped": skipped_counts,
     }
+    if kind == "signal" and valid[0].get("family") == "tactile" and "tasks" in valid[0]:
+        task_targets: dict[str, torch.Tensor] = {}
+        task_masks: dict[str, torch.Tensor] = {}
+        for task in valid[0]["tasks"]:
+            targets = torch.zeros((len(valid), len(TASK_LABELS[task])), dtype=torch.float32)
+            mask = torch.zeros(len(valid), dtype=torch.bool)
+            for row_index, item in enumerate(valid):
+                positive = item["targets"].get(task)
+                if positive is not None:
+                    targets[row_index, list(positive)] = 1.0
+                    mask[row_index] = True
+            task_targets[task] = targets
+            task_masks[task] = mask
+        collated["targets"] = task_targets
+        collated["masks"] = task_masks
+    return collated

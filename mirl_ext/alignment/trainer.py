@@ -18,13 +18,16 @@ from omegaconf import DictConfig, OmegaConf
 from .metrics import (
     _allreduce_counts,
     _allreduce_metrics,
+    _merge_prediction_metrics,
     _metric_groups,
     add_batch_counts,
 )
 from .objective import (
+    _build_tactile_label_bank,
     _build_text_label_bank,
     _compute_losses,
     _run_validation,
+    _score_tactile,
     _score_ts,
 )
 from .runtime import (
@@ -48,14 +51,23 @@ class AccumulationWindow:
     ts_embeddings: list[torch.Tensor] = field(default_factory=list)
     ts_labels: list[str] = field(default_factory=list)
     ts_families: list[str] = field(default_factory=list)
+    tactile_embeddings: list[torch.Tensor] = field(default_factory=list)
+    tactile_target_chunks: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+    tactile_mask_chunks: dict[str, list[torch.Tensor]] = field(default_factory=dict)
 
     def add(self, batch: dict, metrics: dict, ts_eval: tuple) -> None:
         add_batch_counts(self.counts, batch)
-        embeddings, labels, families = ts_eval
+        embeddings, labels, families, tactile_targets, tactile_masks = ts_eval
         if embeddings is not None:
-            self.ts_embeddings.append(embeddings)
-            self.ts_labels.extend(labels)
-            self.ts_families.extend(families)
+            if tactile_targets:
+                self.tactile_embeddings.append(embeddings)
+                for task in tactile_targets:
+                    self.tactile_target_chunks.setdefault(task, []).append(tactile_targets[task])
+                    self.tactile_mask_chunks.setdefault(task, []).append(tactile_masks[task])
+            else:
+                self.ts_embeddings.append(embeddings)
+                self.ts_labels.extend(labels)
+                self.ts_families.extend(families)
         for key, value in metrics.items():
             self.metric_values.setdefault(key, []).append(float(value))
 
@@ -101,6 +113,14 @@ def train(cfg: DictConfig) -> None:
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
+    if train_ds.task_labels != val_ds.task_labels:
+        raise ValueError("train and validation structured tactile tasks do not match")
+    tactile_label_bank = _build_tactile_label_bank(
+        model,
+        train_ds.task_labels,
+        train_ds.task_positive_rates,
+        device,
+    )
     free, total = torch.cuda.mem_get_info()
     logger.info(
         "GPU memory after load: %.2f / %.2f GiB",
@@ -153,11 +173,7 @@ def train(cfg: DictConfig) -> None:
     window = AccumulationWindow()
     cumulative_counts: Counter[str] = Counter()
     opt_step = int(resume_progress["step"]) if resume_progress else 0
-    best_value = (
-        float(resume_progress.get("best_value", float("-inf")))
-        if resume_progress
-        else float("-inf")
-    )
+    best_value = float(resume_progress.get("best_value", float("-inf"))) if resume_progress else float("-inf")
     start_epoch = int(resume_progress.get("next_epoch", 0)) if resume_progress else 0
     start_batch_index = int(resume_progress.get("next_batch_index", 0)) if resume_progress else 0
     if start_batch_index % grad_accum:
@@ -194,6 +210,7 @@ def train(cfg: DictConfig) -> None:
                         cfg,
                         world_size=world_size,
                         label_bank=train_label_bank,
+                        tactile_label_bank=tactile_label_bank,
                     )
                 window.add(batch, metrics, micro_eval)
                 accelerator.backward(loss / window_size)
@@ -203,12 +220,24 @@ def train(cfg: DictConfig) -> None:
 
             metrics = {key: sum(values) / len(values) for key, values in window.metric_values.items()}
             metrics["grad_norm"] = float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
-            window_metrics = _score_ts(
+            standard_window_metrics = _score_ts(
                 window.ts_embeddings,
                 window.ts_labels,
                 window.ts_families,
                 train_label_bank,
                 world_size=world_size,
+            )
+            tactile_window_metrics = _score_tactile(
+                window.tactile_embeddings,
+                window.tactile_target_chunks,
+                window.tactile_mask_chunks,
+                tactile_label_bank,
+                base_model.log_logit_scale,
+                world_size=world_size,
+            )
+            window_metrics = _merge_prediction_metrics(
+                standard_window_metrics,
+                tactile_window_metrics,
             )
             optimizer.step()
             lrs = {str(group["name"]).partition("_")[0]: float(group["lr"]) for group in optimizer.param_groups}
@@ -224,10 +253,7 @@ def train(cfg: DictConfig) -> None:
                 metrics.update(window_metrics)
                 if wandb_run is not None:
                     payload = _metric_groups("train", metrics, counts)
-                    skipped_total = sum(
-                        cumulative_counts[f"n/skipped_{kind}"]
-                        for kind in ("image", "video", "signal")
-                    )
+                    skipped_total = sum(cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal"))
                     valid_total = (
                         cumulative_counts["n/img_image"]
                         + cumulative_counts["n/img_video"]
@@ -254,12 +280,13 @@ def train(cfg: DictConfig) -> None:
                     )
 
             if validate_now:
-                val_metrics, per_class = _run_validation(
+                val_metrics, per_class, per_label = _run_validation(
                     model,
                     val_loader,
                     cfg,
                     accelerator,
                     label_bank=val_label_bank,
+                    tactile_label_bank=tactile_label_bank,
                 )
                 if is_main:
                     current = val_metrics[cfg.train.best_metric]
@@ -287,6 +314,20 @@ def train(cfg: DictConfig) -> None:
                             payload[f"val-aux/per_class/{family}"] = wandb.Table(
                                 columns=list(columns),
                                 data=[[row[column] for column in columns] for row in rows],
+                            )
+                        tactile_columns = (
+                            "task",
+                            "label",
+                            "support",
+                            "predicted",
+                            "precision",
+                            "recall",
+                            "f1",
+                        )
+                        if per_label:
+                            payload["val-aux/per_label/tactile"] = wandb.Table(
+                                columns=list(tactile_columns),
+                                data=[[row[column] for column in tactile_columns] for row in per_label],
                             )
                         wandb_run.log(payload, step=opt_step, commit=True)
                     save_checkpoint(
@@ -316,10 +357,7 @@ def train(cfg: DictConfig) -> None:
             "training complete: best %s=%.4f; skipped=%s; final=%s",
             cfg.train.best_metric,
             best_value,
-            {
-                kind: cumulative_counts[f"n/skipped_{kind}"]
-                for kind in ("image", "video", "signal")
-            },
+            {kind: cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal")},
             out_dir / "final",
         )
     accelerator.wait_for_everyone()

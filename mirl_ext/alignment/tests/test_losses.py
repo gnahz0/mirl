@@ -12,11 +12,18 @@ torch = pytest.importorskip("torch")
 from mirl_ext.alignment.metrics import (  # noqa: E402
     _allreduce_metrics,
     _label_ranking_metrics,
+    _merge_prediction_metrics,
     _metric_groups,
+    _tactile_prediction_metrics,
     _ts_prediction_metrics,
     add_batch_counts,
 )
-from mirl_ext.alignment.objective import _label_siglip_loss  # noqa: E402
+from mirl_ext.alignment.objective import (  # noqa: E402
+    _build_tactile_label_bank,
+    _compute_losses,
+    _label_siglip_loss,
+    _tactile_task_siglip_loss,
+)
 
 
 def test_label_loss_is_class_balanced():
@@ -55,11 +62,15 @@ def test_label_loss_sums_candidates_before_averaging_anchors():
     bias = -math.log(len(candidate_labels) - 1)
     logits = log_scale.exp() * (anchors @ prototypes.T) + bias
     targets = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    expected = torch.nn.functional.binary_cross_entropy_with_logits(
-        logits,
-        targets,
-        reduction="none",
-    ).sum(dim=1).mean()
+    expected = (
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction="none",
+        )
+        .sum(dim=1)
+        .mean()
+    )
     assert loss == pytest.approx(expected)
 
 
@@ -88,6 +99,120 @@ def test_label_bank_handles_unique_tactile_answers():
     )
 
     assert torch.isfinite(loss)
+
+
+def test_structured_tactile_loss_accepts_multiple_positive_labels():
+    anchors = torch.tensor([[2**-0.5, 2**-0.5]])
+    prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-(2**-0.5), -(2**-0.5)]])
+    loss = _tactile_task_siglip_loss(
+        anchors,
+        torch.tensor([[1.0, 1.0, 0.0]]),
+        torch.tensor([True]),
+        prototypes,
+        bias=0.0,
+        log_logit_scale=torch.tensor(math.log(10.0)),
+    )
+
+    assert loss is not None and torch.isfinite(loss)
+
+
+def test_general_objective_averages_structured_tasks_only_for_tactile():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.log_logit_scale = torch.nn.Parameter(torch.tensor(math.log(2.0)))
+
+        def forward(self, kind, media, family, max_image_tokens):
+            assert (kind, family, max_image_tokens) == ("signal", "tactile", 1024)
+            return None, None, None, torch.eye(2), self.log_logit_scale
+
+    bank = {
+        "force_level": (("a", "b"), torch.eye(2), 0.0),
+        "grip_stability": (
+            ("a", "b"),
+            torch.flip(torch.eye(2), dims=(0,)),
+            0.0,
+        ),
+    }
+    batch = {
+        "kind": "signal",
+        "media": [None, None],
+        "family": "tactile",
+        "text": ["unused", "unused"],
+        "targets": {
+            "force_level": torch.eye(2),
+            "grip_stability": torch.eye(2),
+        },
+        "masks": {
+            "force_level": torch.tensor([True, True]),
+            "grip_stability": torch.tensor([True, True]),
+        },
+    }
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "data": type("Data", (), {"max_image_tokens": 1024})(),
+            "loss": type("Loss", (), {"siglip_weight": 1.0, "distill_weight": 1.0})(),
+        },
+    )()
+
+    total, metrics, task_eval = _compute_losses(
+        Model(),
+        batch,
+        cfg,
+        label_bank={},
+        tactile_label_bank=bank,
+    )
+
+    expected = (metrics["loss/task/force_level"] + metrics["loss/task/grip_stability"]) / 2
+    assert total.detach().item() == pytest.approx(expected)
+    assert metrics["loss/ts_tactile"] == pytest.approx(expected)
+    assert set(task_eval[3]) == set(bank)
+
+
+def test_structured_tactile_metrics_merge_as_one_family():
+    scale = torch.tensor(math.log(10.0))
+    multi_z = torch.tensor([[2**-0.5, 2**-0.5]])
+    multi_text = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-(2**-0.5), -(2**-0.5)]])
+    tactile = _tactile_prediction_metrics(
+        multi_z,
+        {"initial_fingers": torch.tensor([[1.0, 1.0, 0.0]])},
+        {"initial_fingers": torch.tensor([True])},
+        {
+            "initial_fingers": (
+                ("thumb", "index", "palm"),
+                multi_text,
+                0.0,
+            )
+        },
+        scale,
+    )
+    merged = _merge_prediction_metrics(
+        {"f1_macro/ts_smellnet": 0.5, "f1_macro/overall": 0.5},
+        tactile,
+    )
+
+    assert tactile["accuracy/task/initial_fingers"] == 1.0
+    assert tactile["f1_macro/task/initial_fingers"] == 1.0
+    assert tactile["recall_at_1/ts_tactile"] == 1.0
+    assert tactile["map/ts_tactile"] == 1.0
+    assert merged["f1_macro/overall"] == pytest.approx(0.75)
+
+
+def test_structured_tactile_bank_bias_uses_train_positive_rate():
+    class TextModel:
+        def encode_text(self, labels, device):
+            return torch.eye(len(labels))
+
+    bank = _build_tactile_label_bank(
+        TextModel(),
+        {"force_level": ("a", "b", "c", "d")},
+        {"force_level": 0.25},
+        torch.device("cpu"),
+    )
+
+    assert bank["force_level"][2] == pytest.approx(-math.log(3))
 
 
 def test_effective_batch_macro_f1_is_not_an_average_of_micro_batches():

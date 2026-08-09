@@ -1,5 +1,7 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 
+import json
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -67,6 +69,132 @@ def test_tactile_uses_complete_ground_truth_instead_of_filename_stem(tmp_path):
     }
 
 
+def _haptic_signal_row(tensor_path, stem, caption="unused open description"):
+    return {
+        "data_source": "haptic_tactile",
+        "signals": [
+            {
+                "signal": str(tensor_path),
+                "format": "tactile_pt",
+                "key": "right",
+            }
+        ],
+        "reward_model": {"ground_truth": caption},
+        "extra_info": json.dumps({"stem": stem}),
+    }
+
+
+def _tactile_annotation(stem, task, answer):
+    return {
+        "data_source": task,
+        "videos": [{"video": f"/not-loaded/{stem}.mp4"}],
+        "reward_model": {"ground_truth": answer},
+        "extra_info": json.dumps({"video_path": f"visual-tactile/{stem}.mp4"}),
+    }
+
+
+def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
+    tensor_path = tmp_path / "recording.pt"
+    tactile = torch.randn(47, 16, 16)
+    torch.save({"tactile": {"right": tactile}}, tensor_path)
+    data_path = tmp_path / "signals.parquet"
+    annotation_path = tmp_path / "annotations.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _haptic_signal_row(tensor_path, "recording"),
+                {
+                    "data_source": "smellnet_base",
+                    "signals": [{"signal": "/not-loaded/apple.csv", "format": ""}],
+                    "reward_model": {"ground_truth": "apple"},
+                    "extra_info": None,
+                },
+            ]
+        ),
+        data_path,
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _tactile_annotation("recording", "initial_fingers", "A,B,F"),
+                _tactile_annotation("recording", "force_level", "B"),
+                _tactile_annotation("recording", "description", "ignored free text"),
+            ]
+        ),
+        annotation_path,
+    )
+
+    dataset = AlignmentDataset(
+        [str(data_path)],
+        annotation_files=[str(annotation_path)],
+        tasks=["initial_fingers", "force_level"],
+    )
+    sample = dataset[0]
+
+    assert torch.equal(sample["media"], tactile)
+    assert sample["targets"] == {
+        "initial_fingers": (0, 1, 5),
+        "force_level": (1,),
+    }
+    assert dataset.task_positive_rates == {
+        "initial_fingers": 0.5,
+        "force_level": 0.25,
+    }
+    assert dataset.ts_label_vocabs == {"smellnet": ("apple",)}
+    assert set(dataset.sampling_groups) == {
+        ("signal", "haptic_tactile"),
+        ("signal", "smellnet_base"),
+    }
+
+    batch = collate_alignment([sample])
+    assert torch.equal(
+        batch["targets"]["initial_fingers"],
+        torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0, 1.0]]),
+    )
+    assert batch["masks"]["force_level"].tolist() == [True]
+
+
+def test_structured_tactile_join_masks_conflicting_duplicate_task(tmp_path):
+    tensor_path = tmp_path / "recording.pt"
+    other_tensor_path = tmp_path / "other.pt"
+    torch.save({"tactile": {"right": torch.randn(8, 16, 16)}}, tensor_path)
+    torch.save({"tactile": {"right": torch.randn(8, 16, 16)}}, other_tensor_path)
+    data_path = tmp_path / "signals.parquet"
+    annotation_path = tmp_path / "annotations.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _haptic_signal_row(tensor_path, "recording"),
+                _haptic_signal_row(other_tensor_path, "other"),
+            ]
+        ),
+        data_path,
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _tactile_annotation("recording", "initial_fingers", "A,F"),
+                _tactile_annotation("recording", "initial_fingers", "A,F"),
+                _tactile_annotation("recording", "force_level", "A"),
+                _tactile_annotation("recording", "force_level", "B"),
+                _tactile_annotation("other", "force_level", "C"),
+            ]
+        ),
+        annotation_path,
+    )
+
+    dataset = AlignmentDataset(
+        [str(data_path)],
+        annotation_files=[str(annotation_path)],
+        tasks=["initial_fingers", "force_level"],
+    )
+    batch = collate_alignment([dataset[0]])
+
+    assert dataset[0]["targets"] == {"initial_fingers": (0, 5)}
+    assert batch["masks"]["initial_fingers"].tolist() == [True]
+    assert batch["masks"]["force_level"].tolist() == [False]
+
+
 def test_visual_annotations_are_deduplicated_by_media_path(tmp_path):
     rows = [
         {
@@ -128,20 +256,14 @@ def test_multi_media_rows_expand_every_unique_path(tmp_path):
     assert len(dataset) == 7
     assert len(dataset.sampling_groups[("image", "climb")]) == 5
     assert len(dataset.sampling_groups[("video", "tactile")]) == 2
-    assert all(
-        len(row.get("images") or []) + len(row.get("videos") or []) == 1
-        for row in dataset.rows
-    )
-    assert {
-        entry[0]["image"]
-        for row in dataset.rows
-        if (entry := row.get("images"))
-    } == {f"/data/image-{index}.png" for index in range(5)}
-    assert {
-        entry[0]["video"]
-        for row in dataset.rows
-        if (entry := row.get("videos"))
-    } == {"/data/video-0.mp4", "/data/video-1.mp4"}
+    assert all(len(row.get("images") or []) + len(row.get("videos") or []) == 1 for row in dataset.rows)
+    assert {entry[0]["image"] for row in dataset.rows if (entry := row.get("images"))} == {
+        f"/data/image-{index}.png" for index in range(5)
+    }
+    assert {entry[0]["video"] for row in dataset.rows if (entry := row.get("videos"))} == {
+        "/data/video-0.mp4",
+        "/data/video-1.mp4",
+    }
 
     rank0 = list(HomogeneousBatchSampler(dataset, 4, rank=0, world_size=2, seed=5))
     rank1 = list(HomogeneousBatchSampler(dataset, 4, rank=1, world_size=2, seed=5))
@@ -275,9 +397,7 @@ def test_collate_filters_failed_items_and_counts_them():
 
 def test_collate_rejects_an_entirely_unreadable_local_batch():
     with pytest.raises(RuntimeError, match="refusing an empty DDP batch"):
-        collate_alignment(
-            [{"kind": "skipped", "failed_kind": "video", "path": "/bad.mp4"}]
-        )
+        collate_alignment([{"kind": "skipped", "failed_kind": "video", "path": "/bad.mp4"}])
 
 
 def test_collate_keeps_complete_source_homogeneous_signals():
@@ -366,10 +486,7 @@ def test_distributed_sampler_keeps_tail_ranks_in_lockstep():
 
     assert len(rank0) == len(rank1) == 3
     assert all(batch for batch in rank0 + rank1)
-    assert all(
-        len(_batch_groups(dataset, batch0 + batch1)) == 1
-        for batch0, batch1 in zip(rank0, rank1)
-    )
+    assert all(len(_batch_groups(dataset, batch0 + batch1)) == 1 for batch0, batch1 in zip(rank0, rank1, strict=False))
     assert set(index for batch in rank0 + rank1 for index in batch) == set(range(13))
 
 
@@ -406,11 +523,7 @@ def test_homogeneous_sampler_repeats_only_configured_signal_sources():
     )
 
     counts = {group: 0 for group in dataset.sampling_groups}
-    owner = {
-        index: group
-        for group, indices in dataset.sampling_groups.items()
-        for index in indices
-    }
+    owner = {index: group for group, indices in dataset.sampling_groups.items() for index in indices}
     for batch0, batch1 in zip(rank0, rank1, strict=True):
         assert len(_batch_groups(dataset, batch0 + batch1)) == 1
         for index in batch0 + batch1:
