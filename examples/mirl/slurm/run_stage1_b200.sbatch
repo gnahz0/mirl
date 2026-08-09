@@ -67,6 +67,6 @@ python -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' ||
 }
 
 echo "Stage-1 job=$SLURM_JOB_ID node=$(hostname) output=$MIRL_OUTPUT_DIR"
-CONFIG="$PWD/mirl_ext/alignment/config/stage1_qwen35_siglip2.yaml" \
+CONFIG="$PWD/mirl_ext/alignment/config/stage1_qwen35_siglip2_aicr.yaml" \
 NUM_GPUS=4 \
 bash examples/alignment/run_stage1_qwen35_siglip2.sh "$@"

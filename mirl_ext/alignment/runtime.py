@@ -34,21 +34,6 @@ def setup_logging(level_name: str) -> None:
     sys.stderr.reconfigure(line_buffering=True)
 
 
-def maybe_init_wandb(cfg: DictConfig):
-    if not cfg.wandb.enable:
-        return None
-    import wandb
-
-    run = wandb.init(
-        project=str(cfg.wandb.project),
-        name=str(cfg.wandb.name),
-        config=OmegaConf.to_container(cfg, resolve=True),
-        settings=wandb.Settings(console="off"),
-    )
-    logger.info("W&B run initialized: %s", run.url)
-    return run
-
-
 def build_loaders(
     cfg: DictConfig,
     rank: int,
@@ -65,7 +50,6 @@ def build_loaders(
     train_ds = AlignmentDataset(
         list(cfg.data.train_files),
         max_video_frames=cfg.data.max_video_frames,
-        path_rewrites=dict(cfg.data.get("path_rewrites", {})),
     )
     logger.info("train dataset: %d rows (%.1fs)", len(train_ds), time.time() - started)
 
@@ -95,7 +79,6 @@ def build_loaders(
     val_ds = AlignmentDataset(
         list(cfg.data.val_files),
         max_video_frames=cfg.data.max_video_frames,
-        path_rewrites=dict(cfg.data.get("path_rewrites", {})),
     )
     val_sampler = HomogeneousBatchSampler(
         val_ds,
@@ -130,7 +113,6 @@ def build_model(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
         visual_dtype=visual_dtype,
-        gradient_checkpointing=bool(cfg.model.gradient_checkpointing),
         contrastive_temperature=cfg.loss.temperature,
     ).to(device)
     trainable = [param for param in model.parameters() if param.requires_grad]
@@ -177,20 +159,9 @@ def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_step
     return optimizer, scheduler
 
 
-def _checkpoint_file(path: str | Path, filename: str) -> Path:
-    path = Path(path)
-    return path / filename if path.is_dir() or not path.suffix else path
-
-
-def _atomic_torch_save(state: dict, path: Path) -> None:
-    temporary = path.with_suffix(f"{path.suffix}.tmp")
-    torch.save(state, temporary)
-    temporary.replace(path)
-
-
 def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> int:
     """Warm-start trainable model weights from an alignment checkpoint."""
-    state_path = _checkpoint_file(path, "alignment_state.pt")
+    state_path = Path(path) / "alignment_state.pt"
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     model.trainable_visual.load_state_dict(state["trainable_visual"], strict=True)
     with torch.no_grad():
@@ -204,7 +175,7 @@ def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> int:
 
 def load_training_state(path: str | Path, optimizer, scheduler) -> dict[str, Any]:
     """Restore optimizer/scheduler state saved at an optimizer-step boundary."""
-    state_path = _checkpoint_file(path, "trainer_state.pt")
+    state_path = Path(path) / "trainer_state.pt"
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     optimizer.load_state_dict(state.pop("optimizer"))
     scheduler.load_state_dict(state.pop("scheduler"))
@@ -231,9 +202,7 @@ def save_checkpoint(
     }
     if hasattr(model, "logit_bias"):
         state["logit_bias"] = model.logit_bias.detach().cpu()
-    _atomic_torch_save(state, path / "alignment_state.pt")
-    if (optimizer is None) != (scheduler is None):
-        raise ValueError("optimizer and scheduler must be saved together")
+    torch.save(state, path / "alignment_state.pt")
     if optimizer is not None:
         trainer_state = {
             "optimizer": optimizer.state_dict(),
@@ -241,7 +210,7 @@ def save_checkpoint(
             "step": step,
             **(progress or {}),
         }
-        _atomic_torch_save(trainer_state, path / "trainer_state.pt")
+        torch.save(trainer_state, path / "trainer_state.pt")
     OmegaConf.save(cfg, path / "config.yaml")
     logger.info(
         "checkpoint saved to %s (step=%d, trainer_state=%s)",

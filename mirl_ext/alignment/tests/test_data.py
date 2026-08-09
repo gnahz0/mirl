@@ -9,6 +9,8 @@ import torch
 from PIL import ImageFile
 
 from mirl_ext.alignment.data import (
+    TACTILE_NUM_LABELS,
+    TACTILE_SPANS,
     AlignmentDataset,
     HomogeneousBatchSampler,
     _annotation_targets,
@@ -123,11 +125,22 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     }
 
     batch = collate_alignment([sample])
+    # One (1, 30) target/mask pair over the concatenated task vocabularies; a task's
+    # answer lands inside its own column span.
+    assert batch["targets"].shape == (1, TACTILE_NUM_LABELS)
+    assert batch["masks"].shape == (1, TACTILE_NUM_LABELS)
+    start, stop = TACTILE_SPANS["initial_fingers"]
     assert torch.equal(
-        batch["targets"]["initial_fingers"],
-        torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0, 1.0]]),
+        batch["targets"][0, start:stop],
+        torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
     )
-    assert batch["masks"]["force_level"].tolist() == [True]
+    # Every task this fixture answers is fully unmasked; a task's columns are all-or-
+    # nothing, which is what lets the metrics recover the per-row mask from column 0.
+    for task, (task_start, task_stop) in TACTILE_SPANS.items():
+        expected = 1.0 if task in sample["targets"] else 0.0
+        assert batch["masks"][0, task_start:task_stop].tolist() == [expected] * (task_stop - task_start), task
+    # Exactly the answered positives are set, and nothing outside them.
+    assert batch["targets"].sum() == sum(len(v) for v in sample["targets"].values())
 
 
 def test_structured_tactile_join_masks_conflicting_answers():
@@ -212,50 +225,6 @@ def test_multi_media_rows_expand_every_unique_path(tmp_path):
     rank1 = list(HomogeneousBatchSampler(dataset, 4, rank=1, world_size=2, seed=5))
     visited = [index for batches in zip(rank0, rank1, strict=True) for batch in batches for index in batch]
     assert len(visited) == len(set(visited)) == len(dataset)
-
-
-def test_dataset_rewrites_every_embedded_media_path(tmp_path):
-    rows = [
-        {
-            "data_source": "climb",
-            "images": [
-                {"image": "/old/images/a.png"},
-                {"image": "/old/images/b.png"},
-            ],
-            "videos": None,
-            "signals": None,
-            "reward_model": {"ground_truth": "ignored visual annotation"},
-        },
-        {
-            "data_source": "tactile",
-            "images": None,
-            "videos": [{"video": "/old/videos/a.mp4"}],
-            "signals": None,
-            "reward_model": {"ground_truth": "ignored video annotation"},
-        },
-        {
-            "data_source": "ecg",
-            "images": None,
-            "videos": None,
-            "signals": [{"signal": "/old/signals/a.pt", "format": "ts_pt"}],
-            "reward_model": {"ground_truth": "Normal"},
-        },
-    ]
-
-    dataset = _dataset(tmp_path, "rewrites", rows, path_rewrites={"/old": "/new"})
-
-    paths = {
-        entry[key]
-        for row in dataset.rows
-        for column, key in (("images", "image"), ("videos", "video"), ("signals", "signal"))
-        for entry in (row.get(column) or [])
-    }
-    assert paths == {
-        "/new/images/a.png",
-        "/new/images/b.png",
-        "/new/videos/a.mp4",
-        "/new/signals/a.pt",
-    }
 
 
 def test_extreme_video_size_is_retained_with_safe_factor_alignment():

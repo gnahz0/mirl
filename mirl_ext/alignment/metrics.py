@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from .data import MULTILABEL_TASKS, TASK_LABELS
+from .data import MULTILABEL_TASKS, TACTILE_SPANS, TASK_LABELS
 
 # Metric reduction order must be identical on every rank.
 _TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
@@ -209,7 +209,7 @@ def _tactile_task_metrics(
     mask: torch.Tensor,
     labels: tuple[str, ...],
     text_embeddings: torch.Tensor,
-    bias: float,
+    bias: torch.Tensor,
     log_logit_scale: torch.Tensor,
     world_size: int,
     per_label_out: list[dict[str, object]] | None,
@@ -288,26 +288,39 @@ def _tactile_task_metrics(
 @torch.no_grad()
 def _tactile_prediction_metrics(
     z: torch.Tensor,
-    targets: dict[str, torch.Tensor],
-    masks: dict[str, torch.Tensor],
-    label_bank: dict[str, tuple[tuple[str, ...], torch.Tensor, float]],
+    targets: torch.Tensor,
+    masks: torch.Tensor,
+    tactile_bank: tuple[tuple[str, ...], torch.Tensor, torch.Tensor],
     log_logit_scale: torch.Tensor,
     *,
     world_size: int = 1,
     per_label_out: list[dict[str, object]] | None = None,
 ) -> dict[str, float]:
-    """Compute equal-task structured metrics for the tactile family."""
+    """Compute equal-task structured metrics by slicing the one tactile bank."""
     metrics: dict[str, float] = {}
     task_scores: dict[str, dict[str, float]] = {}
-    for task, (labels, text_embeddings, bias) in label_bank.items():
+    all_labels, embeddings, bias = tactile_bank
+    for task, (start, stop) in TACTILE_SPANS.items():
+        # A row is in play for this task iff the join produced an answer, which the
+        # collate marks identically across the task's columns -- so any one of them
+        # recovers the old per-row mask.
+        rows = masks[:, start] > 0
+        observed = rows.sum()
+        if world_size > 1:
+            dist.all_reduce(observed, op=dist.ReduceOp.SUM)
+        if not int(observed):
+            # No rank annotated this task in this pass. Scoring it anyway divides by
+            # a zero sample count and the resulting nan propagates into every
+            # family average, so skip it rather than emit a poisoned number.
+            continue
         scores = _tactile_task_metrics(
             task,
             z,
-            targets[task],
-            masks[task],
-            labels,
-            text_embeddings,
-            bias,
+            targets[:, start:stop],
+            rows,
+            all_labels[start:stop],
+            embeddings[start:stop],
+            bias[start:stop],
             log_logit_scale,
             world_size,
             per_label_out,
@@ -316,6 +329,8 @@ def _tactile_prediction_metrics(
         for name, value in scores.items():
             metrics[f"{name}/task/{task}"] = value
 
+    if not task_scores:
+        return metrics
     for stat in (*_PUBLIC_STATS, "prediction_coverage"):
         metrics[f"{stat}/ts_tactile"] = sum(scores[stat] for scores in task_scores.values()) / len(task_scores)
     return metrics

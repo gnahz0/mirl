@@ -8,8 +8,6 @@ import logging
 import math
 import time
 from contextlib import nullcontext
-from functools import partial
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -18,17 +16,8 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-def _resolve_snapshot(path_or_repo: str) -> Path:
-    path = Path(path_or_repo).expanduser()
-    if path.exists():
-        return path.resolve()
-    from huggingface_hub import snapshot_download
-
-    return Path(snapshot_download(repo_id=path_or_repo)).resolve()
-
-
 def _load_exact_qwen35_visual(
-    path_or_repo: str,
+    model_path: str,
     *,
     dtype: torch.dtype,
 ) -> nn.Module:
@@ -36,37 +25,16 @@ def _load_exact_qwen35_visual(
     from transformers import AutoConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
-    root = _resolve_snapshot(path_or_repo)
-    full_config = AutoConfig.from_pretrained(root, local_files_only=True)
+    full_config = AutoConfig.from_pretrained(model_path, local_files_only=True)
     vision_config = full_config.vision_config
     vision_config._attn_implementation = "sdpa"
     return Qwen3_5VisionModel.from_pretrained(
-        root,
+        model_path,
         config=vision_config,
         dtype=dtype,
         local_files_only=True,
         key_mapping={r"^model\.visual\.": ""},
     )
-
-
-def _enable_block_checkpointing(visual: nn.Module) -> int:
-    """Wrap Qwen vision blocks because its forward loop ignores the HF flag."""
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-        CheckpointImpl,
-        apply_activation_checkpointing,
-        checkpoint_wrapper,
-    )
-
-    blocks = set(visual.blocks)
-    apply_activation_checkpointing(
-        visual,
-        checkpoint_wrapper_fn=partial(
-            checkpoint_wrapper,
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        ),
-        check_fn=blocks.__contains__,
-    )
-    return len(blocks)
 
 
 class MultimodalAlignmentModel(nn.Module):
@@ -77,40 +45,20 @@ class MultimodalAlignmentModel(nn.Module):
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
         visual_dtype: torch.dtype = torch.bfloat16,
-        gradient_checkpointing: bool = False,
         contrastive_temperature: float = 0.07,
     ):
         super().__init__()
         from transformers import AutoProcessor, AutoTokenizer, Siglip2TextModel
 
-        logger.info("[1/4] loading Qwen3.5 processor from %s", qwen35_path)
-        started = time.time()
-        qwen_root = _resolve_snapshot(qwen35_path)
-        self.qwen_processor = AutoProcessor.from_pretrained(qwen_root, local_files_only=True)
-        logger.info("       processor ready (%.1fs)", time.time() - started)
-
-        logger.info("[2/4] loading exact Qwen3.5 model.visual weights (dtype=%s)", visual_dtype)
-        started = time.time()
+        self.qwen_processor = AutoProcessor.from_pretrained(qwen35_path, local_files_only=True)
         self.trainable_visual = _load_exact_qwen35_visual(
-            str(qwen_root),
+            qwen35_path,
             dtype=visual_dtype,
         )
-        logger.info(
-            "       trainable VE ready: %.1fM params (%.1fs)",
-            sum(p.numel() for p in self.trainable_visual.parameters()) / 1e6,
-            time.time() - started,
-        )
 
-        logger.info("[3/4] cloning frozen reference vision encoder (deepcopy on CPU)")
-        started = time.time()
         self.frozen_visual = copy.deepcopy(self.trainable_visual)
         self.frozen_visual.requires_grad_(False).eval()
         self.trainable_visual.merger.requires_grad_(False)
-        logger.info("       frozen VE ready (%.1fs)", time.time() - started)
-
-        if gradient_checkpointing:
-            wrapped = _enable_block_checkpointing(self.trainable_visual)
-            logger.info("       activation checkpointing ON: wrapped %d trainable VE blocks", wrapped)
 
         vcfg = self.trainable_visual.config
         self.vit_patch_size = int(vcfg.patch_size)
@@ -122,20 +70,12 @@ class MultimodalAlignmentModel(nn.Module):
             int(vcfg.temporal_patch_size),
         )
 
-        logger.info("[4/4] loading SigLIP2 label-text encoder %s", siglip2_text_path)
-        started = time.time()
-        siglip_root = _resolve_snapshot(siglip2_text_path)
-        self.label_tokenizer = AutoTokenizer.from_pretrained(siglip_root, local_files_only=True)
+        self.label_tokenizer = AutoTokenizer.from_pretrained(siglip2_text_path, local_files_only=True)
         # The model class loads the text prefix and ignores the vision weights.
         self.label_text_model = Siglip2TextModel.from_pretrained(
-            siglip_root, local_files_only=True
+            siglip2_text_path, local_files_only=True
         ).to(dtype=visual_dtype)
         self.label_text_model.requires_grad_(False).eval()
-        logger.info(
-            "       SigLIP2 text ready: hidden=%d (%.1fs)",
-            self.label_text_model.config.projection_size,
-            time.time() - started,
-        )
 
         self.log_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / contrastive_temperature)))
 

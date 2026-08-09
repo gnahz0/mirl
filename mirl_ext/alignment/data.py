@@ -74,40 +74,17 @@ TASK_LABELS: dict[str, tuple[str, ...]] = {
 }
 MULTILABEL_TASKS = frozenset(("initial_fingers", "highest_pressure"))
 
-
-def _rewrite_path(path: str, rewrites: tuple[tuple[str, str], ...]) -> str:
-    """Replace the longest matching path prefix."""
-    for old, new in rewrites:
-        if path == old or path.startswith(f"{old}/"):
-            return f"{new}{path[len(old) :]}"
-    return path
-
-
-def _rewrite_media_paths(row: dict, rewrites: tuple[tuple[str, str], ...]) -> int:
-    """Translate embedded image, video, and signal paths in one Parquet row."""
-    changed = 0
-    for column, primary_key in (
-        ("images", "image"),
-        ("videos", "video"),
-        ("signals", "signal"),
-    ):
-        entries = row.get(column) or []
-        for index, entry in enumerate(entries):
-            if isinstance(entry, str):
-                rewritten = _rewrite_path(entry, rewrites)
-                entries[index] = rewritten
-                changed += rewritten != entry
-                continue
-            if not isinstance(entry, dict):
-                continue
-            for key in (primary_key, "path"):
-                path = entry.get(key)
-                if not path:
-                    continue
-                rewritten = _rewrite_path(str(path), rewrites)
-                entry[key] = rewritten
-                changed += rewritten != path
-    return changed
+# Column span of each task inside the concatenated tactile bank. The six tasks are
+# independent Bernoulli decisions under the sigmoid objective -- nothing couples
+# them -- so one bank of TACTILE_NUM_LABELS entries is equivalent to six banks, and
+# anything wanting a single task slices these columns instead of holding its own.
+TACTILE_SPANS: dict[str, tuple[int, int]] = {}
+_offset = 0
+for _task, _task_labels in TASK_LABELS.items():
+    TACTILE_SPANS[_task] = (_offset, _offset + len(_task_labels))
+    _offset += len(_task_labels)
+TACTILE_NUM_LABELS = _offset
+del _offset, _task, _task_labels
 
 
 def _recording_stem(row: dict) -> str:
@@ -329,24 +306,12 @@ class AlignmentDataset(Dataset):
         self,
         data_files: list[str],
         max_video_frames: int = 8,
-        path_rewrites: dict[str, str] | None = None,
     ):
         self.max_video_frames = max_video_frames
 
         rows: list[dict] = []
         for path in data_files:
             rows.extend(pq.read_table(path).to_pylist())
-
-        rewrites = tuple(
-            sorted(
-                ((str(old).rstrip("/"), str(new).rstrip("/")) for old, new in (path_rewrites or {}).items()),
-                key=lambda pair: len(pair[0]),
-                reverse=True,
-            )
-        )
-        rewritten = sum(_rewrite_media_paths(row, rewrites) for row in rows) if rewrites else 0
-        if rewritten:
-            logger.info("rewrote %d embedded media paths", rewritten)
 
         rows = [row for row in rows if row["data_source"] != "smellnet_mixture"]
 
@@ -580,18 +545,19 @@ def collate_alignment(batch: list[dict]) -> dict:
         "skipped": skipped_counts,
     }
     if kind == "signal" and "targets" in valid[0]:
-        task_targets: dict[str, torch.Tensor] = {}
-        task_masks: dict[str, torch.Tensor] = {}
-        for task in TASK_LABELS:
-            targets = torch.zeros((len(valid), len(TASK_LABELS[task])), dtype=torch.float32)
-            mask = torch.zeros(len(valid), dtype=torch.bool)
-            for row_index, item in enumerate(valid):
+        # One (B, 30) target and one (B, 30) weight over the concatenated task
+        # vocabularies. The weight is 1.0 only where the QA join produced an answer:
+        # an unannotated row keeps an all-zero target, and zero weight is what stops
+        # the loss from reading that as "none of these labels apply".
+        targets = torch.zeros((len(valid), TACTILE_NUM_LABELS), dtype=torch.float32)
+        mask = torch.zeros((len(valid), TACTILE_NUM_LABELS), dtype=torch.float32)
+        for row_index, item in enumerate(valid):
+            for task, (start, stop) in TACTILE_SPANS.items():
                 positive = item["targets"].get(task)
-                if positive is not None:
-                    targets[row_index, list(positive)] = 1.0
-                    mask[row_index] = True
-            task_targets[task] = targets
-            task_masks[task] = mask
-        collated["targets"] = task_targets
-        collated["masks"] = task_masks
+                if positive is None:
+                    continue
+                mask[row_index, start:stop] = 1.0
+                targets[row_index, [start + index for index in positive]] = 1.0
+        collated["targets"] = targets
+        collated["masks"] = mask
     return collated

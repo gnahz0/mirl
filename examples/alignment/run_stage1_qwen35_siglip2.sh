@@ -33,7 +33,7 @@ export WANDB_PROJECT="${WANDB_PROJECT:-mirl-alignment}"
 export WANDB_DIR="${WANDB_DIR:-${MIRL_ROOT}/outputs/alignment_stage1/wandb}"
 mkdir -p "${WANDB_DIR}"
 
-: "${CONFIG:=${MIRL_ROOT}/mirl_ext/alignment/config/stage1_qwen35_siglip2.yaml}"
+: "${CONFIG:=${MIRL_ROOT}/mirl_ext/alignment/config/stage1_qwen35_siglip2_aicr.yaml}"
 
 echo "Launching ${NUM_GPUS} GPU(s) via torchrun (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 set -x

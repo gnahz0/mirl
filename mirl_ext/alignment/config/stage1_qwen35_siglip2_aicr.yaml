@@ -1,4 +1,4 @@
-# Stage 1: train Qwen3.5's vision encoder on native time series and preserve images.
+# Stage 1 on AICR: train Qwen3.5's vision encoder on native time series and preserve images.
 # Experiment history and rationale live in mirl_ext/CLAUDE.md.
 
 log_level: INFO
@@ -32,7 +32,6 @@ data:
 model:
   qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
   siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
-  gradient_checkpointing: true
 
 loss:
   temperature: 0.07
@@ -70,6 +69,5 @@ train:
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35}
 
 wandb:
-  enable: true
   project: mirl-alignment
   name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_siglip2}

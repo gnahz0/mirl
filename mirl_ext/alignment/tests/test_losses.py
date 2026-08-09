@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from unittest import mock
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from mirl_ext.alignment.data import TASK_LABELS  # noqa: E402
+from mirl_ext.alignment.data import (  # noqa: E402
+    TACTILE_NUM_LABELS,
+    TACTILE_SPANS,
+    TASK_LABELS,
+)
 from mirl_ext.alignment.metrics import (  # noqa: E402
     _allreduce_metrics,
     _label_ranking_metrics,
@@ -20,10 +25,10 @@ from mirl_ext.alignment.metrics import (  # noqa: E402
     add_batch_counts,
 )
 from mirl_ext.alignment.objective import (  # noqa: E402
-    _build_tactile_label_bank,
+    _build_tactile_bank,
     _compute_losses,
     _label_siglip_loss,
-    _tactile_task_siglip_loss,
+    _tactile_siglip_loss,
 )
 
 
@@ -92,16 +97,100 @@ def test_label_loss_uses_absent_labels_as_negatives():
 def test_structured_tactile_loss_accepts_multiple_positive_labels():
     anchors = torch.tensor([[2**-0.5, 2**-0.5]])
     prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-(2**-0.5), -(2**-0.5)]])
-    loss = _tactile_task_siglip_loss(
+    loss, per_task = _tactile_siglip_loss(
         anchors,
         torch.tensor([[1.0, 1.0, 0.0]]),
-        torch.tensor([True]),
+        torch.ones(1, 3),
         prototypes,
-        bias=0.0,
+        bias=torch.zeros(3),
         log_logit_scale=torch.tensor(math.log(10.0)),
     )
 
     assert loss is not None and torch.isfinite(loss)
+    assert per_task == {} or all(math.isfinite(v) for v in per_task.values())
+
+
+def _reference_per_task_mean(z, targets, masks, embeddings, bias, scale):
+    """The pre-refactor objective: one masked BCE per task, then a plain mean.
+
+    Written the way the six-call version was -- select the task's rows, sum its BCE,
+    divide by rows x labels -- so it is an independent oracle rather than a
+    restatement of the implementation.
+    """
+    losses = []
+    for start, stop in TACTILE_SPANS.values():
+        rows = masks[:, start] > 0
+        if not bool(rows.any()):
+            continue
+        logits = scale.exp() * (z[rows] @ embeddings[start:stop].t()) + bias[start:stop]
+        total = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, targets[rows, start:stop], reduction="sum"
+        )
+        losses.append(total / (int(rows.sum()) * (stop - start)))
+    return torch.stack(losses).mean()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_unified_tactile_loss_matches_per_task_reference(partial):
+    """The refactor is plumbing only: same number, across all six mixed-width tasks."""
+    torch.manual_seed(0)
+    width = TACTILE_NUM_LABELS
+    z = torch.nn.functional.normalize(torch.randn(5, 8), dim=-1)
+    embeddings = torch.nn.functional.normalize(torch.randn(width, 8), dim=-1)
+    targets = (torch.rand(5, width) > 0.5).float()
+    masks = torch.ones(5, width)
+    if partial:
+        # Row 3 answers only the first task; row 4 answers nothing -- the two shapes
+        # of incomplete join that actually occur in the data.
+        first_stop = next(iter(TACTILE_SPANS.values()))[1]
+        masks[3, first_stop:] = 0.0
+        masks[4] = 0.0
+    bias = torch.full((width,), -0.5)
+    scale = torch.tensor(math.log(10.0))
+
+    actual, per_task = _tactile_siglip_loss(z, targets, masks, embeddings, bias, scale)
+    expected = _reference_per_task_mean(z, targets, masks, embeddings, bias, scale)
+
+    assert actual.item() == pytest.approx(expected.item(), rel=1e-6)
+    assert len(per_task) == len(TACTILE_SPANS)
+
+
+def test_unmasked_labels_contribute_no_gradient():
+    """A row with no annotation for a task must not push that task's labels.
+
+    This is the whole reason the mask exists: an unannotated row keeps an all-zero
+    target, which under BCE would otherwise read as "every one of these labels is
+    absent" rather than "nobody said".
+    """
+    torch.manual_seed(0)
+    width = TACTILE_NUM_LABELS
+    z = torch.nn.functional.normalize(torch.randn(3, 8), dim=-1).requires_grad_(True)
+    embeddings = torch.nn.functional.normalize(torch.randn(width, 8), dim=-1)
+    targets = torch.zeros(3, width)
+    masks = torch.ones(3, width)
+    masks[2] = 0.0  # row 2 has no annotation for any task
+
+    loss, per_task = _tactile_siglip_loss(
+        z, targets, masks, embeddings, torch.zeros(width), torch.tensor(math.log(10.0))
+    )
+    loss.backward()
+
+    assert torch.equal(z.grad[2], torch.zeros(8)), "a fully masked row must not move"
+    assert (z.grad[:2] != 0).any(), "annotated rows must still receive gradient"
+    # The divisor counts known pairs only, so masking must not silently rescale the
+    # surviving rows' contribution.
+    assert loss.item() == pytest.approx(
+        _tactile_siglip_loss(
+            z.detach()[:2],
+            targets[:2],
+            masks[:2],
+            embeddings,
+            torch.zeros(width),
+            torch.tensor(math.log(10.0)),
+        )[0].item(),
+        rel=1e-6,
+    )
+    assert set(per_task) == {f"loss/task/{task}" for task in TACTILE_SPANS}
 
 
 def test_general_objective_averages_structured_tasks_only_for_tactile():
@@ -114,27 +203,19 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
             assert (kind, family, max_image_tokens) == ("signal", "tactile", 1024)
             return None, None, None, torch.eye(2), self.log_logit_scale
 
-    bank = {
-        "force_level": (("a", "b"), torch.eye(2), 0.0),
-        "grip_stability": (
-            ("a", "b"),
-            torch.flip(torch.eye(2), dims=(0,)),
-            0.0,
-        ),
-    }
+    width = TACTILE_NUM_LABELS
+    bank = (
+        tuple(f"label{index}" for index in range(width)),
+        torch.nn.functional.normalize(torch.arange(width * 2, dtype=torch.float32).reshape(width, 2), dim=-1),
+        torch.zeros(width),
+    )
     batch = {
         "kind": "signal",
         "media": [None, None],
         "family": "tactile",
         "text": ["unused", "unused"],
-        "targets": {
-            "force_level": torch.eye(2),
-            "grip_stability": torch.eye(2),
-        },
-        "masks": {
-            "force_level": torch.tensor([True, True]),
-            "grip_stability": torch.tensor([True, True]),
-        },
+        "targets": torch.zeros(2, width).index_fill_(1, torch.tensor([0]), 1.0),
+        "masks": torch.ones(2, width),
     }
     cfg = type(
         "Cfg",
@@ -150,30 +231,39 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
         batch,
         cfg,
         label_bank={},
-        tactile_label_bank=bank,
+        tactile_bank=bank,
     )
 
-    expected = (metrics["loss/task/force_level"] + metrics["loss/task/grip_stability"]) / 2
-    assert total.detach().item() == pytest.approx(expected)
-    assert metrics["loss/ts_tactile"] == pytest.approx(expected)
-    assert set(task_eval[3]) == set(bank)
+    # One loss for the whole family, and a per-task breakdown for every task.
+    assert total.detach().item() == pytest.approx(metrics["loss/ts_tactile"])
+    assert metrics["loss/siglip"] == pytest.approx(metrics["loss/ts_tactile"])
+    assert {key for key in metrics if key.startswith("loss/task/")} == {
+        f"loss/task/{task}" for task in TACTILE_SPANS
+    }
+    # ts_eval now carries the (B, 30) target/mask pair rather than per-task dicts.
+    assert task_eval[3].shape == (2, TACTILE_NUM_LABELS)
+    assert task_eval[4].shape == (2, TACTILE_NUM_LABELS)
 
 
 def test_structured_tactile_metrics_merge_as_one_family():
     scale = torch.tensor(math.log(10.0))
     multi_z = torch.tensor([[2**-0.5, 2**-0.5]])
     multi_text = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-(2**-0.5), -(2**-0.5)]])
+    # Only the first task is exercised; the rest are masked out entirely, which is
+    # also a check that a wholly-unobserved task is skipped rather than scored.
+    width = TACTILE_NUM_LABELS
+    first_stop = next(iter(TACTILE_SPANS.values()))[1]
+    embeddings = torch.zeros(width, 2)
+    embeddings[:3] = multi_text
+    targets = torch.zeros(1, width)
+    targets[0, :2] = 1.0
+    masks = torch.zeros(1, width)
+    masks[0, :first_stop] = 1.0
     tactile = _tactile_prediction_metrics(
         multi_z,
-        {"initial_fingers": torch.tensor([[1.0, 1.0, 0.0]])},
-        {"initial_fingers": torch.tensor([True])},
-        {
-            "initial_fingers": (
-                ("thumb", "index", "palm"),
-                multi_text,
-                0.0,
-            )
-        },
+        targets,
+        masks,
+        (tuple(f"label{index}" for index in range(width)), embeddings, torch.zeros(width)),
         scale,
     )
     merged = _merge_prediction_metrics(
@@ -193,13 +283,20 @@ def test_structured_tactile_bank_bias_uses_train_positive_rate():
         def encode_text(self, labels, device):
             return torch.eye(len(labels))
 
-    bank = _build_tactile_label_bank(
+    labels, embeddings, bias = _build_tactile_bank(
         TextModel(),
         dict.fromkeys(TASK_LABELS, 0.25),
         torch.device("cpu"),
     )
 
-    assert bank["force_level"][2] == pytest.approx(-math.log(3))
+    assert len(labels) == TACTILE_NUM_LABELS
+    assert embeddings.shape[0] == TACTILE_NUM_LABELS
+    # The bias is per LABEL, so a task's prior is repeated across its own columns.
+    start, stop = TACTILE_SPANS["force_level"]
+    assert bias.shape == (TACTILE_NUM_LABELS,)
+    assert bias[start:stop].tolist() == pytest.approx([-math.log(3)] * (stop - start))
+    # Column order must follow TASK_LABELS, or every downstream slice is off.
+    assert labels[start:stop] == TASK_LABELS["force_level"]
 
 
 def test_effective_batch_macro_f1_is_not_an_average_of_micro_batches():

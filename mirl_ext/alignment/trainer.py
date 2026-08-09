@@ -25,7 +25,7 @@ from .metrics import (
     add_batch_counts,
 )
 from .objective import (
-    _build_tactile_label_bank,
+    _build_tactile_bank,
     _build_text_label_bank,
     _compute_losses,
 )
@@ -35,7 +35,6 @@ from .runtime import (
     build_optimizer,
     load_checkpoint,
     load_training_state,
-    maybe_init_wandb,
     save_checkpoint,
     setup_logging,
 )
@@ -51,18 +50,17 @@ class AccumulationWindow:
     ts_labels: list[str] = field(default_factory=list)
     ts_families: list[str] = field(default_factory=list)
     tactile_embeddings: list[torch.Tensor] = field(default_factory=list)
-    tactile_target_chunks: dict[str, list[torch.Tensor]] = field(default_factory=dict)
-    tactile_mask_chunks: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+    tactile_target_chunks: list[torch.Tensor] = field(default_factory=list)
+    tactile_mask_chunks: list[torch.Tensor] = field(default_factory=list)
 
     def add(self, batch: dict, metrics: dict, ts_eval: tuple) -> None:
         add_batch_counts(self.counts, batch)
         embeddings, labels, families, tactile_targets, tactile_masks = ts_eval
         if embeddings is not None:
-            if tactile_targets:
+            if tactile_targets is not None:
                 self.tactile_embeddings.append(embeddings)
-                for task in tactile_targets:
-                    self.tactile_target_chunks.setdefault(task, []).append(tactile_targets[task])
-                    self.tactile_mask_chunks.setdefault(task, []).append(tactile_masks[task])
+                self.tactile_target_chunks.append(tactile_targets)
+                self.tactile_mask_chunks.append(tactile_masks)
             else:
                 self.ts_embeddings.append(embeddings)
                 self.ts_labels.extend(labels)
@@ -73,7 +71,7 @@ class AccumulationWindow:
     def score(
         self,
         label_bank,
-        tactile_label_bank,
+        tactile_bank,
         logit_scale,
         world_size: int,
         per_class=None,
@@ -94,9 +92,9 @@ class AccumulationWindow:
         tactile = (
             _tactile_prediction_metrics(
                 torch.cat(self.tactile_embeddings),
-                {task: torch.cat(self.tactile_target_chunks[task]) for task in tactile_label_bank},
-                {task: torch.cat(self.tactile_mask_chunks[task]) for task in tactile_label_bank},
-                tactile_label_bank,
+                torch.cat(self.tactile_target_chunks),
+                torch.cat(self.tactile_mask_chunks),
+                tactile_bank,
                 logit_scale,
                 world_size=world_size,
                 per_label_out=per_label,
@@ -108,7 +106,7 @@ class AccumulationWindow:
 
 
 @torch.no_grad()
-def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_label_bank):
+def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_bank):
     """Evaluate the full sharded validation set."""
     was_training = model.training
     model.eval()
@@ -122,7 +120,7 @@ def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_lab
                 cfg,
                 world_size=world_size,
                 label_bank=label_bank,
-                tactile_label_bank=tactile_label_bank,
+                tactile_bank=tactile_bank,
             )
         window.add(batch, metrics, batch_eval)
 
@@ -137,7 +135,7 @@ def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_lab
     base_model = accelerator.unwrap_model(model)
     prediction_metrics = window.score(
         label_bank,
-        tactile_label_bank,
+        tactile_bank,
         base_model.log_logit_scale,
         world_size,
         per_class,
@@ -192,7 +190,7 @@ def train(cfg: DictConfig) -> None:
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
-    tactile_label_bank = _build_tactile_label_bank(
+    tactile_bank = _build_tactile_bank(
         model,
         train_ds.task_positive_rates,
         device,
@@ -224,7 +222,18 @@ def train(cfg: DictConfig) -> None:
                 f"total_steps {saved_total_steps} != {total_steps}; use "
                 "train.init_checkpoint for a weights-only continuation"
             )
-    wandb_run = maybe_init_wandb(cfg) if is_main else None
+    if is_main:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=str(cfg.wandb.project),
+            name=str(cfg.wandb.name),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            settings=wandb.Settings(console="off"),
+        )
+        logger.info("W&B run initialized: %s", wandb_run.url)
+    else:
+        wandb_run = None
     model.train()
     base_model.frozen_visual.eval()
     base_model.label_text_model.eval()
@@ -286,7 +295,7 @@ def train(cfg: DictConfig) -> None:
                         cfg,
                         world_size=world_size,
                         label_bank=train_label_bank,
-                        tactile_label_bank=tactile_label_bank,
+                        tactile_bank=tactile_bank,
                     )
                 window.add(batch, metrics, micro_eval)
                 accelerator.backward(loss / window_size)
@@ -298,7 +307,7 @@ def train(cfg: DictConfig) -> None:
             metrics["grad_norm"] = float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
             window_metrics = window.score(
                 train_label_bank,
-                tactile_label_bank,
+                tactile_bank,
                 base_model.log_logit_scale,
                 world_size,
             )
@@ -313,33 +322,32 @@ def train(cfg: DictConfig) -> None:
             cumulative_counts.update(counts)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
-                if wandb_run is not None:
-                    payload = _metric_groups("train", metrics, counts, window_metrics)
-                    skipped_total = sum(cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal"))
-                    valid_total = (
-                        cumulative_counts["n/img_image"]
-                        + cumulative_counts["n/img_video"]
-                        + cumulative_counts["n/ts_signal"]
+                payload = _metric_groups("train", metrics, counts, window_metrics)
+                skipped_total = sum(cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal"))
+                valid_total = (
+                    cumulative_counts["n/img_image"]
+                    + cumulative_counts["n/img_video"]
+                    + cumulative_counts["n/ts_signal"]
+                )
+                for kind in ("image", "video", "signal"):
+                    payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(
+                        cumulative_counts[f"n/skipped_{kind}"]
                     )
-                    for kind in ("image", "video", "signal"):
-                        payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(
-                            cumulative_counts[f"n/skipped_{kind}"]
-                        )
-                    payload["train-aux/n/skipped_cumulative/total"] = float(skipped_total)
-                    payload["train-aux/skipped_fraction_cumulative"] = skipped_total / max(
-                        valid_total + skipped_total,
-                        1,
-                    )
-                    wandb_run.log(
-                        {
-                            **payload,
-                            "train-aux/lr/model": lrs["model"],
-                            "train-aux/lr/scalar": lrs["scalar"],
-                            "train-aux/epoch": epoch + (batch_index + 1) / micro_batches_per_epoch,
-                        },
-                        step=opt_step,
-                        commit=not validate_now,
-                    )
+                payload["train-aux/n/skipped_cumulative/total"] = float(skipped_total)
+                payload["train-aux/skipped_fraction_cumulative"] = skipped_total / max(
+                    valid_total + skipped_total,
+                    1,
+                )
+                wandb_run.log(
+                    {
+                        **payload,
+                        "train-aux/lr/model": lrs["model"],
+                        "train-aux/lr/scalar": lrs["scalar"],
+                        "train-aux/epoch": epoch + (batch_index + 1) / micro_batches_per_epoch,
+                    },
+                    step=opt_step,
+                    commit=not validate_now,
+                )
 
             if validate_now:
                 val_metrics, per_class, per_label = _run_validation(
@@ -348,7 +356,7 @@ def train(cfg: DictConfig) -> None:
                     cfg,
                     accelerator,
                     label_bank=val_label_bank,
-                    tactile_label_bank=tactile_label_bank,
+                    tactile_bank=tactile_bank,
                 )
                 if is_main:
                     current = val_metrics[cfg.train.best_metric]
@@ -356,42 +364,39 @@ def train(cfg: DictConfig) -> None:
                     if is_best:
                         best_value = current
                         save_checkpoint(base_model, out_dir / "best", cfg, opt_step)
-                    if wandb_run is not None:
-                        import wandb
-
-                        payload = dict(val_metrics)
-                        if is_best:
-                            payload.update({"best/metric": current, "best/step": opt_step})
-                        columns = (
-                            "class_id",
-                            "label",
-                            "support",
-                            "predicted",
-                            "precision",
-                            "recall",
-                            "f1",
-                            "recall_at_5",
+                    payload = dict(val_metrics)
+                    if is_best:
+                        payload.update({"best/metric": current, "best/step": opt_step})
+                    columns = (
+                        "class_id",
+                        "label",
+                        "support",
+                        "predicted",
+                        "precision",
+                        "recall",
+                        "f1",
+                        "recall_at_5",
+                    )
+                    for family, rows in per_class.items():
+                        payload[f"val-aux/per_class/{family}"] = wandb.Table(
+                            columns=list(columns),
+                            data=[[row[column] for column in columns] for row in rows],
                         )
-                        for family, rows in per_class.items():
-                            payload[f"val-aux/per_class/{family}"] = wandb.Table(
-                                columns=list(columns),
-                                data=[[row[column] for column in columns] for row in rows],
-                            )
-                        tactile_columns = (
-                            "task",
-                            "label",
-                            "support",
-                            "predicted",
-                            "precision",
-                            "recall",
-                            "f1",
+                    tactile_columns = (
+                        "task",
+                        "label",
+                        "support",
+                        "predicted",
+                        "precision",
+                        "recall",
+                        "f1",
+                    )
+                    if per_label:
+                        payload["val-aux/per_label/tactile"] = wandb.Table(
+                            columns=list(tactile_columns),
+                            data=[[row[column] for column in tactile_columns] for row in per_label],
                         )
-                        if per_label:
-                            payload["val-aux/per_label/tactile"] = wandb.Table(
-                                columns=list(tactile_columns),
-                                data=[[row[column] for column in tactile_columns] for row in per_label],
-                            )
-                        wandb_run.log(payload, step=opt_step, commit=True)
+                    wandb_run.log(payload, step=opt_step, commit=True)
                     save_checkpoint(
                         base_model,
                         out_dir / "last",
@@ -413,8 +418,7 @@ def train(cfg: DictConfig) -> None:
 
     if is_main:
         save_checkpoint(base_model, out_dir / "final", cfg, opt_step)
-        if wandb_run is not None:
-            wandb_run.finish()
+        wandb_run.finish()
         logger.info(
             "training complete: best %s=%.4f; skipped=%s; final=%s",
             cfg.train.best_metric,

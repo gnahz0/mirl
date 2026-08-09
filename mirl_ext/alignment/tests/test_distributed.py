@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import nullcontext
+from unittest import mock
 
 import pytest
 
@@ -27,7 +28,8 @@ class _ToyModel(torch.nn.Module):
 
 def _worker(rank: int, results: dict) -> None:
     from mirl_ext.alignment.metrics import _label_ranking_metrics
-    from mirl_ext.alignment.objective import _label_siglip_loss, _tactile_task_siglip_loss
+    from mirl_ext.alignment.data import TACTILE_SPANS
+    from mirl_ext.alignment.objective import _label_siglip_loss, _tactile_siglip_loss
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29517"
@@ -62,30 +64,35 @@ def _worker(rank: int, results: dict) -> None:
         reference.zero_grad()
         embeddings, scale = model(inputs)
         tactile_targets = (torch.tensor([[1.0, 0.0], [1.0, 0.0]]), torch.tensor([[0.0, 1.0]]))[rank]
-        tactile_mask = (torch.tensor([True, True]), torch.tensor([False]))[rank]
-        tactile_loss = _tactile_task_siglip_loss(
-            embeddings,
-            tactile_targets,
-            tactile_mask,
-            text,
-            0.0,
-            scale,
-            world_size=2,
-        )
-        assert tactile_loss is not None
-        tactile_loss.backward()
+        # Rank 1's only row is unannotated, so the sharded loss must equal a
+        # single-process reference over rank 0's two rows alone.
+        tactile_mask = (torch.ones(2, 2), torch.zeros(1, 2))[rank]
+        bias = torch.zeros(2)
+        # The toy bank is 2 labels wide; pretend it is one task spanning both.
+        with mock.patch.dict(TACTILE_SPANS, {"toy": (0, 2)}, clear=True):
+            tactile_loss, _ = _tactile_siglip_loss(
+                embeddings,
+                tactile_targets,
+                tactile_mask,
+                text,
+                bias,
+                scale,
+                world_size=2,
+            )
+            assert tactile_loss is not None
+            tactile_loss.backward()
 
-        reference_embeddings, reference_scale = reference(all_inputs[:2])
-        reference_loss = _tactile_task_siglip_loss(
-            reference_embeddings,
-            torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
-            torch.tensor([True, True]),
-            text,
-            0.0,
-            reference_scale,
-        )
-        assert reference_loss is not None
-        reference_loss.backward()
+            reference_embeddings, reference_scale = reference(all_inputs[:2])
+            reference_loss, _ = _tactile_siglip_loss(
+                reference_embeddings,
+                torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+                torch.ones(2, 2),
+                text,
+                bias,
+                reference_scale,
+            )
+            assert reference_loss is not None
+            reference_loss.backward()
         results[rank] = standard_result + (
             torch.allclose(model.module.weight.grad, reference.weight.grad, atol=1e-6),
             torch.allclose(model.module.log_scale.grad, reference.log_scale.grad, atol=1e-6),

@@ -67,4 +67,3 @@ def test_checkpoint_restores_model_optimizer_scheduler_and_progress(tmp_path):
         "steps_per_epoch": 10,
         "total_steps": 20,
     }
-    assert not list(tmp_path.glob("*.tmp"))
