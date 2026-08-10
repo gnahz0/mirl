@@ -113,7 +113,6 @@ def build_model(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
         visual_dtype=visual_dtype,
-        contrastive_temperature=cfg.loss.temperature,
     ).to(device)
     if cfg.train.gradient_checkpointing:
         # Only the trainable tower; the frozen anchor already runs under no_grad.
@@ -150,7 +149,6 @@ def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_step
         eps=1e-8,
     )
     warmup = math.ceil(total_steps * float(cfg.train.warmup_ratio))
-    logger.info("cosine schedule: %d warmup steps, %d total optimizer steps", warmup, total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
     return optimizer, scheduler
 
@@ -162,8 +160,7 @@ def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> int:
     model.trainable_visual.load_state_dict(state["trainable_visual"], strict=True)
     with torch.no_grad():
         model.log_logit_scale.copy_(state["log_logit_scale"])
-        if "logit_bias" in state and hasattr(model, "logit_bias"):
-            model.logit_bias.copy_(state["logit_bias"])
+        model.logit_bias.copy_(state["logit_bias"])
     step = int(state.get("step", 0))
     logger.info("loaded alignment checkpoint %s (step=%d)", state_path, step)
     return step
@@ -194,10 +191,9 @@ def save_checkpoint(
     state = {
         "trainable_visual": model.trainable_visual.state_dict(),
         "log_logit_scale": model.log_logit_scale.detach().cpu(),
+        "logit_bias": model.logit_bias.detach().cpu(),
         "step": step,
     }
-    if hasattr(model, "logit_bias"):
-        state["logit_bias"] = model.logit_bias.detach().cpu()
     torch.save(state, path / "alignment_state.pt")
     if optimizer is not None:
         trainer_state = {

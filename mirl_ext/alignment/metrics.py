@@ -9,11 +9,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from .data import MULTILABEL_TASKS, TACTILE_SPANS, TASK_LABELS
+from .data import (
+    _CLASSIFICATION_FAMILIES,
+    _TS_FAMILIES,
+    MULTILABEL_TASKS,
+    TACTILE_SPANS,
+    TASK_LABELS,
+)
 
-# Metric reduction order must be identical on every rank.
-_TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
-_CLASSIFICATION_FAMILIES = ("smellnet", "ecg")
 _PUBLIC_STATS = ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
 _ALL_STATS = (*_PUBLIC_STATS, "prediction_coverage")
 
@@ -34,12 +37,6 @@ _COUNT_KEYS: tuple[str, ...] = (
     *(f"n/ts_{family}" for family in _TS_FAMILIES),
     *(f"n/skipped_{kind}" for kind in ("image", "video", "signal")),
 )
-
-# Every published statistic is a ratio of sums over rows, so these nine tensors
-# are all any reduction ever needs. Per-class counts are one entry per label;
-# the rest are scalars.
-_CLASS_FIELDS = ("support", "predicted", "true_positive", "recall_at_5_count")
-_SCALAR_FIELDS = ("top_is_positive", "recall_at_1", "recall_at_5", "average_precision", "n")
 
 
 def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> dict[str, torch.Tensor]:
@@ -68,21 +65,17 @@ class BankSpec:
 
     The only thing that differs between smellnet, ecg and the six tactile tasks,
     and it is data rather than a code path -- all eight score through
-    ``_bank_stats``. ``label_to_id`` selects rows by batch family and one-hots the
-    ground-truth string; ``span`` selects them by the tactile mask and slices that
-    task's columns. ``threshold_bias`` predicts every label whose biased logit
-    exceeds zero, else the prediction is the argmax within this bank.
+    ``_bank_stats``. ``key`` carries the rest of the identity: it names the unit's
+    W&B keys, it is how ``_microbatch_units`` finds the unit a row belongs to, and
+    its prefix says whether the unit is a family or a task. ``multilabel`` is a
+    field rather than another thing read off ``key`` because it alone decides a
+    published number -- every logit above zero, against the argmax.
     """
 
     key: str  # "ts_smellnet" | "task/force_level"
     labels: tuple[str, ...]
     embeddings: torch.Tensor  # (K, D) frozen bank or bank slice
-    family: str | None = None
-    label_to_id: dict[str, int] | None = None
-    threshold_bias: torch.Tensor | None = None  # (K,)
-    span: tuple[int, int] | None = None
-    report_key: str | None = None  # emit per-class W&B rows under this name
-    row_extra: dict[str, object] | None = None
+    multilabel: bool = False
 
 
 def build_bank_specs(label_bank: dict, tactile_bank: tuple | None) -> tuple[BankSpec, ...]:
@@ -90,36 +83,16 @@ def build_bank_specs(label_bank: dict, tactile_bank: tuple | None) -> tuple[Bank
 
     Depends only on the label banks and ``TACTILE_SPANS``, so the unit list -- and
     the reduce buffer's length -- is identical on every rank for the whole run.
+    ``update_stats`` re-reads ``TACTILE_SPANS`` to slice the same columns back out,
+    so the two must see the same span table; nothing is cached to disagree with it.
     """
-    specs: list[BankSpec] = []
-    for family in _TS_FAMILIES:
-        entry = label_bank.get(family)
-        if entry is None:
-            continue
-        labels, embeddings = entry
-        specs.append(
-            BankSpec(
-                key=f"ts_{family}",
-                labels=labels,
-                embeddings=embeddings,
-                family=family,
-                label_to_id={label: index for index, label in enumerate(labels)},
-                report_key=family if family in _CLASSIFICATION_FAMILIES else None,
-            )
-        )
+    specs = [BankSpec(f"ts_{family}", *label_bank[family]) for family in _TS_FAMILIES if family in label_bank]
     if tactile_bank is not None:
-        all_labels, embeddings, bias = tactile_bank
-        for task, (start, stop) in TACTILE_SPANS.items():
-            specs.append(
-                BankSpec(
-                    key=f"task/{task}",
-                    labels=all_labels[start:stop],
-                    embeddings=embeddings[start:stop],
-                    threshold_bias=bias[start:stop] if task in MULTILABEL_TASKS else None,
-                    span=(start, stop),
-                    row_extra={"task": task},
-                )
-            )
+        labels, embeddings = tactile_bank
+        specs += [
+            BankSpec(f"task/{task}", labels[start:stop], embeddings[start:stop], task in MULTILABEL_TASKS)
+            for task, (start, stop) in TACTILE_SPANS.items()
+        ]
     return tuple(specs)
 
 
@@ -129,6 +102,7 @@ def _bank_stats(
     target: torch.Tensor,
     spec: BankSpec,
     log_logit_scale: torch.Tensor | None = None,
+    logit_bias: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Sufficient statistics for one (rows x bank) scoring problem. No collective.
 
@@ -136,47 +110,46 @@ def _bank_stats(
     familiar form: average precision over one positive is ``1 / rank``, recall@1 is
     accuracy. These sums add across microbatches exactly as they add across ranks,
     so nothing retains embeddings and macro-F1 stays a pooled-confusion number.
-    Zero rows is legal and yields zeros, which keeps an empty rank in lockstep.
+    Zero rows is legal and yields zeros, which keeps an empty rank in lockstep and
+    is what ``new_stats`` uses to size the buffer.
     """
-    num_labels = len(spec.labels)
     target = target.to(z.device).bool()
+    # A transposed view, never .contiguous(): fresh strides make cuBLAS pick a
+    # different kernel and move the similarities in their last bits, which
+    # argsort(stable=True) can turn into a different tie order.
     sims = z.float() @ spec.embeddings.to(z.device).float().t()
     # stable=True pins tie order to label index, so a row scores identically
     # however the rows were chunked.
     ranked = sims.argsort(dim=1, descending=True, stable=True)
-    top = ranked[:, 0]
-    top_k = ranked[:, : min(5, num_labels)]
+    top, top_k = ranked[:, :1], ranked[:, :5]  # a slice already clamps to a narrower bank
 
-    top_is_positive = target.gather(1, top[:, None]).squeeze(1)
+    top_is_positive = target.gather(1, top).squeeze(1)
     positive_count = target.sum(dim=1).clamp_min(1)
     recall_at_1 = top_is_positive.float() / positive_count
     recall_at_5 = target.gather(1, top_k).sum(dim=1) / positive_count
 
     ranked_target = target.gather(1, ranked).float()
-    ranks = torch.arange(1, num_labels + 1, device=z.device, dtype=torch.float32)
+    ranks = torch.arange(1, len(spec.labels) + 1, device=z.device, dtype=torch.float32)
     precision_at_rank = ranked_target.cumsum(dim=1) / ranks
-    average_precision = (precision_at_rank * ranked_target).sum(dim=1) / ranked_target.sum(
-        dim=1
-    ).clamp_min(1)
+    average_precision = (precision_at_rank * ranked_target).sum(dim=1) / ranked_target.sum(dim=1).clamp_min(1)
 
-    if spec.threshold_bias is None:
-        predicted_mask = F.one_hot(top, num_classes=num_labels).bool()
-    else:
-        logits = log_logit_scale.float().exp() * sims + spec.threshold_bias.to(z.device)
-        predicted_mask = logits > 0
-    in_top_k = torch.zeros_like(target)
-    in_top_k.scatter_(1, top_k, True)
+    predicted = (
+        log_logit_scale.float().exp() * sims + logit_bias.float() > 0
+        if spec.multilabel
+        else torch.zeros_like(target).scatter_(1, top, True)
+    )
+    in_top_k = torch.zeros_like(target).scatter_(1, top_k, True)
 
     return {
-        "support": target.sum(dim=0).double(),
-        "predicted": predicted_mask.sum(dim=0).double(),
-        "true_positive": (target & predicted_mask).sum(dim=0).double(),
-        "recall_at_5_count": (target & in_top_k).sum(dim=0).double(),
-        "top_is_positive": top_is_positive.double().sum(),
-        "recall_at_1": recall_at_1.double().sum(),
-        "recall_at_5": recall_at_5.double().sum(),
-        "average_precision": average_precision.double().sum(),
-        "n": z.new_tensor(float(len(target)), dtype=torch.float64),
+        f"{spec.key}/support": target.sum(dim=0).double(),
+        f"{spec.key}/predicted": predicted.sum(dim=0).double(),
+        f"{spec.key}/true_positive": (target & predicted).sum(dim=0).double(),
+        f"{spec.key}/recall_at_5_count": (target & in_top_k).sum(dim=0).double(),
+        f"{spec.key}/top_is_positive": top_is_positive.double().sum(),
+        f"{spec.key}/recall_at_1": recall_at_1.double().sum(),
+        f"{spec.key}/recall_at_5": recall_at_5.double().sum(),
+        f"{spec.key}/average_precision": average_precision.double().sum(),
+        f"{spec.key}/n": z.new_tensor(float(len(target)), dtype=torch.float64),
     }
 
 
@@ -188,19 +161,22 @@ def _bank_metrics(
     rows_out: list[dict[str, object]] | None = None,
 ) -> dict[str, float]:
     """Turn globally reduced sufficient statistics into the published scalars."""
-    support, predicted = stats["support"], stats["predicted"]
-    true_positive, sample_count = stats["true_positive"], stats["n"]
+    support, predicted = stats[f"{spec.key}/support"], stats[f"{spec.key}/predicted"]
+    true_positive, sample_count = stats[f"{spec.key}/true_positive"], stats[f"{spec.key}/n"]
 
     precision = true_positive / predicted.clamp_min(1)
     recall = true_positive / support.clamp_min(1)
     f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
-    recall_at_5_by_class = stats["recall_at_5_count"] / support.clamp_min(1)
+    recall_at_5_by_class = stats[f"{spec.key}/recall_at_5_count"] / support.clamp_min(1)
     supported = support > 0
+    task = spec.key.partition("task/")[2]
 
     if rows_out is not None:
         rows_out.extend(
             {
-                **(spec.row_extra or {}),
+                # The six tasks share one table, so their rows say which task; a
+                # family has its own table and would only repeat its own name.
+                **({"task": task} if task else {}),
                 "class_id": index,
                 "label": label,
                 "support": support[index].item(),
@@ -214,11 +190,11 @@ def _bank_metrics(
         )
 
     return {
-        "accuracy": float(stats["top_is_positive"] / sample_count),
+        "accuracy": float(stats[f"{spec.key}/top_is_positive"] / sample_count),
         "f1_macro": float(f1[supported].mean()),
-        "recall_at_1": float(stats["recall_at_1"] / sample_count),
-        "recall_at_5": float(stats["recall_at_5"] / sample_count),
-        "map": float(stats["average_precision"] / sample_count),
+        "recall_at_1": float(stats[f"{spec.key}/recall_at_1"] / sample_count),
+        "recall_at_5": float(stats[f"{spec.key}/recall_at_5"] / sample_count),
+        "map": float(stats[f"{spec.key}/average_precision"] / sample_count),
         "prediction_coverage": float((predicted > 0).sum()) / len(spec.labels),
     }
 
@@ -230,53 +206,62 @@ def score_bank(
     target: torch.Tensor,
     *,
     log_logit_scale: torch.Tensor | None = None,
+    logit_bias: torch.Tensor | None = None,
     rows_out: list[dict[str, object]] | None = None,
     world_size: int = 1,
 ) -> dict[str, float]:
     """Score one unit in one shot: accumulate, reduce, derive."""
-    stats = all_reduce_sum(_bank_stats(z, target, spec, log_logit_scale), world_size=world_size)
+    stats = all_reduce_sum(
+        _bank_stats(z, target, spec, log_logit_scale, logit_bias),
+        world_size=world_size,
+    )
     return _bank_metrics(stats, spec, rows_out=rows_out)
 
 
 def new_stats(specs: tuple[BankSpec, ...], device: torch.device) -> dict[str, torch.Tensor]:
-    """Zero-fill the complete statistic key set before any data is seen."""
-    stats: dict[str, torch.Tensor] = {}
-    for spec in specs:
-        for field_name in _CLASS_FIELDS:
-            stats[f"{spec.key}/{field_name}"] = torch.zeros(
-                len(spec.labels), dtype=torch.float64, device=device
-            )
-        for field_name in _SCALAR_FIELDS:
-            stats[f"{spec.key}/{field_name}"] = torch.zeros((), dtype=torch.float64, device=device)
-    return stats
+    """Zero-fill the complete statistic key set before any data is seen.
+
+    Sized by asking the producer for the statistics of zero rows, which are exactly
+    zeros, so the buffer cannot fall out of step with what ``update_stats`` writes.
+    """
+    return {
+        key: value.to(device)
+        for spec in specs
+        for key, value in _bank_stats(
+            spec.embeddings.new_zeros(0, spec.embeddings.shape[1]),
+            spec.embeddings.new_zeros(0, len(spec.labels)),
+            spec,
+            spec.embeddings.new_zeros(()),
+            spec.embeddings.new_zeros(()),
+        ).items()
+    }
 
 
-def _unit_rows(
-    spec: BankSpec,
-    z: torch.Tensor,
-    texts: list[str],
-    families: list[str],
-    targets: torch.Tensor | None,
-    masks: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Select this unit's rows and multi-hot target from one microbatch."""
-    if spec.span is None:
-        index = [i for i, value in enumerate(families) if value == spec.family]
-        if not index:
-            return None
-        selected = torch.tensor(index, device=z.device, dtype=torch.long)
-        ids = torch.tensor([spec.label_to_id[texts[i]] for i in index], device=z.device)
-        return z[selected], F.one_hot(ids, num_classes=len(spec.labels))
+def _microbatch_units(specs, z, texts, families, targets, masks):
+    """Every unit holding rows here, as (spec, its rows of ``z``, its multi-hot target).
+
+    The one place that knows the two kinds of answer apart: a family row names its
+    label as a string, a tactile row carries an answered span of the collated
+    target. Both leave as the same triple, which is why nothing downstream branches
+    on unit kind. Enumerating the families the microbatch actually carries -- rather
+    than asking every unit whether the batch is its own -- is what makes a visual
+    microbatch, which carries none and whose ``z`` is None, yield nothing at all.
+    """
+    by_key = {spec.key: spec for spec in specs}
     if masks is None:
-        return None
-    start, stop = spec.span
-    span_mask = masks[:, start:stop] > 0
-    rows = span_mask[:, 0]
-    # collate_alignment writes a task's mask columns as one slice; that is the only
-    # reason one column recovers the per-row mask, and nothing in data.py enforces it.
-    if not torch.equal(span_mask, rows[:, None].expand_as(span_mask)):
-        raise ValueError(f"tactile mask is not span-uniform for {spec.key}")
-    return z[rows], targets[rows, start:stop]
+        rows_by_key: dict[str, list[int]] = {}
+        for position, family in enumerate(families):
+            rows_by_key.setdefault(f"ts_{family}", []).append(position)
+        for key, rows in rows_by_key.items():
+            spec = by_key[key]
+            ids = torch.tensor([spec.labels.index(texts[row]) for row in rows], dtype=torch.long)
+            yield spec, z[rows], F.one_hot(ids, len(spec.labels))
+        return
+    for task, (start, stop) in TACTILE_SPANS.items():
+        # collate_alignment writes a task's whole span in one assignment, so requiring
+        # the whole span drops a partly-answered row rather than misreading it.
+        rows = (masks[:, start:stop] > 0).all(dim=1)
+        yield by_key[f"task/{task}"], z[rows], targets[rows, start:stop]
 
 
 @torch.no_grad()
@@ -285,19 +270,13 @@ def update_stats(
     specs: tuple[BankSpec, ...],
     ts_eval: tuple,
     log_logit_scale: torch.Tensor | None,
+    logit_bias: torch.Tensor | None,
 ) -> None:
     """Fold one microbatch into the running statistics. No collective, no retention."""
-    z, texts, families, targets, masks = ts_eval
-    if z is None:
-        return
-    for spec in specs:
-        rows = _unit_rows(spec, z, texts, families, targets, masks)
-        if rows is None:
-            continue
-        for field_name, value in _bank_stats(rows[0], rows[1], spec, log_logit_scale).items():
+    for spec, rows, target in _microbatch_units(specs, *ts_eval):
+        for key, value in _bank_stats(rows, target, spec, log_logit_scale, logit_bias).items():
             # Fixed key set: a diverged rank raises KeyError rather than hanging.
-            key = f"{spec.key}/{field_name}"
-            stats[key] = stats[key] + value
+            stats[key] += value
 
 
 @torch.no_grad()
@@ -313,18 +292,17 @@ def prediction_metrics(
     task_scores: list[dict[str, float]] = []
     for spec in specs:
         # Reads an already-reduced count, so every rank takes the same branch.
-        unit = {name: stats[f"{spec.key}/{name}"] for name in (*_CLASS_FIELDS, *_SCALAR_FIELDS)}
-        if not float(unit["n"]):
+        if not float(stats[f"{spec.key}/n"]):
             continue
-        rows_out = None
-        if spec.report_key is not None and per_class is not None:
-            rows_out = per_class.setdefault(spec.report_key, [])
-        elif spec.span is not None and per_label is not None:
-            rows_out = per_label
-        scores = _bank_metrics(unit, spec, rows_out=rows_out)
+        is_task = spec.key.startswith("task/")
+        # The six tasks share one table; each reported family gets its own.
+        rows_out = per_label if is_task else None
+        if per_class is not None and (family := spec.key.removeprefix("ts_")) in _CLASSIFICATION_FAMILIES:
+            rows_out = per_class.setdefault(family, [])
+        scores = _bank_metrics(stats, spec, rows_out=rows_out)
         for stat in _ALL_STATS:
             metrics[f"{stat}/{spec.key}"] = scores[stat]
-        if spec.span is not None:
+        if is_task:
             task_scores.append(scores)
     if task_scores:
         for stat in _ALL_STATS:
@@ -341,8 +319,6 @@ def _merge_prediction_metrics(*metric_sets: dict[str, float]) -> dict[str, float
         family_values = [merged[f"{stat}/ts_{family}"] for family in _TS_FAMILIES if f"{stat}/ts_{family}" in merged]
         if family_values:
             merged[f"{stat}/overall"] = sum(family_values) / len(family_values)
-        else:
-            merged.pop(f"{stat}/overall", None)
     return merged
 
 
@@ -403,7 +379,7 @@ def _metric_groups(
 
     if split == "train":
         for key, value in loss_metrics.items():
-            if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale"}:
+            if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale", "logit_bias"}:
                 out[f"{aux}/{key}"] = value
         out[f"{aux}/n/img"] = float(counts["n/img_image"] + counts["n/img_video"])
 

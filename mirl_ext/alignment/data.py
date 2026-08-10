@@ -22,7 +22,11 @@ os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
 os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 
 
-_SIGNAL_FAMILIES = ("smellnet", "ecg", "tactile")
+# Metric reduction order must be identical on every rank, so this tuple is the one
+# definition of it; tactile aligns against TASK_LABELS and never has a vocabulary.
+_TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
+_CLASSIFICATION_FAMILIES: tuple[str, ...] = ("smellnet", "ecg")
+_SIGNAL_FORMATS = {"": "smellnet", "ts_pt": "ecg", "tactile_pt": "tactile"}
 _SKIPPABLE_LOAD_ERRORS = (OSError, ValueError, RuntimeError, EOFError)
 
 # Closed-label tactile tasks. The haptic signal Parquets contain open-ended
@@ -105,10 +109,12 @@ def _parse_annotation_answer(answer: object, task: str) -> tuple[int, ...]:
     """Convert comma-separated QA choices (for example ``A,B,F``) to IDs."""
     labels = TASK_LABELS[task]
     choices = [choice.strip() for choice in str(answer).split(",")]
-    if not choices or any(len(choice) != 1 or not choice.isalpha() for choice in choices):
+    if any(len(choice) != 1 or not choice.isalpha() for choice in choices):
         raise ValueError(f"invalid answer {answer!r}")
+    # Splitting always yields a choice and no alphabetic codepoint sits below "A", so
+    # the upper bound is the only reachable range failure -- it also rejects lowercase.
     indices = tuple(sorted({ord(choice) - ord("A") for choice in choices}))
-    if not indices or indices[0] < 0 or indices[-1] >= len(labels):
+    if indices[-1] >= len(labels):
         raise ValueError(f"answer {answer!r} is outside A-{chr(ord('A') + len(labels) - 1)}")
     if task not in MULTILABEL_TASKS and len(indices) != 1:
         raise ValueError(f"exclusive task has {len(indices)} choices in {answer!r}")
@@ -120,8 +126,7 @@ def _annotation_targets(
     valid_stems: set[str],
 ) -> dict[str, dict[str, tuple[int, ...]]]:
     """Join the fixed closed QA answers by recording stem."""
-    targets: dict[str, dict[str, tuple[int, ...]]] = defaultdict(dict)
-    conflicts: set[tuple[str, str]] = set()
+    answers: dict[str, dict[str, set[tuple[int, ...]]]] = defaultdict(lambda: defaultdict(set))
     for row in rows:
         task = str(row["data_source"])
         if task not in TASK_LABELS:
@@ -129,16 +134,13 @@ def _annotation_targets(
         stem = _recording_stem(row)
         if stem not in valid_stems:
             continue
-        answer = _parse_annotation_answer(row["reward_model"]["ground_truth"], task)
-        if (stem, task) in conflicts:
-            continue
-        previous = targets[stem].get(task)
-        if previous is not None and previous != answer:
-            targets[stem].pop(task)
-            conflicts.add((stem, task))
-        else:
-            targets[stem][task] = answer
-    return dict(targets)
+        answers[stem][task].add(_parse_annotation_answer(row["reward_model"]["ground_truth"], task))
+    # Duplicate QA rows that disagree drop the pair, not the recording: the stem stays
+    # a key so its other tasks still supervise.
+    return {
+        stem: {task: next(iter(choices)) for task, choices in tasks.items() if len(choices) == 1}
+        for stem, tasks in answers.items()
+    }
 
 
 def _visual_entries(row: dict) -> list[tuple[str, tuple[str, str], dict | str]]:
@@ -191,7 +193,7 @@ def _expand_and_deduplicate_visual_rows(rows: list[dict]) -> tuple[list[dict], i
 
 
 def _signal_family(sig_entry: dict) -> str:
-    return {"": "smellnet", "ts_pt": "ecg", "tactile_pt": "tactile"}[sig_entry["format"]]
+    return _SIGNAL_FORMATS[sig_entry["format"]]
 
 
 def _load_signal_csv(path: str) -> torch.Tensor:
@@ -315,25 +317,21 @@ class AlignmentDataset(Dataset):
 
         rows = [row for row in rows if row["data_source"] != "smellnet_mixture"]
 
-        self.task_positive_rates: dict[str, float] = {}
         tactile_rows = [
             row for row in rows if (signals := row.get("signals") or []) and _signal_family(signals[0]) == "tactile"
         ]
         if tactile_rows:
-            valid_stems = {_recording_stem(row) for row in tactile_rows}
-            annotations = _annotation_targets(rows, valid_stems)
-            for row in tactile_rows:
-                row["_tactile_targets"] = annotations[_recording_stem(row)]
-            for task, labels in TASK_LABELS.items():
-                observed = [row["_tactile_targets"][task] for row in tactile_rows if task in row["_tactile_targets"]]
-                positive_rate = sum(map(len, observed)) / (len(observed) * len(labels))
-                self.task_positive_rates[task] = positive_rate
+            stems = [_recording_stem(row) for row in tactile_rows]
+            annotations = _annotation_targets(rows, set(stems))
+            for row, stem in zip(tactile_rows, stems, strict=True):
+                row["_tactile_targets"] = annotations[stem]
+            for task in TASK_LABELS:
+                observed = sum(task in row["_tactile_targets"] for row in tactile_rows)
                 logger.info(
-                    "tactile labels: task=%s observed=%d missing=%d positive_rate=%.4f",
+                    "tactile labels: task=%s observed=%d missing=%d",
                     task,
-                    len(observed),
-                    len(tactile_rows) - len(observed),
-                    positive_rate,
+                    observed,
+                    len(tactile_rows) - observed,
                 )
 
         rows, visual_paths, repeated = _expand_and_deduplicate_visual_rows(rows)
@@ -344,29 +342,20 @@ class AlignmentDataset(Dataset):
                 repeated,
             )
 
-        vocab_sets = {family: set() for family in _SIGNAL_FAMILIES}
-        for row in rows:
-            signals = row.get("signals") or []
-            if not signals:
-                continue
-            family = _signal_family(signals[0])
-            if "_tactile_targets" in row:
-                continue
-            vocab_sets[family].add(row["reward_model"]["ground_truth"])
-        self.ts_label_vocabs = {
-            family: tuple(sorted(vocab_sets[family])) for family in _SIGNAL_FAMILIES if vocab_sets[family]
-        }
-
         self.rows = rows
+        # Tactile rows are supervised by their joined QA spans, never by a vocabulary.
+        vocab_sets: dict[str, set[str]] = {family: set() for family in _CLASSIFICATION_FAMILIES}
         self.sampling_groups: dict[tuple[str, str], list[int]] = {}
-        for index, row in enumerate(self.rows):
+        for index, row in enumerate(rows):
             signals = row.get("signals") or []
             if signals:
                 kind = "signal"
+                if (family := _signal_family(signals[0])) in vocab_sets:
+                    vocab_sets[family].add(row["reward_model"]["ground_truth"])
             else:
                 kind = "image" if row.get("images") else "video"
-            group = (kind, row["data_source"])
-            self.sampling_groups.setdefault(group, []).append(index)
+            self.sampling_groups.setdefault((kind, row["data_source"]), []).append(index)
+        self.ts_label_vocabs = {family: tuple(sorted(labels)) for family, labels in vocab_sets.items() if labels}
         group_sizes = {f"{kind}/{source}": len(indices) for (kind, source), indices in self.sampling_groups.items()}
         logger.info(
             "AlignmentDataset: %d unique rows from %d files; groups=%s",
@@ -546,18 +535,14 @@ def collate_alignment(batch: list[dict]) -> dict:
     }
     if kind == "signal" and "targets" in valid[0]:
         # One (B, 30) target and one (B, 30) weight over the concatenated task
-        # vocabularies. The weight is 1.0 only where the QA join produced an answer:
-        # an unannotated row keeps an all-zero target, and zero weight is what stops
-        # the loss from reading that as "none of these labels apply".
-        targets = torch.zeros((len(valid), TACTILE_NUM_LABELS), dtype=torch.float32)
-        mask = torch.zeros((len(valid), TACTILE_NUM_LABELS), dtype=torch.float32)
-        for row_index, item in enumerate(valid):
+
+        width = max(stop for _, stop in TACTILE_SPANS.values())
+        targets = torch.zeros(len(valid), width, dtype=torch.float32)
+        masks = torch.zeros(len(valid), width, dtype=torch.float32)
+        for row, item in enumerate(valid):
             for task, (start, stop) in TACTILE_SPANS.items():
-                positive = item["targets"].get(task)
-                if positive is None:
-                    continue
-                mask[row_index, start:stop] = 1.0
-                targets[row_index, [start + index for index in positive]] = 1.0
+                masks[row, start:stop] = float(task in item["targets"])
+                targets[row, [start + index for index in item["targets"].get(task, ())]] = 1.0
         collated["targets"] = targets
-        collated["masks"] = mask
+        collated["masks"] = masks
     return collated

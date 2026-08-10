@@ -20,10 +20,11 @@ class _ToyModel(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.eye(2))
         self.log_scale = torch.nn.Parameter(torch.tensor(math.log(10.0)))
+        self.bias = torch.nn.Parameter(torch.tensor(-10.0))
 
     def forward(self, x):
         values = torch.nn.functional.normalize(x @ self.weight, dim=-1)
-        return values, self.log_scale * 1.0
+        return values, self.log_scale * 1.0, self.bias * 1.0
 
 
 def _free_port() -> int:
@@ -66,31 +67,46 @@ def _worker(rank: int, results: dict, port: int) -> None:
         model = DistributedDataParallel(_ToyModel())
         for sync in (False, True):
             with nullcontext() if sync else model.no_sync():
-                embeddings, scale = model(inputs)
-                loss = _label_siglip_loss(embeddings, labels, candidates, text, scale, world_size=2)
+                embeddings, scale, bias = model(inputs)
+                loss = _label_siglip_loss(
+                    embeddings,
+                    labels,
+                    candidates,
+                    text,
+                    scale,
+                    bias,
+                    world_size=2,
+                )
                 (loss / 2).backward()
         metrics = _rank_metrics(embeddings.detach(), labels, candidates, text, world_size=2)
 
         reference = _ToyModel()
         all_inputs = torch.cat((torch.tensor([[1.0, 0.0], [0.8, 0.2]]), torch.tensor([[0.0, 1.0]])))
-        all_embeddings, all_scale = reference(all_inputs)
-        reference_loss = _label_siglip_loss(all_embeddings, ["A", "A", "B"], candidates, text, all_scale)
+        all_embeddings, all_scale, all_bias = reference(all_inputs)
+        reference_loss = _label_siglip_loss(
+            all_embeddings,
+            ["A", "A", "B"],
+            candidates,
+            text,
+            all_scale,
+            all_bias,
+        )
         reference_loss.backward()
         reference_metrics = _rank_metrics(all_embeddings.detach(), ["A", "A", "B"], candidates, text)
         standard_result = (
             torch.allclose(model.module.weight.grad, reference.weight.grad, atol=1e-6),
             torch.allclose(model.module.log_scale.grad, reference.log_scale.grad, atol=1e-6),
+            torch.allclose(model.module.bias.grad, reference.bias.grad, atol=1e-6),
             metrics == pytest.approx(reference_metrics),
         )
 
         model.zero_grad()
         reference.zero_grad()
-        embeddings, scale = model(inputs)
+        embeddings, scale, bias = model(inputs)
         tactile_targets = (torch.tensor([[1.0, 0.0], [1.0, 0.0]]), torch.tensor([[0.0, 1.0]]))[rank]
         # Rank 1's only row is unannotated, so the sharded loss must equal a
         # single-process reference over rank 0's two rows alone.
         tactile_mask = (torch.ones(2, 2), torch.zeros(1, 2))[rank]
-        bias = torch.zeros(2)
         # The toy bank is 2 labels wide; pretend it is one task spanning both.
         with mock.patch.dict(TACTILE_SPANS, {"toy": (0, 2)}, clear=True):
             tactile_loss, _ = _tactile_siglip_loss(
@@ -98,27 +114,28 @@ def _worker(rank: int, results: dict, port: int) -> None:
                 tactile_targets,
                 tactile_mask,
                 text,
-                bias,
                 scale,
+                bias,
                 world_size=2,
             )
             assert tactile_loss is not None
             tactile_loss.backward()
 
-            reference_embeddings, reference_scale = reference(all_inputs[:2])
+            reference_embeddings, reference_scale, reference_bias = reference(all_inputs[:2])
             reference_loss, _ = _tactile_siglip_loss(
                 reference_embeddings,
                 torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
                 torch.ones(2, 2),
                 text,
-                bias,
                 reference_scale,
+                reference_bias,
             )
             assert reference_loss is not None
             reference_loss.backward()
         results[rank] = standard_result + (
             torch.allclose(model.module.weight.grad, reference.weight.grad, atol=1e-6),
             torch.allclose(model.module.log_scale.grad, reference.log_scale.grad, atol=1e-6),
+            torch.allclose(model.module.bias.grad, reference.bias.grad, atol=1e-6),
         )
     finally:
         dist.destroy_process_group()
@@ -164,7 +181,7 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
             (ecg_z, ["B", "A", "B"], ["ecg"] * 3),
         )[rank]
         stats = new_stats(specs, torch.device("cpu"))
-        update_stats(stats, specs, (shard[0], shard[1], shard[2], None, None), None)
+        update_stats(stats, specs, (shard[0], shard[1], shard[2], None, None), None, None)
         sharded = prediction_metrics(all_reduce_sum(stats, world_size=2), specs)
 
         reference_stats = new_stats(specs, torch.device("cpu"))
@@ -178,6 +195,7 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
                 None,
                 None,
             ),
+            None,
             None,
         )
         reference = prediction_metrics(reference_stats, specs)

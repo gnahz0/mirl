@@ -32,11 +32,10 @@ global mean over its observed sample-label pairs, and the six task losses are
 averaged equally. Changing a reduction silently rebalances training.
 
 **SigLIP uses complete fixed text-label banks.** SmellNet has 50 labels and ECG
-has 7; their bias is the log-odds of `1 / K`. Tactile has six closed QA banks
-with 6, 6, 4, 2, 8, and 4 verbalized choices. Initial-contact and
-highest-pressure targets may have multiple positives; each tactile bias uses the
-measured training positive rate. `log_logit_scale` initializes to
-`log(1 / 0.07)` and is a 0-dim no-decay parameter.
+has 7. Tactile has six closed QA banks with 6, 6, 4, 2, 8, and 4 verbalized
+choices; initial-contact and highest-pressure targets may have multiple positives.
+The canonical shared `log_logit_scale` and `logit_bias` parameters initialize to
+`log(10)` and `-10`, respectively, and both train without weight decay.
 
 **The clean baseline is sensor-to-text only.** SmellNet and ECG use their stored
 class labels. Tactile joins the six closed QA answers to each pressure recording
@@ -87,9 +86,10 @@ macro-F1, Recall@1, Recall@5, mAP, and prediction coverage for SmellNet, ECG, an
 tactile. Accuracy means the top-ranked candidate is positive. Recall@k is the
 fraction of ground-truth positives recovered in the top k, so it equals accuracy
 at k=1 for single-label tasks but can be lower for multi-positive tactile tasks.
-Tactile macro-F1 uses zero-logit thresholding for the two multi-label tasks and
-argmax for the four exclusive tasks. `overall` is the equal-family mean. Training
-metrics cover the current accumulation window; validation uses the full set.
+Tactile macro-F1 uses the learned SigLIP scale and bias for zero-logit thresholding
+on the two multi-label tasks and argmax for the four exclusive tasks. `overall` is
+the equal-family mean. Training metrics cover the current accumulation window;
+validation uses the full set.
 
 **Metrics carry no placeholder values.** A key is present iff its branch fired.
 Never pre-populate `loss/*` with `0.0`: a placeholder is indistinguishable from
@@ -154,7 +154,7 @@ Runs (val/f1 on the protocol noted; "fixed" = original val mix, n_ts=519):
 | run | change | f1 (fixed) | verdict |
 |---|---|---|---|
 | v1/v2 | InfoNCE, lr 1e-5, clip 1/5 | 0.478 / 0.446 | best f1; InfoNCE optimizes the argmax metric directly |
-| v4 | sigmoid, logit_bias=-10 | 0.135 | COLLAPSED — bias must be log-odds of measured pos_rate |
+| v4 | sigmoid, logit_bias=-10 | 0.135 | COLLAPSED in that setup; canonical learned-bias training is a new lineage |
 | v7 | sigmoid calibrated, lr 3e-5, gather | 0.301 | lr 3e-5 hurt (~2x f1 deficit vs 1e-5, measured) |
 | v8 | lr 1e-5, clip 1, oversample 3 | 0.309 | completed; encoder drift only 3.3e-3 (heads did the work) |
 | v9 | continue + distill_img 0.5 | 0.388/0.587 (own mix, peak) | encoder freed (drift +22% in 300 steps); killed at 600 for v11 |

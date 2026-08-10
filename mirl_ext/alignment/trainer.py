@@ -55,10 +55,9 @@ class AccumulationWindow:
     """
 
     device: torch.device
-    label_bank: dict = field(default_factory=dict)
-    tactile_bank: tuple | None = None
+    specs: tuple = ()
     log_logit_scale: torch.Tensor | None = None
-    specs: tuple = field(init=False)
+    logit_bias: torch.Tensor | None = None
     stats: dict[str, torch.Tensor] = field(init=False)
     loss_sums: dict[str, float] = field(init=False)
     loss_counts: dict[str, int] = field(init=False)
@@ -66,7 +65,6 @@ class AccumulationWindow:
     local_values: dict[str, list[float]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.specs = build_bank_specs(self.label_bank, self.tactile_bank)
         self.stats = new_stats(self.specs, self.device)
         self.loss_sums = dict.fromkeys(_REDUCED_METRIC_KEYS, 0.0)
         self.loss_counts = dict.fromkeys(_REDUCED_METRIC_KEYS, 0)
@@ -88,10 +86,10 @@ class AccumulationWindow:
             elif key.startswith("loss/"):
                 raise RuntimeError(f"metric absent from _REDUCED_METRIC_KEYS: {key}")
             else:
-                # grad_norm / logit_scale are rank-local diagnostics, not reduced.
+                # Gradient norm and SigLIP calibration are rank-local diagnostics.
                 self.local_values.setdefault(key, []).append(float(value))
 
-        update_stats(self.stats, self.specs, ts_eval, self.log_logit_scale)
+        update_stats(self.stats, self.specs, ts_eval, self.log_logit_scale, self.logit_bias)
 
     def flush(self, world_size: int = 1, per_class=None, per_label=None):
         """Reduce the whole window in one collective, then derive every number.
@@ -130,14 +128,17 @@ class AccumulationWindow:
 
 
 @torch.no_grad()
-def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_bank):
+def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_bank, specs):
     """Evaluate the full sharded validation set."""
     was_training = model.training
     model.eval()
     world_size = accelerator.num_processes
     base_model = accelerator.unwrap_model(model)
     window = AccumulationWindow(
-        accelerator.device, label_bank, tactile_bank, base_model.log_logit_scale
+        accelerator.device,
+        specs,
+        base_model.log_logit_scale,
+        base_model.logit_bias,
     )
     for batch in val_loader:
         with accelerator.autocast():
@@ -203,11 +204,11 @@ def train(cfg: DictConfig) -> None:
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
-    tactile_bank = _build_tactile_bank(
-        model,
-        train_ds.task_positive_rates,
-        device,
-    )
+    tactile_bank = _build_tactile_bank(model, device)
+    # One scoring-unit list per split for the whole run: every window reuses it, so
+    # the derived bank constants are built once rather than per optimizer step.
+    train_specs = build_bank_specs(train_label_bank, tactile_bank)
+    val_specs = build_bank_specs(val_label_bank, tactile_bank)
     free, total = torch.cuda.mem_get_info()
     logger.info(
         "GPU memory after load: %.2f / %.2f GiB",
@@ -268,7 +269,12 @@ def train(cfg: DictConfig) -> None:
     )
 
     trainable = [param for param in model.parameters() if param.requires_grad]
-    window_args = (device, train_label_bank, tactile_bank, base_model.log_logit_scale)
+    window_args = (
+        device,
+        train_specs,
+        base_model.log_logit_scale,
+        base_model.logit_bias,
+    )
     window = AccumulationWindow(*window_args)
     cumulative_counts: Counter[str] = Counter()
     opt_step = int(resume_progress["step"]) if resume_progress else 0
@@ -364,6 +370,7 @@ def train(cfg: DictConfig) -> None:
                     accelerator,
                     label_bank=val_label_bank,
                     tactile_bank=tactile_bank,
+                    specs=val_specs,
                 )
                 if is_main:
                     current = val_metrics[cfg.train.best_metric]

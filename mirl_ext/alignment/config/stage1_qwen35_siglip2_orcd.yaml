@@ -28,7 +28,6 @@ model:
   siglip2_text_path: ${oc.env:MIRL_SIGLIP2_PATH,/orcd/scratch/orcd/010/alecz/mirl-qwen35/models/siglip2-text}
 
 loss:
-  temperature: 0.07
   siglip_weight: 1.0
   distill_weight: 1.0
 
@@ -56,8 +55,8 @@ train:
   val_every: 200
   val_batch_size: 128
   best_metric: val-core/f1_macro/overall
-  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/orcd/scratch/orcd/010/alecz/mirl-qwen35/checkpoints/alignment_qwen35_orcd}
+  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/orcd/scratch/orcd/010/alecz/mirl-qwen35/checkpoints/alignment_qwen35_canonical_siglip_orcd}
 
 wandb:
   project: mirl-alignment
-  name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_siglip2_orcd}
+  name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_canonical_siglip_orcd}

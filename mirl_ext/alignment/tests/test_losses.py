@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from unittest import mock
 
 import pytest
 
@@ -49,10 +48,10 @@ def _rank(z, labels, candidates, bank, rows_out=None):
     return score_bank(spec, z, target, rows_out=rows_out)
 
 
-def _score_units(specs, ts_eval, log_logit_scale=None, **reports):
+def _score_units(specs, ts_eval, log_logit_scale=None, logit_bias=None, **reports):
     """Stream one microbatch through the unified path and derive every metric."""
     stats = new_stats(specs, torch.device("cpu"))
-    update_stats(stats, specs, ts_eval, log_logit_scale)
+    update_stats(stats, specs, ts_eval, log_logit_scale, logit_bias)
     return prediction_metrics(stats, specs, **reports)
 
 
@@ -69,6 +68,7 @@ def test_label_loss_is_class_balanced():
             ("A", "B"),
             torch.stack([pa, pb]),
             scale,
+            torch.tensor(-1.0),
         )
 
     assert float(compute(2)) == pytest.approx(float(compute(20)), rel=1e-6)
@@ -80,6 +80,7 @@ def test_label_loss_sums_candidates_before_averaging_anchors():
     candidate_labels = ("A", "B", "C")
     labels = ["A", "B"]
     log_scale = torch.tensor(math.log(2.0))
+    bias = torch.tensor(-0.75)
 
     loss = _label_siglip_loss(
         anchors,
@@ -87,9 +88,9 @@ def test_label_loss_sums_candidates_before_averaging_anchors():
         candidate_labels,
         prototypes,
         log_scale,
+        bias,
     )
 
-    bias = -math.log(len(candidate_labels) - 1)
     logits = log_scale.exp() * (anchors @ prototypes.T) + bias
     targets = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     expected = (
@@ -114,8 +115,27 @@ def test_label_loss_uses_absent_labels_as_negatives():
         ("A", "B", "C"),
         prototypes,
         scale,
+        torch.tensor(-10.0),
     )
     assert torch.isfinite(loss)
+
+
+def test_siglip_scale_and_bias_are_both_trainable():
+    scale = torch.nn.Parameter(torch.tensor(math.log(10.0)))
+    bias = torch.nn.Parameter(torch.tensor(-10.0))
+    loss = _label_siglip_loss(
+        torch.eye(2),
+        ["A", "B"],
+        ("A", "B"),
+        torch.eye(2),
+        scale,
+        bias,
+    )
+
+    loss.backward()
+
+    assert scale.grad is not None and scale.grad != 0
+    assert bias.grad is not None and bias.grad != 0
 
 
 def test_structured_tactile_loss_accepts_multiple_positive_labels():
@@ -126,15 +146,15 @@ def test_structured_tactile_loss_accepts_multiple_positive_labels():
         torch.tensor([[1.0, 1.0, 0.0]]),
         torch.ones(1, 3),
         prototypes,
-        bias=torch.zeros(3),
         log_logit_scale=torch.tensor(math.log(10.0)),
+        logit_bias=torch.tensor(-1.0),
     )
 
     assert loss is not None and torch.isfinite(loss)
     assert per_task == {} or all(math.isfinite(v) for v in per_task.values())
 
 
-def _reference_per_task_mean(z, targets, masks, embeddings, bias, scale):
+def _reference_per_task_mean(z, targets, masks, embeddings, scale, bias):
     """The pre-refactor objective: one masked BCE per task, then a plain mean.
 
     Written the way the six-call version was -- select the task's rows, sum its BCE,
@@ -146,7 +166,7 @@ def _reference_per_task_mean(z, targets, masks, embeddings, bias, scale):
         rows = masks[:, start] > 0
         if not bool(rows.any()):
             continue
-        logits = scale.exp() * (z[rows] @ embeddings[start:stop].t()) + bias[start:stop]
+        logits = scale.exp() * (z[rows] @ embeddings[start:stop].t()) + bias
         total = torch.nn.functional.binary_cross_entropy_with_logits(
             logits, targets[rows, start:stop], reduction="sum"
         )
@@ -169,11 +189,11 @@ def test_unified_tactile_loss_matches_per_task_reference(partial):
         first_stop = next(iter(TACTILE_SPANS.values()))[1]
         masks[3, first_stop:] = 0.0
         masks[4] = 0.0
-    bias = torch.full((width,), -0.5)
     scale = torch.tensor(math.log(10.0))
+    bias = torch.tensor(-0.5)
 
-    actual, per_task = _tactile_siglip_loss(z, targets, masks, embeddings, bias, scale)
-    expected = _reference_per_task_mean(z, targets, masks, embeddings, bias, scale)
+    actual, per_task = _tactile_siglip_loss(z, targets, masks, embeddings, scale, bias)
+    expected = _reference_per_task_mean(z, targets, masks, embeddings, scale, bias)
 
     assert actual.item() == pytest.approx(expected.item(), rel=1e-6)
     assert len(per_task) == len(TACTILE_SPANS)
@@ -195,7 +215,7 @@ def test_unmasked_labels_contribute_no_gradient():
     masks[2] = 0.0  # row 2 has no annotation for any task
 
     loss, per_task = _tactile_siglip_loss(
-        z, targets, masks, embeddings, torch.zeros(width), torch.tensor(math.log(10.0))
+        z, targets, masks, embeddings, torch.tensor(math.log(10.0)), torch.tensor(-1.0)
     )
     loss.backward()
 
@@ -209,8 +229,8 @@ def test_unmasked_labels_contribute_no_gradient():
             targets[:2],
             masks[:2],
             embeddings,
-            torch.zeros(width),
             torch.tensor(math.log(10.0)),
+            torch.tensor(-1.0),
         )[0].item(),
         rel=1e-6,
     )
@@ -222,16 +242,16 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
         def __init__(self):
             super().__init__()
             self.log_logit_scale = torch.nn.Parameter(torch.tensor(math.log(2.0)))
+            self.logit_bias = torch.nn.Parameter(torch.tensor(-1.0))
 
         def forward(self, kind, media, family, max_image_tokens):
             assert (kind, family, max_image_tokens) == ("signal", "tactile", 1024)
-            return None, None, None, torch.eye(2), self.log_logit_scale
+            return None, None, None, torch.eye(2), self.log_logit_scale, self.logit_bias
 
     width = TACTILE_NUM_LABELS
     bank = (
         tuple(f"label{index}" for index in range(width)),
         torch.nn.functional.normalize(torch.arange(width * 2, dtype=torch.float32).reshape(width, 2), dim=-1),
-        torch.zeros(width),
     )
     batch = {
         "kind": "signal",
@@ -285,9 +305,14 @@ def test_structured_tactile_metrics_merge_as_one_family():
     masks[0, :first_stop] = 1.0
     specs = build_bank_specs(
         {},
-        (tuple(f"label{index}" for index in range(width)), embeddings, torch.zeros(width)),
+        (tuple(f"label{index}" for index in range(width)), embeddings),
     )
-    tactile = _score_units(specs, (multi_z, [], [], targets, masks), scale)
+    tactile = _score_units(
+        specs,
+        (multi_z, [], [], targets, masks),
+        scale,
+        torch.tensor(-1.0),
+    )
     merged = _merge_prediction_metrics(
         {"f1_macro/ts_smellnet": 0.5, "f1_macro/overall": 0.5},
         tactile,
@@ -300,24 +325,16 @@ def test_structured_tactile_metrics_merge_as_one_family():
     assert merged["f1_macro/overall"] == pytest.approx(0.75)
 
 
-def test_structured_tactile_bank_bias_uses_train_positive_rate():
+def test_structured_tactile_bank_preserves_task_label_order():
     class TextModel:
         def encode_text(self, labels, device):
             return torch.eye(len(labels))
 
-    labels, embeddings, bias = _build_tactile_bank(
-        TextModel(),
-        dict.fromkeys(TASK_LABELS, 0.25),
-        torch.device("cpu"),
-    )
+    labels, embeddings = _build_tactile_bank(TextModel(), torch.device("cpu"))
 
     assert len(labels) == TACTILE_NUM_LABELS
     assert embeddings.shape[0] == TACTILE_NUM_LABELS
-    # The bias is per LABEL, so a task's prior is repeated across its own columns.
     start, stop = TACTILE_SPANS["force_level"]
-    assert bias.shape == (TACTILE_NUM_LABELS,)
-    assert bias[start:stop].tolist() == pytest.approx([-math.log(3)] * (stop - start))
-    # Column order must follow TASK_LABELS, or every downstream slice is off.
     assert labels[start:stop] == TASK_LABELS["force_level"]
 
 
@@ -514,6 +531,7 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "prediction_coverage/ts_tactile": 0.1,
         "grad_norm": 2.0,
         "logit_scale": 10.0,
+        "logit_bias": -10.0,
     }
     counts = Counter()
     counts.update(
@@ -553,6 +571,8 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     assert grouped["train-core/loss/tactile"] == 0.75
     assert grouped["train-aux/loss/siglip"] == 0.75
     assert grouped["train-aux/loss/distill"] == 0.5
+    assert grouped["train-aux/logit_scale"] == 10.0
+    assert grouped["train-aux/logit_bias"] == -10.0
 
 
 def test_loss_registration_and_batch_counts_fail_closed():

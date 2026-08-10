@@ -45,9 +45,9 @@ export XDG_CACHE_HOME="$MIRL_CLUSTER_ROOT/.cache/xdg"
 export WANDB_DIR=/scratch/dvdai_mit/alecz/wandb
 export WANDB_PROJECT=mirl-alignment
 export WANDB_ENTITY=aleczhang-massachusetts-institute-of-technology
-export WANDB_RUN_ID="stage1-qwen35-ve-${SLURM_JOB_ID}"
+export WANDB_RUN_ID="stage1-qwen35-canonical-siglip-${SLURM_JOB_ID}"
 export WANDB_RESUME=never
-export MIRL_OUTPUT_DIR="/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_${SLURM_JOB_ID}"
+export MIRL_OUTPUT_DIR="/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_canonical_siglip_${SLURM_JOB_ID}"
 mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
   "$XDG_CACHE_HOME" "$WANDB_DIR" "$MIRL_OUTPUT_DIR"
 

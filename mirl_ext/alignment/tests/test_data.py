@@ -115,8 +115,6 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     assert torch.equal(sample["media"], tactile)
     assert sample["targets"]["initial_fingers"] == (0, 1, 5)
     assert sample["targets"]["force_level"] == (1,)
-    assert dataset.task_positive_rates["initial_fingers"] == 0.5
-    assert dataset.task_positive_rates["force_level"] == 0.25
     assert dataset.ts_label_vocabs == {"smellnet": ("apple",)}
     assert set(dataset.sampling_groups) == {
         ("signal", "haptic_tactile"),

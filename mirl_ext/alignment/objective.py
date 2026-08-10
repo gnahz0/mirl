@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import math
 
 import torch
 import torch.distributed as dist
@@ -25,6 +24,7 @@ TSEval = tuple[
     torch.Tensor | None,
     torch.Tensor | None,
 ]
+
 
 @torch.no_grad()
 def _build_text_label_bank(
@@ -51,32 +51,20 @@ def _build_text_label_bank(
 @torch.no_grad()
 def _build_tactile_bank(
     model: MultimodalAlignmentModel,
-    positive_rates: dict[str, float],
     device: torch.device,
-) -> tuple[tuple[str, ...], torch.Tensor, torch.Tensor]:
-    """Encode all six tactile task vocabularies as one bank.
-
-    Returns ``(labels, embeddings, bias)`` where ``bias`` is per LABEL rather than
-    per task: each entry is that task's ``log(p/(1-p))`` prior, repeated across the
-    task's columns so it broadcasts over the concatenated logits.
-    """
+) -> tuple[tuple[str, ...], torch.Tensor]:
+    """Encode all six tactile task vocabularies as one bank."""
     labels: list[str] = []
-    bias_values: list[float] = []
     for task, task_labels in TASK_LABELS.items():
-        rate = float(positive_rates[task])
         labels.extend(task_labels)
-        bias_values.extend([math.log(rate / (1.0 - rate))] * len(task_labels))
         logger.info(
-            "tactile bank: task=%s cols=%s labels=%d positive_rate=%.4f bias=%.4f",
+            "tactile bank: task=%s cols=%s labels=%d",
             task,
             TACTILE_SPANS[task],
             len(task_labels),
-            rate,
-            bias_values[-1],
         )
     embeddings = model.encode_text(labels, device=device).float().detach()
-    bias = torch.tensor(bias_values, device=device, dtype=torch.float32)
-    return tuple(labels), embeddings, bias
+    return tuple(labels), embeddings
 
 
 def _label_siglip_loss(
@@ -85,6 +73,7 @@ def _label_siglip_loss(
     candidate_labels: tuple[str, ...],
     text_embeddings: torch.Tensor,
     log_logit_scale: torch.Tensor,
+    logit_bias: torch.Tensor,
     world_size: int = 1,
 ) -> torch.Tensor:
     """Compute class-balanced SigLIP against one complete text-label bank."""
@@ -100,8 +89,7 @@ def _label_siglip_loss(
     if world_size > 1:
         dist.all_reduce(class_count, op=dist.ReduceOp.SUM)
     sample_weight = class_count.index_select(0, targets).reciprocal()
-    bias = z_ts.new_tensor(-math.log(num_labels - 1))
-    logits = log_logit_scale.float().exp() * (z_ts.float() @ text_embeddings.float().t()) + bias
+    logits = log_logit_scale.float().exp() * (z_ts.float() @ text_embeddings.float().t()) + logit_bias.float()
     positives = F.one_hot(targets, num_classes=num_labels).to(dtype=logits.dtype)
     local_sum = F.binary_cross_entropy_with_logits(
         logits,
@@ -121,8 +109,8 @@ def _tactile_siglip_loss(
     targets: torch.Tensor,
     mask: torch.Tensor,
     text_embeddings: torch.Tensor,
-    bias: torch.Tensor,
     log_logit_scale: torch.Tensor,
+    logit_bias: torch.Tensor,
     world_size: int = 1,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Score all six tactile tasks in one masked pass over the 30-label bank.
@@ -140,8 +128,9 @@ def _tactile_siglip_loss(
     device = z_ts.device
     target = targets.to(device)
     weight = mask.to(device)
-    logits = log_logit_scale.float().exp() * (z_ts.float() @ text_embeddings.to(device).float().t())
-    logits = logits + bias.to(device)
+    logits = (
+        log_logit_scale.float().exp() * (z_ts.float() @ text_embeddings.to(device).float().t()) + logit_bias.float()
+    )
     elementwise = F.binary_cross_entropy_with_logits(
         logits,
         target,
@@ -184,7 +173,7 @@ def _compute_losses(
     cfg: DictConfig,
     *,
     label_bank: LabelBank,
-    tactile_bank: tuple[tuple[str, ...], torch.Tensor, torch.Tensor],
+    tactile_bank: tuple[tuple[str, ...], torch.Tensor],
     world_size: int = 1,
 ) -> tuple[torch.Tensor, dict, TSEval]:
     """Compute family label-bank SigLIP and frozen-Qwen preservation losses."""
@@ -194,21 +183,21 @@ def _compute_losses(
     media = batch["media"]
     family = batch["family"]
     labels = batch["text"]
-    feat_img, feat_ref_img, img_token_counts, feat_ts, log_logit_scale = model(
+    feat_img, feat_ref_img, img_token_counts, feat_ts, log_logit_scale, logit_bias = model(
         kind,
         media,
         family,
         int(cfg.data.max_image_tokens),
     )
 
-    total = log_logit_scale.float() * 0.0
+    total = (log_logit_scale.float() + logit_bias.float()) * 0.0
     tactile_targets: torch.Tensor | None = None
     tactile_masks: torch.Tensor | None = None
 
     z_ts = F.normalize(feat_ts.float(), dim=-1, eps=1e-6) if feat_ts is not None else None
     if z_ts is not None:
         if family == "tactile":
-            _, text_embeddings, bias = tactile_bank
+            _, text_embeddings = tactile_bank
             tactile_targets = batch["targets"].to(z_ts.device)
             tactile_masks = batch["masks"].to(z_ts.device)
             l_ts, per_task = _tactile_siglip_loss(
@@ -216,8 +205,8 @@ def _compute_losses(
                 tactile_targets,
                 tactile_masks,
                 text_embeddings,
-                bias,
                 log_logit_scale,
+                logit_bias,
                 world_size,
             )
             metrics.update(per_task)
@@ -231,6 +220,7 @@ def _compute_losses(
                 candidate_labels,
                 text_embeddings,
                 log_logit_scale,
+                logit_bias,
                 world_size,
             )
         # A tactile batch whose rows are all unannotated for every task yields no
@@ -266,6 +256,7 @@ def _compute_losses(
 
     metrics["loss/total"] = total.detach().item()
     metrics["logit_scale"] = log_logit_scale.detach().exp().item()
+    metrics["logit_bias"] = logit_bias.detach().item()
     ts_eval = (
         (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
         if z_ts is not None

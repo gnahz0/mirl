@@ -34,7 +34,6 @@ model:
   siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
 
 loss:
-  temperature: 0.07
   siglip_weight: 1.0
   distill_weight: 1.0
 
@@ -44,10 +43,10 @@ train:
   resume_checkpoint: null
   # Repeat complete shuffled passes over low-resource signal sources. Values are
   # positive integers; omitted sources and all visual sources repeat once.
-  # Validation is always one-pass. These factors approximate square-root
-  # balancing without requiring a sampling exponent.
+  # Validation is always one-pass. SmellNet and tactile receive roughly equal
+  # effective exposure.
   signal_repeat_factors:
-    smellnet_base: 13
+    smellnet_base: 32
     haptic_tactile: 5
   # Four GPUs and two-step accumulation give a global batch of up to 256.
   batch_size: 32
@@ -55,7 +54,7 @@ train:
   gradient_checkpointing: true
   num_workers: 4
   lr: 1.0e-5
-  weight_decay: 0.05
+  weight_decay: 0.0
   # Optimizer steps are derived from the sampler and accumulation.
   num_train_epochs: 1
   warmup_ratio: 0.03
@@ -66,8 +65,8 @@ train:
   val_batch_size: 256
   # Tactile contributes its equal-task structured F1 to the equal-family score.
   best_metric: val-core/f1_macro/overall
-  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35}
+  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_canonical_siglip}
 
 wandb:
   project: mirl-alignment
-  name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_siglip2}
+  name: ${oc.env:WANDB_RUN_ID,stage1_qwen35_canonical_siglip}

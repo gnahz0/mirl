@@ -1,5 +1,5 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Assert the 2026-08-09 metrics rewrite changed no published number.
+"""Guard the metric surface established by the 2026-08-09 rewrite.
 
 ``fixtures/metrics_golden.json`` was produced by ``regen_metrics_golden.py`` run
 against the implementation that preceded the rewrite -- the one that hand-packed
@@ -7,9 +7,9 @@ every statistic into a positional buffer and reduced it with torchmetrics
 ``MeanMetric``s alongside. It stores both the inputs and the outputs, so these
 tests replay the same inputs through the new unified path and compare exactly.
 
-Exact equality is the assertion. The rewrite reorganized which buffer a number
-travels in, not how it is computed, so anything that moves is a real behaviour
-change and should fail here rather than be absorbed by a tolerance.
+Exact equality remains the assertion except for tactile multi-label F1 and
+coverage, which now use canonical SigLIP's learned scalar bias instead of fixed
+per-task priors. Ranking metrics remain unchanged by that calibration change.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from mirl_ext.alignment.data import TACTILE_SPANS  # noqa: E402
+from mirl_ext.alignment.data import MULTILABEL_TASKS, TACTILE_SPANS  # noqa: E402
 from mirl_ext.alignment.metrics import (  # noqa: E402
     _merge_prediction_metrics,
     _metric_groups,
@@ -56,9 +56,7 @@ def _one_hot(labels, candidates) -> torch.Tensor:
 
 
 def _tactile_specs(case) -> tuple:
-    return build_bank_specs(
-        {}, (tuple(case["labels"]), _tensor(case["bank"]), _tensor(case["bias"]))
-    )
+    return build_bank_specs({}, (tuple(case["labels"]), _tensor(case["bank"])))
 
 
 def _assert_same(actual: dict, expected: dict, label: str) -> None:
@@ -89,12 +87,8 @@ def test_single_label_families_score_unchanged(golden, case):
     _assert_rows(rows, golden["golden"][f"{name}_rows"], name)
 
 
-def test_tactile_tasks_score_unchanged(golden):
-    """All six tasks, including the unobserved one that must stay unscored.
-
-    The scalars are genuine pre-rewrite output; the per-label rows are a
-    lock-forward pin -- see ``regen_metrics_golden``.
-    """
+def test_tactile_ranking_is_unchanged_and_classification_uses_learned_bias(golden):
+    """Changing calibration leaves ranking intact and changes multi-label F1."""
     case = golden["inputs"]["tactile"]
     rows: list[dict] = []
     specs = _tactile_specs(case)
@@ -104,6 +98,7 @@ def test_tactile_tasks_score_unchanged(golden):
         specs,
         (_tensor(case["z"]), [], [], _tensor(case["targets"]), _tensor(case["masks"])),
         torch.tensor(case["log_logit_scale"]),
+        torch.tensor(-10.0),
     )
     metrics = prediction_metrics(stats, specs, per_label=rows)
 
@@ -117,8 +112,26 @@ def test_tactile_tasks_score_unchanged(golden):
             for stat in ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
         }
     )
-    _assert_same(metrics, expected, "tactile")
-    _assert_rows(rows, golden["golden"]["tactile_rows"], "tactile")
+    ranking = {
+        key: value
+        for key, value in metrics.items()
+        if not key.startswith(("f1_macro/", "prediction_coverage/"))
+    }
+    expected_ranking = {
+        key: value
+        for key, value in expected.items()
+        if not key.startswith(("f1_macro/", "prediction_coverage/"))
+    }
+    _assert_same(ranking, expected_ranking, "tactile ranking")
+
+    expected_rows = golden["golden"]["tactile_rows"]
+    for actual, old in zip(rows, expected_rows, strict=True):
+        for field in ("task", "class_id", "label", "support", "recall_at_5"):
+            assert actual[field] == old[field]
+        if actual["task"] in MULTILABEL_TASKS:
+            assert actual["predicted"] == actual["precision"] == actual["recall"] == actual["f1"] == 0
+        else:
+            assert actual == old
     # local_shape was answered by no row, so it must be absent rather than nan.
     assert not any(key.endswith("/task/local_shape") for key in metrics)
     assert {row["task"] for row in rows} == set(TACTILE_SPANS) - {"local_shape"}
@@ -146,6 +159,7 @@ def test_mixed_families_and_overall_rollup_unchanged(golden):
             None,
             None,
         ),
+        None,
         None,
     )
     mixed = _merge_prediction_metrics(
@@ -189,7 +203,6 @@ def test_streaming_equals_one_shot(golden):
     data = golden["inputs"]["ecg"]
     spec = _single_label_spec(data["candidates"], data["bank"])
     z = _tensor(data["z"])
-    target = _one_hot(data["labels"], data["candidates"])
 
     stats = new_stats((spec,), torch.device("cpu"))
     for start in range(0, len(z), 11):
@@ -198,6 +211,7 @@ def test_streaming_equals_one_shot(golden):
             stats,
             (spec,),
             (z[chunk], data["labels"][chunk], ["ecg"] * len(z[chunk]), None, None),
+            None,
             None,
         )
     streamed = prediction_metrics(stats, (spec,))

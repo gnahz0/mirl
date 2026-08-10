@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+
 class MultimodalAlignmentModel(nn.Module):
     """Trainable Qwen vision tower, frozen image anchor, and SigLIP2 text tower."""
 
@@ -22,7 +23,6 @@ class MultimodalAlignmentModel(nn.Module):
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
         visual_dtype: torch.dtype = torch.bfloat16,
-        contrastive_temperature: float = 0.07,
     ):
         super().__init__()
         from transformers import AutoConfig, AutoProcessor, AutoTokenizer, Siglip2TextModel
@@ -60,7 +60,8 @@ class MultimodalAlignmentModel(nn.Module):
         ).to(dtype=visual_dtype)
         self.label_text_model.requires_grad_(False).eval()
 
-        self.log_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / contrastive_temperature)))
+        self.log_logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.logit_bias = nn.Parameter(torch.tensor(-10.0))
 
     def encode_visual(
         self,
@@ -92,13 +93,15 @@ class MultimodalAlignmentModel(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """Encode one source-homogeneous batch through the trainable tower."""
         device = next(self.trainable_visual.parameters()).device
         logit_scale = self.log_logit_scale * 1.0
+        logit_bias = self.logit_bias * 1.0
         if kind == "signal":
             signal_features = self.encode_ts_trainable(media, family, device)
-            return None, None, None, signal_features, logit_scale
+            return None, None, None, signal_features, logit_scale, logit_bias
 
         if kind == "image":
             token_pixels = (self.vit_patch_size * self.vit_merge_size) ** 2
@@ -125,7 +128,7 @@ class MultimodalAlignmentModel(nn.Module):
         token_counts = grid.prod(dim=1)
         features = self.encode_visual(pixels, grid, pool=False)
         references = self.encode_visual(pixels, grid, frozen=True, pool=False)
-        return features, references, token_counts, None, logit_scale
+        return features, references, token_counts, None, logit_scale, logit_bias
 
     @staticmethod
     def _robust_normalize_rows(x: torch.Tensor) -> torch.Tensor:
