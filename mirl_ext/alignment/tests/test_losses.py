@@ -16,13 +16,13 @@ from mirl_ext.alignment.data import (  # noqa: E402
     TASK_LABELS,
 )
 from mirl_ext.alignment.metrics import (  # noqa: E402
-    _allreduce_metrics,
-    _label_ranking_metrics,
     _merge_prediction_metrics,
     _metric_groups,
-    _tactile_prediction_metrics,
-    _ts_prediction_metrics,
-    add_batch_counts,
+    build_bank_specs,
+    new_stats,
+    prediction_metrics,
+    score_bank,
+    update_stats,
 )
 from mirl_ext.alignment.objective import (  # noqa: E402
     _build_tactile_bank,
@@ -30,6 +30,30 @@ from mirl_ext.alignment.objective import (  # noqa: E402
     _label_siglip_loss,
     _tactile_siglip_loss,
 )
+
+
+def _signal_batch(size: int) -> dict:
+    return {
+        "kind": "signal",
+        "media": [0] * size,
+        "family": "smellnet",
+        "skipped": {"image": 0, "video": 0, "signal": 1},
+    }
+
+
+def _rank(z, labels, candidates, bank, rows_out=None):
+    """Score one exclusive family the way the trainer does: one-hot into one bank."""
+    spec = build_bank_specs({"ecg": (candidates, bank)}, None)[0]
+    ids = torch.tensor([candidates.index(label) for label in labels])
+    target = torch.nn.functional.one_hot(ids, num_classes=len(candidates))
+    return score_bank(spec, z, target, rows_out=rows_out)
+
+
+def _score_units(specs, ts_eval, log_logit_scale=None, **reports):
+    """Stream one microbatch through the unified path and derive every metric."""
+    stats = new_stats(specs, torch.device("cpu"))
+    update_stats(stats, specs, ts_eval, log_logit_scale)
+    return prediction_metrics(stats, specs, **reports)
 
 
 def test_label_loss_is_class_balanced():
@@ -259,13 +283,11 @@ def test_structured_tactile_metrics_merge_as_one_family():
     targets[0, :2] = 1.0
     masks = torch.zeros(1, width)
     masks[0, :first_stop] = 1.0
-    tactile = _tactile_prediction_metrics(
-        multi_z,
-        targets,
-        masks,
+    specs = build_bank_specs(
+        {},
         (tuple(f"label{index}" for index in range(width)), embeddings, torch.zeros(width)),
-        scale,
     )
+    tactile = _score_units(specs, (multi_z, [], [], targets, masks), scale)
     merged = _merge_prediction_metrics(
         {"f1_macro/ts_smellnet": 0.5, "f1_macro/overall": 0.5},
         tactile,
@@ -301,19 +323,19 @@ def test_structured_tactile_bank_bias_uses_train_positive_rate():
 
 def test_effective_batch_macro_f1_is_not_an_average_of_micro_batches():
     prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    first = _label_ranking_metrics(
+    first = _rank(
         torch.tensor([[1.0, 0.0]]),
         ["A"],
         ("A", "B"),
         prototypes,
     )
-    second = _label_ranking_metrics(
+    second = _rank(
         torch.tensor([[1.0, 0.0]]),
         ["B"],
         ("A", "B"),
         prototypes,
     )
-    combined = _label_ranking_metrics(
+    combined = _rank(
         torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
         ["A", "B"],
         ("A", "B"),
@@ -326,12 +348,12 @@ def test_effective_batch_macro_f1_is_not_an_average_of_micro_batches():
 
 def test_absent_ground_truth_classes_do_not_cap_macro_f1():
     report = []
-    metrics = _label_ranking_metrics(
+    metrics = _rank(
         torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
         ["A", "B"],
         ("A", "B", "C"),
         torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]),
-        per_class_out=report,
+        rows_out=report,
     )
 
     assert metrics["accuracy"] == metrics["f1_macro"] == 1.0
@@ -349,7 +371,7 @@ def test_absent_ground_truth_classes_do_not_cap_macro_f1():
 
 
 def test_prototype_recall_at_five_uses_ranked_classes():
-    metrics = _label_ranking_metrics(
+    metrics = _rank(
         torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5, 0.4]]),
         ["E"],
         ("A", "B", "C", "D", "E", "F"),
@@ -366,7 +388,7 @@ def test_macro_f1_exposes_single_class_prediction_collapse():
     z = torch.tensor([[1.0, 0.0]] * len(true))
     prototypes = torch.tensor([[1.0, 0.0]] + [[0.0, 1.0]] * (len(labels) - 1))
 
-    metrics = _label_ranking_metrics(z, true, labels, prototypes)
+    metrics = _rank(z, true, labels, prototypes)
 
     assert metrics["accuracy"] == pytest.approx(5 / 12)
     assert metrics["f1_macro"] == pytest.approx((10 / 17) / 7)
@@ -385,7 +407,8 @@ def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
         "tactile": (("a", "b"), z[[5, 4]]),
     }
     reports = {}
-    metrics = _merge_prediction_metrics(_ts_prediction_metrics(z, labels, families, bank, reports))
+    specs = build_bank_specs(bank, None)
+    metrics = _score_units(specs, (z, labels, families, None, None), per_class=reports)
 
     for family in ("smellnet", "ecg", "tactile"):
         for stat in ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map"):
@@ -533,17 +556,32 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
 
 
 def test_loss_registration_and_batch_counts_fail_closed():
-    with pytest.raises(RuntimeError, match="_REDUCED_METRIC_KEYS"):
-        _allreduce_metrics({"loss/typo": 0.5}, torch.device("cpu"), world_size=1)
+    from mirl_ext.alignment.trainer import AccumulationWindow
 
-    counts = Counter()
-    add_batch_counts(
-        counts,
-        {
-            "kind": "signal",
-            "media": [1, 2, 3],
-            "family": "smellnet",
-            "skipped": {"image": 0, "video": 0, "signal": 1},
-        },
-    )
-    assert counts == {"n/ts_smellnet": 3, "n/skipped_signal": 1}
+    window = AccumulationWindow(torch.device("cpu"))
+    with pytest.raises(RuntimeError, match="_REDUCED_METRIC_KEYS"):
+        window.add(_signal_batch(0), {"loss/typo": 0.5}, (None, [], [], None, None))
+
+    window = AccumulationWindow(torch.device("cpu"))
+    window.add(_signal_batch(3), {}, (None, [], [], None, None))
+    _, counts, _ = window.flush()
+    assert counts["n/ts_smellnet"] == 3
+    assert counts["n/skipped_signal"] == 1
+    assert counts["n/ts_signal"] == 3  # derived from the per-family totals
+
+
+def test_window_averages_only_over_microbatches_that_produced_a_loss():
+    from mirl_ext.alignment.trainer import AccumulationWindow
+
+    window = AccumulationWindow(torch.device("cpu"))
+    for index in range(4):
+        payload = {"loss/total": 1.0}
+        if index < 2:  # only half the window held a tactile batch
+            payload["loss/ts_tactile"] = 3.0
+        window.add(_signal_batch(1), payload, (None, [], [], None, None))
+    losses, _, _ = window.flush()
+
+    assert losses["loss/total"] == pytest.approx(1.0)
+    assert losses["loss/ts_tactile"] == pytest.approx(3.0)
+    # Losses nothing produced are dropped rather than logged as nan.
+    assert "loss/ts_ecg" not in losses

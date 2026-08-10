@@ -16,13 +16,15 @@ from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 
 from .metrics import (
-    _allreduce_counts,
-    _allreduce_metrics,
-    _merge_prediction_metrics,
+    _COUNT_KEYS,
+    _REDUCED_METRIC_KEYS,
+    _TS_FAMILIES,
     _metric_groups,
-    _tactile_prediction_metrics,
-    _ts_prediction_metrics,
-    add_batch_counts,
+    all_reduce_sum,
+    build_bank_specs,
+    new_stats,
+    prediction_metrics,
+    update_stats,
 )
 from .objective import (
     _build_tactile_bank,
@@ -44,65 +46,87 @@ logger = logging.getLogger("alignment.trainer")
 
 @dataclass
 class AccumulationWindow:
-    counts: Counter[str] = field(default_factory=Counter)
-    metric_values: dict[str, list[float]] = field(default_factory=dict)
-    ts_embeddings: list[torch.Tensor] = field(default_factory=list)
-    ts_labels: list[str] = field(default_factory=list)
-    ts_families: list[str] = field(default_factory=list)
-    tactile_embeddings: list[torch.Tensor] = field(default_factory=list)
-    tactile_target_chunks: list[torch.Tensor] = field(default_factory=list)
-    tactile_mask_chunks: list[torch.Tensor] = field(default_factory=list)
+    """One window's running loss sums, sample counts, and prediction statistics.
+
+    Every published statistic is a ratio of sums over rows, so a microbatch folds
+    into fixed float64 accumulators as it is seen and the window keeps no
+    embeddings. The key set is fixed in ``__post_init__``, before any data, so the
+    single all-reduce in ``flush()`` is identical on every rank.
+    """
+
+    device: torch.device
+    label_bank: dict = field(default_factory=dict)
+    tactile_bank: tuple | None = None
+    log_logit_scale: torch.Tensor | None = None
+    specs: tuple = field(init=False)
+    stats: dict[str, torch.Tensor] = field(init=False)
+    loss_sums: dict[str, float] = field(init=False)
+    loss_counts: dict[str, int] = field(init=False)
+    counts: dict[str, int] = field(init=False)
+    local_values: dict[str, list[float]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.specs = build_bank_specs(self.label_bank, self.tactile_bank)
+        self.stats = new_stats(self.specs, self.device)
+        self.loss_sums = dict.fromkeys(_REDUCED_METRIC_KEYS, 0.0)
+        self.loss_counts = dict.fromkeys(_REDUCED_METRIC_KEYS, 0)
+        self.counts = dict.fromkeys(_COUNT_KEYS, 0)
 
     def add(self, batch: dict, metrics: dict, ts_eval: tuple) -> None:
-        add_batch_counts(self.counts, batch)
-        embeddings, labels, families, tactile_targets, tactile_masks = ts_eval
-        if embeddings is not None:
-            if tactile_targets is not None:
-                self.tactile_embeddings.append(embeddings)
-                self.tactile_target_chunks.append(tactile_targets)
-                self.tactile_mask_chunks.append(tactile_masks)
-            else:
-                self.ts_embeddings.append(embeddings)
-                self.ts_labels.extend(labels)
-                self.ts_families.extend(families)
-        for key, value in metrics.items():
-            self.metric_values.setdefault(key, []).append(float(value))
+        for kind, value in batch.get("skipped", {}).items():
+            self.counts[f"n/skipped_{kind}"] += int(value)
+        size = len(batch["media"])
+        if batch["kind"] == "signal":
+            self.counts[f"n/ts_{batch['family']}"] += size
+        else:
+            self.counts[f"n/img_{batch['kind']}"] += size
 
-    def score(
-        self,
-        label_bank,
-        tactile_bank,
-        logit_scale,
-        world_size: int,
-        per_class=None,
-        per_label=None,
-    ) -> dict[str, float]:
-        standard = (
-            _ts_prediction_metrics(
-                torch.cat(self.ts_embeddings),
-                self.ts_labels,
-                self.ts_families,
-                label_bank,
-                world_size=world_size,
-                per_class_reports=per_class,
-            )
-            if self.ts_embeddings
-            else {}
+        for key, value in metrics.items():
+            if key in self.loss_sums:
+                self.loss_sums[key] += float(value)
+                self.loss_counts[key] += 1
+            elif key.startswith("loss/"):
+                raise RuntimeError(f"metric absent from _REDUCED_METRIC_KEYS: {key}")
+            else:
+                # grad_norm / logit_scale are rank-local diagnostics, not reduced.
+                self.local_values.setdefault(key, []).append(float(value))
+
+        update_stats(self.stats, self.specs, ts_eval, self.log_logit_scale)
+
+    def flush(self, world_size: int = 1, per_class=None, per_label=None):
+        """Reduce the whole window in one collective, then derive every number.
+
+        Losses are averaged over the rank/microbatch pairs that produced them and
+        dropped when nobody did.
+        """
+        payload = dict(self.stats)
+        payload["_loss_sum"] = torch.tensor(
+            [self.loss_sums[key] for key in _REDUCED_METRIC_KEYS],
+            dtype=torch.float64,
+            device=self.device,
         )
-        tactile = (
-            _tactile_prediction_metrics(
-                torch.cat(self.tactile_embeddings),
-                torch.cat(self.tactile_target_chunks),
-                torch.cat(self.tactile_mask_chunks),
-                tactile_bank,
-                logit_scale,
-                world_size=world_size,
-                per_label_out=per_label,
-            )
-            if self.tactile_embeddings
-            else {}
+        payload["_loss_count"] = torch.tensor(
+            [float(self.loss_counts[key]) for key in _REDUCED_METRIC_KEYS],
+            dtype=torch.float64,
+            device=self.device,
         )
-        return _merge_prediction_metrics(standard, tactile)
+        payload["_count"] = torch.tensor(
+            [float(self.counts[key]) for key in _COUNT_KEYS],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        reduced = all_reduce_sum(payload, world_size=world_size)
+
+        sums = dict(zip(_REDUCED_METRIC_KEYS, reduced["_loss_sum"].tolist(), strict=True))
+        weights = dict(zip(_REDUCED_METRIC_KEYS, reduced["_loss_count"].tolist(), strict=True))
+        losses = {key: sums[key] / weights[key] for key in _REDUCED_METRIC_KEYS if weights[key]}
+        losses.update({key: sum(v) / len(v) for key, v in self.local_values.items()})
+        counts = {
+            key: int(value) for key, value in zip(_COUNT_KEYS, reduced["_count"].tolist(), strict=True)
+        }
+        counts["n/ts_signal"] = sum(counts[f"n/ts_{family}"] for family in _TS_FAMILIES)
+        prediction = prediction_metrics(reduced, self.specs, per_class=per_class, per_label=per_label)
+        return losses, counts, prediction
 
 
 @torch.no_grad()
@@ -111,7 +135,10 @@ def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_ban
     was_training = model.training
     model.eval()
     world_size = accelerator.num_processes
-    window = AccumulationWindow()
+    base_model = accelerator.unwrap_model(model)
+    window = AccumulationWindow(
+        accelerator.device, label_bank, tactile_bank, base_model.log_logit_scale
+    )
     for batch in val_loader:
         with accelerator.autocast():
             _, metrics, batch_eval = _compute_losses(
@@ -124,29 +151,15 @@ def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_ban
             )
         window.add(batch, metrics, batch_eval)
 
-    losses = _allreduce_metrics(
-        {key: sum(values) / len(values) for key, values in window.metric_values.items()},
-        accelerator.device,
-        world_size,
-    )
-    counts = _allreduce_counts(window.counts, accelerator.device, world_size)
     per_class: dict[str, list[dict[str, object]]] = {}
     per_label: list[dict[str, object]] = []
-    base_model = accelerator.unwrap_model(model)
-    prediction_metrics = window.score(
-        label_bank,
-        tactile_bank,
-        base_model.log_logit_scale,
-        world_size,
-        per_class,
-        per_label,
-    )
+    losses, counts, prediction = window.flush(world_size, per_class, per_label)
 
     if was_training:
         model.train()
         base_model.frozen_visual.eval()
         base_model.label_text_model.eval()
-    return _metric_groups("val", losses, counts, prediction_metrics), per_class, per_label
+    return _metric_groups("val", losses, counts, prediction), per_class, per_label
 
 
 def train(cfg: DictConfig) -> None:
@@ -255,7 +268,8 @@ def train(cfg: DictConfig) -> None:
     )
 
     trainable = [param for param in model.parameters() if param.requires_grad]
-    window = AccumulationWindow()
+    window_args = (device, train_label_bank, tactile_bank, base_model.log_logit_scale)
+    window = AccumulationWindow(*window_args)
     cumulative_counts: Counter[str] = Counter()
     opt_step = int(resume_progress["step"]) if resume_progress else 0
     best_value = float(resume_progress.get("best_value", float("-inf"))) if resume_progress else float("-inf")
@@ -303,22 +317,16 @@ def train(cfg: DictConfig) -> None:
             if not sync_now:
                 continue
 
-            metrics = {key: sum(values) / len(values) for key, values in window.metric_values.items()}
-            metrics["grad_norm"] = float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
-            window_metrics = window.score(
-                train_label_bank,
-                tactile_bank,
-                base_model.log_logit_scale,
-                world_size,
+            window.local_values.setdefault("grad_norm", []).append(
+                float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
             )
+            metrics, counts, window_metrics = window.flush(world_size)
             optimizer.step()
-            lrs = {str(group["name"]).partition("_")[0]: float(group["lr"]) for group in optimizer.param_groups}
+            lr = float(optimizer.param_groups[0]["lr"])
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             opt_step += 1
 
-            metrics = _allreduce_metrics(metrics, device, world_size)
-            counts = _allreduce_counts(window.counts, device, world_size)
             cumulative_counts.update(counts)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
@@ -341,8 +349,7 @@ def train(cfg: DictConfig) -> None:
                 wandb_run.log(
                     {
                         **payload,
-                        "train-aux/lr/model": lrs["model"],
-                        "train-aux/lr/scalar": lrs["scalar"],
+                        "train-aux/lr": lr,
                         "train-aux/epoch": epoch + (batch_index + 1) / micro_batches_per_epoch,
                     },
                     step=opt_step,
@@ -414,7 +421,7 @@ def train(cfg: DictConfig) -> None:
                     )
                 accelerator.wait_for_everyone()
 
-            window = AccumulationWindow()
+            window = AccumulationWindow(*window_args)
 
     if is_main:
         save_checkpoint(base_model, out_dir / "final", cfg, opt_step)

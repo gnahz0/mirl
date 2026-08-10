@@ -1,7 +1,9 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Sensor-to-text ranking metrics and distributed loss reduction."""
+"""Sensor-to-text ranking metrics and their single distributed reduction."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -13,6 +15,7 @@ from .data import MULTILABEL_TASKS, TACTILE_SPANS, TASK_LABELS
 _TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
 _CLASSIFICATION_FAMILIES = ("smellnet", "ecg")
 _PUBLIC_STATS = ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
+_ALL_STATS = (*_PUBLIC_STATS, "prediction_coverage")
 
 _REDUCED_METRIC_KEYS = (
     "loss/siglip",
@@ -32,308 +35,301 @@ _COUNT_KEYS: tuple[str, ...] = (
     *(f"n/skipped_{kind}" for kind in ("image", "video", "signal")),
 )
 
+# Every published statistic is a ratio of sums over rows, so these nine tensors
+# are all any reduction ever needs. Per-class counts are one entry per label;
+# the rest are scalars.
+_CLASS_FIELDS = ("support", "predicted", "true_positive", "recall_at_5_count")
+_SCALAR_FIELDS = ("top_is_positive", "recall_at_1", "recall_at_5", "average_precision", "n")
 
-def _allreduce_metrics(metrics: dict, device: torch.device, world_size: int) -> dict:
-    """Average each present loss over the ranks that computed it."""
-    missing = [key for key in metrics if key.startswith("loss/") and key not in _REDUCED_METRIC_KEYS]
-    if missing:
-        raise RuntimeError(f"metrics absent from _REDUCED_METRIC_KEYS: {missing}")
+
+def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> dict[str, torch.Tensor]:
+    """Sum every entry of ``values`` across ranks with exactly one collective.
+
+    Callers build ``values`` from a key set fixed before any data is seen, so the
+    packed buffer is identical on every rank whatever rows landed locally.
+    """
     if world_size <= 1:
-        return metrics
-    # Pack once to avoid a device synchronization per metric.
-    flat: list[float] = []
-    for key in _REDUCED_METRIC_KEYS:
-        value = metrics.get(key)
-        flat += [float(value), 1.0] if value is not None else [0.0, 0.0]
-    packed = torch.tensor(flat, device=device, dtype=torch.float64)
-    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    reduced = packed.tolist()
-    out = dict(metrics)
-    for i, key in enumerate(_REDUCED_METRIC_KEYS):
-        total, present = reduced[2 * i], reduced[2 * i + 1]
-        if present > 0:
-            out[key] = total / present
-        else:
-            out.pop(key, None)
-    return out
+        return values
+    keys = sorted(values)
+    flat = torch.cat([values[key].reshape(-1).double() for key in keys])
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    reduced: dict[str, torch.Tensor] = {}
+    offset = 0
+    for key in keys:
+        size = values[key].numel()
+        reduced[key] = flat[offset : offset + size].view(values[key].shape)
+        offset += size
+    return reduced
 
 
-def _allreduce_counts(counts: dict, device: torch.device, world_size: int) -> dict:
-    """Sum sample counts across ranks in a fixed collective order."""
-    if world_size <= 1:
-        out = {key: int(counts.get(key, 0)) for key in _COUNT_KEYS}
-    else:
-        packed = torch.tensor([counts.get(key, 0) for key in _COUNT_KEYS], device=device, dtype=torch.long)
-        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-        out = {k: int(v) for k, v in zip(_COUNT_KEYS, packed.tolist(), strict=True)}
-    out["n/ts_signal"] = sum(out[f"n/ts_{family}"] for family in _TS_FAMILIES)
-    return out
+@dataclass(frozen=True)
+class BankSpec:
+    """One scoring unit: some rows ranked against some bank of label embeddings.
+
+    The only thing that differs between smellnet, ecg and the six tactile tasks,
+    and it is data rather than a code path -- all eight score through
+    ``_bank_stats``. ``label_to_id`` selects rows by batch family and one-hots the
+    ground-truth string; ``span`` selects them by the tactile mask and slices that
+    task's columns. ``threshold_bias`` predicts every label whose biased logit
+    exceeds zero, else the prediction is the argmax within this bank.
+    """
+
+    key: str  # "ts_smellnet" | "task/force_level"
+    labels: tuple[str, ...]
+    embeddings: torch.Tensor  # (K, D) frozen bank or bank slice
+    family: str | None = None
+    label_to_id: dict[str, int] | None = None
+    threshold_bias: torch.Tensor | None = None  # (K,)
+    span: tuple[int, int] | None = None
+    report_key: str | None = None  # emit per-class W&B rows under this name
+    row_extra: dict[str, object] | None = None
 
 
-def add_batch_counts(counts: dict, batch: dict) -> None:
-    """Count one source-homogeneous local batch."""
-    for kind, value in batch.get("skipped", {}).items():
-        if value:
-            counts[f"n/skipped_{kind}"] += int(value)
-    size = len(batch["media"])
-    if batch["kind"] == "signal":
-        counts[f"n/ts_{batch['family']}"] += size
-    else:
-        counts[f"n/img_{batch['kind']}"] += size
+def build_bank_specs(label_bank: dict, tactile_bank: tuple | None) -> tuple[BankSpec, ...]:
+    """Enumerate every scoring unit, once, before any data is seen.
 
-
-@torch.no_grad()
-def _label_ranking_metrics(
-    z: torch.Tensor,
-    labels: list[str],
-    candidate_labels: tuple[str, ...],
-    text_embeddings: torch.Tensor,
-    per_class_out: list[dict[str, object]] | None = None,
-    world_size: int = 1,
-) -> dict[str, float]:
-    """Score labels, macro-averaging only classes present in ground truth."""
-    label_to_id = {label: idx for idx, label in enumerate(candidate_labels)}
-    text_embeddings = text_embeddings.to(device=z.device)
-    true = torch.tensor([label_to_id[label] for label in labels], device=z.device)
-    sims = z.float() @ text_embeddings.float().t()
-    ranked = sims.argsort(dim=1, descending=True)
-    pred = ranked[:, 0]
-    recall_at_5 = (ranked[:, : min(5, ranked.shape[1])] == true[:, None]).any(dim=1)
-    reciprocal_rank = (ranked == true[:, None]).int().argmax(dim=1).add(1).float().reciprocal()
-    num_classes = len(candidate_labels)
-    support = torch.bincount(true, minlength=num_classes)
-    predicted = torch.bincount(pred, minlength=num_classes)
-    true_positive = torch.bincount(true[pred == true], minlength=num_classes)
-    recall_at_5_count = torch.bincount(
-        true,
-        weights=recall_at_5.float(),
-        minlength=num_classes,
-    )
-    packed = torch.cat(
-        (
-            support.double(),
-            predicted.double(),
-            true_positive.double(),
-            recall_at_5_count.double(),
-            reciprocal_rank.double().sum().reshape(1),
-        )
-    )
-    if world_size > 1:
-        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    support, predicted, true_positive, recall_at_5_count = packed[:-1].reshape(4, num_classes)
-    sample_count = support.sum()
-
-    precision = true_positive / predicted.clamp_min(1)
-    recall = true_positive / support.clamp_min(1)
-    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
-    recall_at_5_by_class = recall_at_5_count / support.clamp_min(1)
-    supported = support > 0
-
-    if per_class_out is not None:
-        per_class_out.extend(
-            {
-                "class_id": class_id,
-                "label": label,
-                "support": support_i,
-                "predicted": predicted_i,
-                "precision": precision_i,
-                "recall": recall_i,
-                "f1": f1_i,
-                "recall_at_5": recall_at_5_i,
-            }
-            for class_id, (label, support_i, predicted_i, precision_i, recall_i, f1_i, recall_at_5_i) in enumerate(
-                zip(
-                    candidate_labels,
-                    support.tolist(),
-                    predicted.tolist(),
-                    precision.tolist(),
-                    recall.tolist(),
-                    f1.tolist(),
-                    recall_at_5_by_class.tolist(),
-                    strict=True,
-                )
+    Depends only on the label banks and ``TACTILE_SPANS``, so the unit list -- and
+    the reduce buffer's length -- is identical on every rank for the whole run.
+    """
+    specs: list[BankSpec] = []
+    for family in _TS_FAMILIES:
+        entry = label_bank.get(family)
+        if entry is None:
+            continue
+        labels, embeddings = entry
+        specs.append(
+            BankSpec(
+                key=f"ts_{family}",
+                labels=labels,
+                embeddings=embeddings,
+                family=family,
+                label_to_id={label: index for index, label in enumerate(labels)},
+                report_key=family if family in _CLASSIFICATION_FAMILIES else None,
             )
         )
-
-    return {
-        "accuracy": float(true_positive.sum() / sample_count),
-        "f1_macro": float(f1[supported].mean()),
-        "recall_at_1": float(true_positive.sum() / sample_count),
-        "recall_at_5": float(recall_at_5_count.sum() / sample_count),
-        "map": float(packed[-1] / sample_count),
-        "prediction_coverage": float((predicted > 0).sum()) / num_classes,
-    }
-
-
-@torch.no_grad()
-def _ts_prediction_metrics(
-    z: torch.Tensor,
-    texts: list[str],
-    families: list[str],
-    label_bank: dict[str, tuple[tuple[str, ...], torch.Tensor]],
-    per_class_reports: dict[str, list[dict[str, object]]] | None = None,
-    world_size: int = 1,
-) -> dict[str, float]:
-    """Compute metrics for each single-label sensor family."""
-    metrics: dict[str, float] = {}
-    for family in _TS_FAMILIES:
-        idx = [i for i, value in enumerate(families) if value == family]
-        if not idx:
-            continue
-        sel = torch.tensor(idx, device=z.device, dtype=torch.long)
-        family_labels = [texts[i] for i in idx]
-        entry = label_bank[family]
-        report_rows = (
-            per_class_reports.setdefault(family, [])
-            if per_class_reports is not None and family in _CLASSIFICATION_FAMILIES
-            else None
-        )
-        family_metrics = _label_ranking_metrics(
-            z[sel],
-            family_labels,
-            entry[0],
-            entry[1],
-            world_size=world_size,
-            per_class_out=report_rows,
-        )
-        for stat in (*_PUBLIC_STATS, "prediction_coverage"):
-            metrics[f"{stat}/ts_{family}"] = family_metrics[stat]
-    return metrics
+    if tactile_bank is not None:
+        all_labels, embeddings, bias = tactile_bank
+        for task, (start, stop) in TACTILE_SPANS.items():
+            specs.append(
+                BankSpec(
+                    key=f"task/{task}",
+                    labels=all_labels[start:stop],
+                    embeddings=embeddings[start:stop],
+                    threshold_bias=bias[start:stop] if task in MULTILABEL_TASKS else None,
+                    span=(start, stop),
+                    row_extra={"task": task},
+                )
+            )
+    return tuple(specs)
 
 
 @torch.no_grad()
-def _tactile_task_metrics(
-    task: str,
+def _bank_stats(
     z: torch.Tensor,
-    targets: torch.Tensor,
-    mask: torch.Tensor,
-    labels: tuple[str, ...],
-    text_embeddings: torch.Tensor,
-    bias: torch.Tensor,
-    log_logit_scale: torch.Tensor,
-    world_size: int,
-    per_label_out: list[dict[str, object]] | None,
-) -> dict[str, float]:
-    """Score one structured tactile task, including multi-positive labels."""
-    num_labels = len(labels)
-    mask = mask.to(z.device)
-    target = targets.to(z.device)[mask].bool()
-    similarities = z[mask].float() @ text_embeddings.to(z.device).float().t()
-    logits = log_logit_scale.float().exp() * similarities + bias
-    ranked = similarities.argsort(dim=1, descending=True)
+    target: torch.Tensor,
+    spec: BankSpec,
+    log_logit_scale: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Sufficient statistics for one (rows x bank) scoring problem. No collective.
+
+    Single-label units pass a one-hot target and every statistic collapses to its
+    familiar form: average precision over one positive is ``1 / rank``, recall@1 is
+    accuracy. These sums add across microbatches exactly as they add across ranks,
+    so nothing retains embeddings and macro-F1 stays a pooled-confusion number.
+    Zero rows is legal and yields zeros, which keeps an empty rank in lockstep.
+    """
+    num_labels = len(spec.labels)
+    target = target.to(z.device).bool()
+    sims = z.float() @ spec.embeddings.to(z.device).float().t()
+    # stable=True pins tie order to label index, so a row scores identically
+    # however the rows were chunked.
+    ranked = sims.argsort(dim=1, descending=True, stable=True)
     top = ranked[:, 0]
+    top_k = ranked[:, : min(5, num_labels)]
+
     top_is_positive = target.gather(1, top[:, None]).squeeze(1)
     positive_count = target.sum(dim=1).clamp_min(1)
     recall_at_1 = top_is_positive.float() / positive_count
-    recall_at_5 = target.gather(1, ranked[:, : min(5, num_labels)]).sum(dim=1) / positive_count
+    recall_at_5 = target.gather(1, top_k).sum(dim=1) / positive_count
 
     ranked_target = target.gather(1, ranked).float()
     ranks = torch.arange(1, num_labels + 1, device=z.device, dtype=torch.float32)
     precision_at_rank = ranked_target.cumsum(dim=1) / ranks
-    average_precision = (precision_at_rank * ranked_target).sum(dim=1) / (ranked_target.sum(dim=1).clamp_min(1))
+    average_precision = (precision_at_rank * ranked_target).sum(dim=1) / ranked_target.sum(
+        dim=1
+    ).clamp_min(1)
 
-    if task in MULTILABEL_TASKS:
-        predicted_mask = logits > 0
-    else:
+    if spec.threshold_bias is None:
         predicted_mask = F.one_hot(top, num_classes=num_labels).bool()
-    support = target.sum(dim=0).double()
-    predicted = predicted_mask.sum(dim=0).double()
-    true_positive = (target & predicted_mask).sum(dim=0).double()
-    packed = torch.cat(
-        (
-            support,
-            predicted,
-            true_positive,
-            top_is_positive.double().sum().reshape(1),
-            recall_at_1.double().sum().reshape(1),
-            recall_at_5.double().sum().reshape(1),
-            average_precision.double().sum().reshape(1),
-            target.new_tensor([len(target)], dtype=torch.float64),
-        )
-    )
-    if world_size > 1:
-        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-
-    support, predicted, true_positive = packed[:-5].reshape(3, num_labels)
-    sample_count = packed[-1]
-    precision = true_positive / predicted.clamp_min(1)
-    recall = true_positive / support.clamp_min(1)
-    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
-    supported = support > 0
-
-    if per_label_out is not None:
-        per_label_out.extend(
-            {
-                "task": task,
-                "label": label,
-                "support": int(support[index].item()),
-                "predicted": int(predicted[index].item()),
-                "precision": float(precision[index].item()),
-                "recall": float(recall[index].item()),
-                "f1": float(f1[index].item()),
-            }
-            for index, label in enumerate(labels)
-        )
+    else:
+        logits = log_logit_scale.float().exp() * sims + spec.threshold_bias.to(z.device)
+        predicted_mask = logits > 0
+    in_top_k = torch.zeros_like(target)
+    in_top_k.scatter_(1, top_k, True)
 
     return {
-        "accuracy": float(packed[-5] / sample_count),
-        "f1_macro": float(f1[supported].mean()),
-        "recall_at_1": float(packed[-4] / sample_count),
-        "recall_at_5": float(packed[-3] / sample_count),
-        "map": float(packed[-2] / sample_count),
-        "prediction_coverage": float((predicted > 0).sum()) / num_labels,
+        "support": target.sum(dim=0).double(),
+        "predicted": predicted_mask.sum(dim=0).double(),
+        "true_positive": (target & predicted_mask).sum(dim=0).double(),
+        "recall_at_5_count": (target & in_top_k).sum(dim=0).double(),
+        "top_is_positive": top_is_positive.double().sum(),
+        "recall_at_1": recall_at_1.double().sum(),
+        "recall_at_5": recall_at_5.double().sum(),
+        "average_precision": average_precision.double().sum(),
+        "n": z.new_tensor(float(len(target)), dtype=torch.float64),
     }
 
 
 @torch.no_grad()
-def _tactile_prediction_metrics(
-    z: torch.Tensor,
-    targets: torch.Tensor,
-    masks: torch.Tensor,
-    tactile_bank: tuple[tuple[str, ...], torch.Tensor, torch.Tensor],
-    log_logit_scale: torch.Tensor,
+def _bank_metrics(
+    stats: dict[str, torch.Tensor],
+    spec: BankSpec,
     *,
-    world_size: int = 1,
-    per_label_out: list[dict[str, object]] | None = None,
+    rows_out: list[dict[str, object]] | None = None,
 ) -> dict[str, float]:
-    """Compute equal-task structured metrics by slicing the one tactile bank."""
-    metrics: dict[str, float] = {}
-    task_scores: dict[str, dict[str, float]] = {}
-    all_labels, embeddings, bias = tactile_bank
-    for task, (start, stop) in TACTILE_SPANS.items():
-        # A row is in play for this task iff the join produced an answer, which the
-        # collate marks identically across the task's columns -- so any one of them
-        # recovers the old per-row mask.
-        rows = masks[:, start] > 0
-        observed = rows.sum()
-        if world_size > 1:
-            dist.all_reduce(observed, op=dist.ReduceOp.SUM)
-        if not int(observed):
-            # No rank annotated this task in this pass. Scoring it anyway divides by
-            # a zero sample count and the resulting nan propagates into every
-            # family average, so skip it rather than emit a poisoned number.
-            continue
-        scores = _tactile_task_metrics(
-            task,
-            z,
-            targets[:, start:stop],
-            rows,
-            all_labels[start:stop],
-            embeddings[start:stop],
-            bias[start:stop],
-            log_logit_scale,
-            world_size,
-            per_label_out,
-        )
-        task_scores[task] = scores
-        for name, value in scores.items():
-            metrics[f"{name}/task/{task}"] = value
+    """Turn globally reduced sufficient statistics into the published scalars."""
+    support, predicted = stats["support"], stats["predicted"]
+    true_positive, sample_count = stats["true_positive"], stats["n"]
 
-    if not task_scores:
-        return metrics
-    for stat in (*_PUBLIC_STATS, "prediction_coverage"):
-        metrics[f"{stat}/ts_tactile"] = sum(scores[stat] for scores in task_scores.values()) / len(task_scores)
-    return metrics
+    precision = true_positive / predicted.clamp_min(1)
+    recall = true_positive / support.clamp_min(1)
+    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
+    recall_at_5_by_class = stats["recall_at_5_count"] / support.clamp_min(1)
+    supported = support > 0
+
+    if rows_out is not None:
+        rows_out.extend(
+            {
+                **(spec.row_extra or {}),
+                "class_id": index,
+                "label": label,
+                "support": support[index].item(),
+                "predicted": predicted[index].item(),
+                "precision": precision[index].item(),
+                "recall": recall[index].item(),
+                "f1": f1[index].item(),
+                "recall_at_5": recall_at_5_by_class[index].item(),
+            }
+            for index, label in enumerate(spec.labels)
+        )
+
+    return {
+        "accuracy": float(stats["top_is_positive"] / sample_count),
+        "f1_macro": float(f1[supported].mean()),
+        "recall_at_1": float(stats["recall_at_1"] / sample_count),
+        "recall_at_5": float(stats["recall_at_5"] / sample_count),
+        "map": float(stats["average_precision"] / sample_count),
+        "prediction_coverage": float((predicted > 0).sum()) / len(spec.labels),
+    }
+
+
+@torch.no_grad()
+def score_bank(
+    spec: BankSpec,
+    z: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    log_logit_scale: torch.Tensor | None = None,
+    rows_out: list[dict[str, object]] | None = None,
+    world_size: int = 1,
+) -> dict[str, float]:
+    """Score one unit in one shot: accumulate, reduce, derive."""
+    stats = all_reduce_sum(_bank_stats(z, target, spec, log_logit_scale), world_size=world_size)
+    return _bank_metrics(stats, spec, rows_out=rows_out)
+
+
+def new_stats(specs: tuple[BankSpec, ...], device: torch.device) -> dict[str, torch.Tensor]:
+    """Zero-fill the complete statistic key set before any data is seen."""
+    stats: dict[str, torch.Tensor] = {}
+    for spec in specs:
+        for field_name in _CLASS_FIELDS:
+            stats[f"{spec.key}/{field_name}"] = torch.zeros(
+                len(spec.labels), dtype=torch.float64, device=device
+            )
+        for field_name in _SCALAR_FIELDS:
+            stats[f"{spec.key}/{field_name}"] = torch.zeros((), dtype=torch.float64, device=device)
+    return stats
+
+
+def _unit_rows(
+    spec: BankSpec,
+    z: torch.Tensor,
+    texts: list[str],
+    families: list[str],
+    targets: torch.Tensor | None,
+    masks: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Select this unit's rows and multi-hot target from one microbatch."""
+    if spec.span is None:
+        index = [i for i, value in enumerate(families) if value == spec.family]
+        if not index:
+            return None
+        selected = torch.tensor(index, device=z.device, dtype=torch.long)
+        ids = torch.tensor([spec.label_to_id[texts[i]] for i in index], device=z.device)
+        return z[selected], F.one_hot(ids, num_classes=len(spec.labels))
+    if masks is None:
+        return None
+    start, stop = spec.span
+    span_mask = masks[:, start:stop] > 0
+    rows = span_mask[:, 0]
+    # collate_alignment writes a task's mask columns as one slice; that is the only
+    # reason one column recovers the per-row mask, and nothing in data.py enforces it.
+    if not torch.equal(span_mask, rows[:, None].expand_as(span_mask)):
+        raise ValueError(f"tactile mask is not span-uniform for {spec.key}")
+    return z[rows], targets[rows, start:stop]
+
+
+@torch.no_grad()
+def update_stats(
+    stats: dict[str, torch.Tensor],
+    specs: tuple[BankSpec, ...],
+    ts_eval: tuple,
+    log_logit_scale: torch.Tensor | None,
+) -> None:
+    """Fold one microbatch into the running statistics. No collective, no retention."""
+    z, texts, families, targets, masks = ts_eval
+    if z is None:
+        return
+    for spec in specs:
+        rows = _unit_rows(spec, z, texts, families, targets, masks)
+        if rows is None:
+            continue
+        for field_name, value in _bank_stats(rows[0], rows[1], spec, log_logit_scale).items():
+            # Fixed key set: a diverged rank raises KeyError rather than hanging.
+            key = f"{spec.key}/{field_name}"
+            stats[key] = stats[key] + value
+
+
+@torch.no_grad()
+def prediction_metrics(
+    stats: dict[str, torch.Tensor],
+    specs: tuple[BankSpec, ...],
+    *,
+    per_class: dict[str, list[dict[str, object]]] | None = None,
+    per_label: list[dict[str, object]] | None = None,
+) -> dict[str, float]:
+    """Derive every published key from globally reduced statistics. No collective."""
+    metrics: dict[str, float] = {}
+    task_scores: list[dict[str, float]] = []
+    for spec in specs:
+        # Reads an already-reduced count, so every rank takes the same branch.
+        unit = {name: stats[f"{spec.key}/{name}"] for name in (*_CLASS_FIELDS, *_SCALAR_FIELDS)}
+        if not float(unit["n"]):
+            continue
+        rows_out = None
+        if spec.report_key is not None and per_class is not None:
+            rows_out = per_class.setdefault(spec.report_key, [])
+        elif spec.span is not None and per_label is not None:
+            rows_out = per_label
+        scores = _bank_metrics(unit, spec, rows_out=rows_out)
+        for stat in _ALL_STATS:
+            metrics[f"{stat}/{spec.key}"] = scores[stat]
+        if spec.span is not None:
+            task_scores.append(scores)
+    if task_scores:
+        for stat in _ALL_STATS:
+            metrics[f"{stat}/ts_tactile"] = sum(s[stat] for s in task_scores) / len(task_scores)
+    return _merge_prediction_metrics(metrics)
 
 
 def _merge_prediction_metrics(*metric_sets: dict[str, float]) -> dict[str, float]:
@@ -395,7 +391,7 @@ def _metric_groups(
         loss_key = f"loss/task/{task}"
         if loss_key in loss_metrics:
             out[f"{aux}/loss/tactile/{task}"] = loss_metrics[loss_key]
-        for stat in (*_PUBLIC_STATS, "prediction_coverage"):
+        for stat in _ALL_STATS:
             key = f"{stat}/task/{task}"
             if key in prediction_metrics:
                 out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]

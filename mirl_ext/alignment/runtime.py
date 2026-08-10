@@ -115,6 +115,9 @@ def build_model(
         visual_dtype=visual_dtype,
         contrastive_temperature=cfg.loss.temperature,
     ).to(device)
+    if cfg.train.gradient_checkpointing:
+        # Only the trainable tower; the frozen anchor already runs under no_grad.
+        model.trainable_visual.gradient_checkpointing_enable()
     trainable = [param for param in model.parameters() if param.requires_grad]
     # Keep fp32 master weights while autocast handles bf16 forward operations.
     for param in trainable:
@@ -128,28 +131,21 @@ def build_model(
 
 
 def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_steps: int):
-    trainable = [p for p in model.parameters() if p.requires_grad and p is not model.log_logit_scale]
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    # One learning rate for everything, temperature included, as SigLIP does.
+    # 0-dim scalars fail an `ndim == 1` predicate, so the no-decay split is `<= 1`.
     optimizer = torch.optim.AdamW(
         [
             {
-                "name": "model_decay",
                 "params": [p for p in trainable if p.ndim > 1],
-                "lr": cfg.train.lr,
                 "weight_decay": cfg.train.weight_decay,
             },
             {
-                "name": "model_no_decay",
                 "params": [p for p in trainable if p.ndim <= 1],
-                "lr": cfg.train.lr,
-                "weight_decay": 0.0,
-            },
-            {
-                "name": "scalar",
-                "params": [model.log_logit_scale],
-                "lr": cfg.train.scalar_lr,
                 "weight_decay": 0.0,
             },
         ],
+        lr=cfg.train.lr,
         betas=(0.9, 0.95),
         eps=1e-8,
     )

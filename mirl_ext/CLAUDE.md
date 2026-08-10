@@ -219,8 +219,6 @@ Measured lessons (do not re-derive; re-measure if the regime changes):
   over an available measurement: lr 3e-5 (SigLIP2 citation vs v1/v2's own logs),
   clip=5 (dismissed v1's clip=1), "val-mix is harder" (eval showed the opposite),
   tactile 2x upscale (probe: worse). Probe/eval first; it costs minutes.
-- **Scalars need their own LR.** Adam moves 0-dim params ~lr/step; SigLIP's
-  temperature is meant to LEARN (10 -> ~100). Hence train.scalar_lr (3e-3).
 - **Similarity gap is not a selection metric** because it moves with common-mode
   shifts; it is no longer published to W&B. Historical `val/f1` numbers above use
   the old mixed, batch-local protocol and are not comparable to supported-class macro-F1.

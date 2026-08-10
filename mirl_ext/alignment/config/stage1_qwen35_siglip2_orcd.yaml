@@ -45,9 +45,9 @@ train:
   # Two GPUs and four-step accumulation give an effective batch of 256.
   batch_size: 32
   grad_accum_steps: 4
+  gradient_checkpointing: true
   num_workers: 4
   lr: 1.0e-5
-  scalar_lr: 3.0e-3
   weight_decay: 0.05
   num_train_epochs: 1
   warmup_ratio: 0.03

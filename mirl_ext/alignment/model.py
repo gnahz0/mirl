@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import logging
 import math
-import time
 from contextlib import nullcontext
 
 import torch
@@ -14,28 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
-
-def _load_exact_qwen35_visual(
-    model_path: str,
-    *,
-    dtype: torch.dtype,
-) -> nn.Module:
-    """Load the native Qwen3.5 vision tower without materializing the 9B LM."""
-    from transformers import AutoConfig
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
-
-    full_config = AutoConfig.from_pretrained(model_path, local_files_only=True)
-    vision_config = full_config.vision_config
-    vision_config._attn_implementation = "sdpa"
-    return Qwen3_5VisionModel.from_pretrained(
-        model_path,
-        config=vision_config,
-        dtype=dtype,
-        local_files_only=True,
-        key_mapping={r"^model\.visual\.": ""},
-    )
-
 
 class MultimodalAlignmentModel(nn.Module):
     """Trainable Qwen vision tower, frozen image anchor, and SigLIP2 text tower."""
@@ -48,12 +25,18 @@ class MultimodalAlignmentModel(nn.Module):
         contrastive_temperature: float = 0.07,
     ):
         super().__init__()
-        from transformers import AutoProcessor, AutoTokenizer, Siglip2TextModel
+        from transformers import AutoConfig, AutoProcessor, AutoTokenizer, Siglip2TextModel
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
         self.qwen_processor = AutoProcessor.from_pretrained(qwen35_path, local_files_only=True)
-        self.trainable_visual = _load_exact_qwen35_visual(
+        vision_config = AutoConfig.from_pretrained(qwen35_path, local_files_only=True).vision_config
+        vision_config._attn_implementation = "sdpa"
+        self.trainable_visual = Qwen3_5VisionModel.from_pretrained(
             qwen35_path,
             dtype=visual_dtype,
+            config=vision_config,
+            local_files_only=True,
+            key_mapping={r"^model\.visual\.": ""},
         )
 
         self.frozen_visual = copy.deepcopy(self.trainable_visual)

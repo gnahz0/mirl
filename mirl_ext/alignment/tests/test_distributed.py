@@ -26,13 +26,36 @@ class _ToyModel(torch.nn.Module):
         return values, self.log_scale * 1.0
 
 
-def _worker(rank: int, results: dict) -> None:
-    from mirl_ext.alignment.metrics import _label_ranking_metrics
+def _free_port() -> int:
+    """Claim an unused port for one rendezvous.
+
+    Hardcoding a port makes two concurrent runs of this file deadlock on the
+    rendezvous rather than fail, which on a shared login node means orphaned
+    gloo processes that outlive the test session.
+    """
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _rank_metrics(z, labels, candidates, text, world_size=1):
+    """Score one exclusive family through the unified path."""
+    from mirl_ext.alignment.metrics import build_bank_specs, score_bank
+
+    spec = build_bank_specs({"ecg": (candidates, text)}, None)[0]
+    ids = torch.tensor([candidates.index(label) for label in labels])
+    target = torch.nn.functional.one_hot(ids, num_classes=len(candidates))
+    return score_bank(spec, z, target, world_size=world_size)
+
+
+def _worker(rank: int, results: dict, port: int) -> None:
     from mirl_ext.alignment.data import TACTILE_SPANS
     from mirl_ext.alignment.objective import _label_siglip_loss, _tactile_siglip_loss
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29517"
+    os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=2)
     try:
         inputs = (torch.tensor([[1.0, 0.0], [0.8, 0.2]]), torch.tensor([[0.0, 1.0]]))[rank]
@@ -46,14 +69,14 @@ def _worker(rank: int, results: dict) -> None:
                 embeddings, scale = model(inputs)
                 loss = _label_siglip_loss(embeddings, labels, candidates, text, scale, world_size=2)
                 (loss / 2).backward()
-        metrics = _label_ranking_metrics(embeddings.detach(), labels, candidates, text, world_size=2)
+        metrics = _rank_metrics(embeddings.detach(), labels, candidates, text, world_size=2)
 
         reference = _ToyModel()
         all_inputs = torch.cat((torch.tensor([[1.0, 0.0], [0.8, 0.2]]), torch.tensor([[0.0, 1.0]])))
         all_embeddings, all_scale = reference(all_inputs)
         reference_loss = _label_siglip_loss(all_embeddings, ["A", "A", "B"], candidates, text, all_scale)
         reference_loss.backward()
-        reference_metrics = _label_ranking_metrics(all_embeddings.detach(), ["A", "A", "B"], candidates, text)
+        reference_metrics = _rank_metrics(all_embeddings.detach(), ["A", "A", "B"], candidates, text)
         standard_result = (
             torch.allclose(model.module.weight.grad, reference.weight.grad, atol=1e-6),
             torch.allclose(model.module.log_scale.grad, reference.log_scale.grad, atol=1e-6),
@@ -104,10 +127,80 @@ def _worker(rank: int, results: dict) -> None:
 def test_ddp_local_loss_and_metrics_match_the_global_batch():
     ctx = mp.get_context("spawn")
     results = ctx.Manager().dict()
-    processes = [ctx.Process(target=_worker, args=(rank, results)) for rank in range(2)]
+    port = _free_port()
+    processes = [ctx.Process(target=_worker, args=(rank, results, port)) for rank in range(2)]
     for process in processes:
         process.start()
     for process in processes:
         process.join(timeout=120)
         assert process.exitcode == 0
+    assert all(all(result) for result in results.values())
+
+
+def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
+    """Each rank holds rows for a family the other rank has none of."""
+    from mirl_ext.alignment.metrics import (
+        all_reduce_sum,
+        build_bank_specs,
+        new_stats,
+        prediction_metrics,
+        update_stats,
+    )
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=2)
+    try:
+        candidates = ("A", "B")
+        bank = {"smellnet": (candidates, torch.eye(2)), "ecg": (candidates, torch.eye(2))}
+        specs = build_bank_specs(bank, None)
+        smell_z = torch.tensor([[1.0, 0.0], [0.2, 0.8]])
+        ecg_z = torch.tensor([[0.0, 1.0], [0.9, 0.1], [0.3, 0.7]])
+
+        # Rank 0 sees only smellnet; rank 1 sees only ecg. Under the old
+        # per-family reduce this shape could not agree on a collective at all.
+        shard = (
+            (smell_z, ["A", "B"], ["smellnet"] * 2),
+            (ecg_z, ["B", "A", "B"], ["ecg"] * 3),
+        )[rank]
+        stats = new_stats(specs, torch.device("cpu"))
+        update_stats(stats, specs, (shard[0], shard[1], shard[2], None, None), None)
+        sharded = prediction_metrics(all_reduce_sum(stats, world_size=2), specs)
+
+        reference_stats = new_stats(specs, torch.device("cpu"))
+        update_stats(
+            reference_stats,
+            specs,
+            (
+                torch.cat([smell_z, ecg_z]),
+                ["A", "B", "B", "A", "B"],
+                ["smellnet"] * 2 + ["ecg"] * 3,
+                None,
+                None,
+            ),
+            None,
+        )
+        reference = prediction_metrics(reference_stats, specs)
+        results[rank] = (set(sharded) == set(reference), sharded == pytest.approx(reference))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_metrics_agree_when_a_rank_holds_no_rows_for_a_family():
+    """A rank with zero rows of a family must still reach the same collective.
+
+    The reduce buffer is sized from the label banks before any data, so a rank
+    contributing nothing to a family contributes exact zeros rather than skipping
+    the reduce -- the shape that would otherwise hang instead of failing.
+    """
+    ctx = mp.get_context("spawn")
+    results = ctx.Manager().dict()
+    port = _free_port()
+    processes = [ctx.Process(target=_asymmetric_worker, args=(rank, results, port)) for rank in range(2)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=120)
+        assert process.exitcode == 0
+    assert len(results) == 2
     assert all(all(result) for result in results.values())
