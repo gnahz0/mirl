@@ -43,12 +43,18 @@ def _free_port() -> int:
 
 def _rank_metrics(z, labels, candidates, text, world_size=1):
     """Score one exclusive family through the unified path."""
-    from mirl_ext.alignment.metrics import build_bank_specs, score_bank
+    from mirl_ext.alignment.metrics import (
+        _bank_metrics,
+        _bank_stats,
+        all_reduce_sum,
+        build_bank_specs,
+    )
 
     spec = build_bank_specs({"ecg": (candidates, text)}, None)[0]
     ids = torch.tensor([candidates.index(label) for label in labels])
     target = torch.nn.functional.one_hot(ids, num_classes=len(candidates))
-    return score_bank(spec, z, target, world_size=world_size)
+    stats = all_reduce_sum(_bank_stats(z, target, spec), world_size=world_size)
+    return _bank_metrics(stats, spec)
 
 
 def _worker(rank: int, results: dict, port: int) -> None:

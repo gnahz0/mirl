@@ -15,12 +15,13 @@ from mirl_ext.alignment.data import (  # noqa: E402
     TASK_LABELS,
 )
 from mirl_ext.alignment.metrics import (  # noqa: E402
+    _bank_metrics,
+    _bank_stats,
     _merge_prediction_metrics,
     _metric_groups,
     build_bank_specs,
     new_stats,
     prediction_metrics,
-    score_bank,
     update_stats,
 )
 from mirl_ext.alignment.objective import (  # noqa: E402
@@ -45,7 +46,7 @@ def _rank(z, labels, candidates, bank, rows_out=None):
     spec = build_bank_specs({"ecg": (candidates, bank)}, None)[0]
     ids = torch.tensor([candidates.index(label) for label in labels])
     target = torch.nn.functional.one_hot(ids, num_classes=len(candidates))
-    return score_bank(spec, z, target, rows_out=rows_out)
+    return _bank_metrics(_bank_stats(z, target, spec), spec, rows_out=rows_out)
 
 
 def _score_units(specs, ts_eval, log_logit_scale=None, logit_bias=None, **reports):
@@ -374,7 +375,6 @@ def test_absent_ground_truth_classes_do_not_cap_macro_f1():
     )
 
     assert metrics["accuracy"] == metrics["f1_macro"] == 1.0
-    assert metrics["prediction_coverage"] == pytest.approx(2 / 3)
     assert report[2] == {
         "class_id": 2,
         "label": "C",
@@ -409,7 +409,6 @@ def test_macro_f1_exposes_single_class_prediction_collapse():
 
     assert metrics["accuracy"] == pytest.approx(5 / 12)
     assert metrics["f1_macro"] == pytest.approx((10 / 17) / 7)
-    assert metrics["prediction_coverage"] == pytest.approx(1 / 7)
 
 
 def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
@@ -467,7 +466,6 @@ def test_validation_metrics_keep_a_compact_core():
             "f1_macro/ts_smellnet": 0.4,
             "recall_at_1/ts_smellnet": 0.5,
             "recall_at_5/ts_smellnet": 0.8,
-            "prediction_coverage/ts_smellnet": 0.25,
             "accuracy/overall": 0.5,
             "f1_macro/overall": 0.4,
             "recall_at_1/overall": 0.3,
@@ -478,7 +476,6 @@ def test_validation_metrics_keep_a_compact_core():
             "recall_at_1/ts_tactile": 0.1,
             "recall_at_5/ts_tactile": 0.3,
             "map/ts_tactile": 0.2,
-            "prediction_coverage/ts_tactile": 0.4,
         },
     )
 
@@ -495,8 +492,6 @@ def test_validation_metrics_keep_a_compact_core():
     assert metrics["val-core/recall_at_1/tactile"] == 0.1
     assert metrics["val-core/recall_at_5/tactile"] == 0.3
     assert metrics["val-core/map/tactile"] == 0.2
-    assert metrics["val-aux/prediction_coverage/smellnet"] == 0.25
-    assert metrics["val-aux/prediction_coverage/tactile"] == 0.4
     assert metrics["val-core/loss/aggregate"] == 0.25
     assert metrics["val-core/loss/smellnet"] == 0.14
     assert metrics["val-core/loss/ecg"] == 0.16
@@ -516,7 +511,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "recall_at_1/overall": 0.45,
         "recall_at_5/overall": 0.75,
         "map/overall": 0.55,
-        "prediction_coverage/ts_smellnet": 0.2,
         "loss/siglip": 0.75,
         "loss/ts_smellnet": 0.7,
         "loss/ts_ecg": 0.8,
@@ -528,7 +522,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "map/ts_tactile": 0.5,
         "accuracy/ts_tactile": 0.25,
         "f1_macro/ts_tactile": 0.2,
-        "prediction_coverage/ts_tactile": 0.1,
         "grad_norm": 2.0,
         "logit_scale": 10.0,
         "logit_bias": -10.0,
@@ -557,8 +550,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     assert grouped["train-core/recall_at_1/tactile"] == 0.25
     assert grouped["train-core/recall_at_5/tactile"] == 0.75
     assert grouped["train-core/map/tactile"] == 0.5
-    assert grouped["train-aux/prediction_coverage/smellnet"] == 0.2
-    assert grouped["train-aux/prediction_coverage/tactile"] == 0.1
     assert grouped["train-aux/n/img"] == 3.0
     assert grouped["train-aux/n/skipped/image"] == 1.0
     assert grouped["train-aux/n/skipped/video"] == 2.0

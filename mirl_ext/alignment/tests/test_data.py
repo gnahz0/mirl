@@ -446,22 +446,3 @@ def test_homogeneous_sampler_repeats_only_configured_signal_sources():
         ("image", "climb"): 12,
         ("video", "human_behaviour"): 12,
     }
-
-
-@pytest.mark.parametrize("factor", [0, -1, 1.5, True])
-def test_homogeneous_sampler_rejects_non_positive_integer_repeat_factors(factor):
-    with pytest.raises(ValueError, match="positive integers"):
-        HomogeneousBatchSampler(
-            _GroupedDataset(),
-            batch_size=8,
-            signal_repeat_factors={"smellnet_base": factor},
-        )
-
-
-def test_homogeneous_sampler_rejects_unknown_repeat_sources():
-    with pytest.raises(ValueError, match="unknown signal sources"):
-        HomogeneousBatchSampler(
-            _GroupedDataset(),
-            batch_size=8,
-            signal_repeat_factors={"missing": 2},
-        )

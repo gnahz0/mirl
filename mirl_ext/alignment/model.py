@@ -14,7 +14,6 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-
 class MultimodalAlignmentModel(nn.Module):
     """Trainable Qwen vision tower, frozen image anchor, and SigLIP2 text tower."""
 
@@ -100,8 +99,7 @@ class MultimodalAlignmentModel(nn.Module):
         logit_scale = self.log_logit_scale * 1.0
         logit_bias = self.logit_bias * 1.0
         if kind == "signal":
-            signal_features = self.encode_ts_trainable(media, family, device)
-            return None, None, None, signal_features, logit_scale, logit_bias
+            return None, None, None, self.encode_ts_trainable(media, family, device), logit_scale, logit_bias
 
         if kind == "image":
             token_pixels = (self.vit_patch_size * self.vit_merge_size) ** 2
@@ -200,9 +198,10 @@ class MultimodalAlignmentModel(nn.Module):
             do_normalize=False,
             return_tensors="pt",
         )
-        pixel_values = processed["pixel_values_videos"].to(device=device)
-        grid_thw = processed["video_grid_thw"].to(device=device)
-        return self.encode_visual(pixel_values, grid_thw)
+        return self.encode_visual(
+            processed["pixel_values_videos"].to(device=device),
+            processed["video_grid_thw"].to(device=device),
+        )
 
     @torch.no_grad()
     def encode_text(

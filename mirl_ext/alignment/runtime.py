@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 import math
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -46,12 +45,10 @@ def build_loaders(
     HomogeneousBatchSampler,
     DataLoader,
 ]:
-    started = time.time()
     train_ds = AlignmentDataset(
         list(cfg.data.train_files),
         max_video_frames=cfg.data.max_video_frames,
     )
-    logger.info("train dataset: %d rows (%.1fs)", len(train_ds), time.time() - started)
 
     train_sampler = HomogeneousBatchSampler(
         train_ds,
@@ -59,74 +56,37 @@ def build_loaders(
         rank=rank,
         world_size=world_size,
         seed=seed,
-        signal_repeat_factors=dict(cfg.train.get("signal_repeat_factors", {})),
+        signal_repeat_factors=dict(cfg.train.signal_repeat_factors),
     )
-    train_kwargs = {
-        "batch_sampler": train_sampler,
-        "num_workers": cfg.train.num_workers,
-        "collate_fn": collate_alignment,
-        "pin_memory": True,
-    }
-    if cfg.train.num_workers:
-        # CUDA is already initialized, so workers must spawn rather than fork.
-        train_kwargs.update(
-            multiprocessing_context="spawn",
-            persistent_workers=True,
-        )
-    train_loader = DataLoader(train_ds, **train_kwargs)
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        num_workers=cfg.train.num_workers,
+        collate_fn=collate_alignment,
+        pin_memory=True,
+        multiprocessing_context="spawn" if cfg.train.num_workers else None,
+        persistent_workers=bool(cfg.train.num_workers),
+    )
 
-    started = time.time()
     val_ds = AlignmentDataset(
         list(cfg.data.val_files),
         max_video_frames=cfg.data.max_video_frames,
     )
-    val_sampler = HomogeneousBatchSampler(
-        val_ds,
-        batch_size=cfg.train.val_batch_size,
-        rank=rank,
-        world_size=world_size,
-        seed=seed + 1,
-    )
     val_loader = DataLoader(
         val_ds,
-        batch_sampler=val_sampler,
+        batch_sampler=HomogeneousBatchSampler(
+            val_ds,
+            batch_size=cfg.train.val_batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=seed + 1,
+        ),
         num_workers=0,
         collate_fn=collate_alignment,
         pin_memory=True,
     )
-    logger.info(
-        "val dataset: %d rows, batch/rank=%d, full evaluation (%.1fs)",
-        len(val_ds),
-        cfg.train.val_batch_size,
-        time.time() - started,
-    )
+
     return train_ds, val_ds, train_loader, train_sampler, val_loader
-
-
-def build_model(
-    cfg: DictConfig,
-    device: torch.device,
-    visual_dtype: torch.dtype,
-) -> MultimodalAlignmentModel:
-    started = time.time()
-    model = MultimodalAlignmentModel(
-        qwen35_path=str(cfg.model.qwen35_path),
-        siglip2_text_path=str(cfg.model.siglip2_text_path),
-        visual_dtype=visual_dtype,
-    ).to(device)
-    if cfg.train.gradient_checkpointing:
-        # Only the trainable tower; the frozen anchor already runs under no_grad.
-        model.trainable_visual.gradient_checkpointing_enable()
-    trainable = [param for param in model.parameters() if param.requires_grad]
-    # Keep fp32 master weights while autocast handles bf16 forward operations.
-    for param in trainable:
-        param.data = param.data.float()
-    logger.info(
-        "model ready in %.1fs; %.1fM trainable parameters",
-        time.time() - started,
-        sum(param.numel() for param in trainable) / 1e6,
-    )
-    return model
 
 
 def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_steps: int):
@@ -148,12 +108,14 @@ def build_optimizer(model: MultimodalAlignmentModel, cfg: DictConfig, total_step
         betas=(0.9, 0.95),
         eps=1e-8,
     )
-    warmup = math.ceil(total_steps * float(cfg.train.warmup_ratio))
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
-    return optimizer, scheduler
+    return optimizer, get_cosine_schedule_with_warmup(
+        optimizer,
+        math.ceil(total_steps * float(cfg.train.warmup_ratio)),
+        total_steps,
+    )
 
 
-def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> int:
+def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> None:
     """Warm-start trainable model weights from an alignment checkpoint."""
     state_path = Path(path) / "alignment_state.pt"
     state = torch.load(state_path, map_location="cpu", weights_only=True)
@@ -161,9 +123,8 @@ def load_checkpoint(model: MultimodalAlignmentModel, path: str | Path) -> int:
     with torch.no_grad():
         model.log_logit_scale.copy_(state["log_logit_scale"])
         model.logit_bias.copy_(state["logit_bias"])
-    step = int(state.get("step", 0))
+    step = int(state["step"])
     logger.info("loaded alignment checkpoint %s (step=%d)", state_path, step)
-    return step
 
 
 def load_training_state(path: str | Path, optimizer, scheduler) -> dict[str, Any]:

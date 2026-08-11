@@ -63,8 +63,7 @@ def _build_tactile_bank(
             TACTILE_SPANS[task],
             len(task_labels),
         )
-    embeddings = model.encode_text(labels, device=device).float().detach()
-    return tuple(labels), embeddings
+    return tuple(labels), model.encode_text(labels, device=device).float().detach()
 
 
 def _label_siglip_loss(
@@ -158,13 +157,12 @@ def _tactile_siglip_loss(
     # that appeared. DDP averages rank gradients, so the local sum is scaled back up
     # by world_size against the globally reduced pair count.
     task_losses = per_task_sum[present] * world_size / task_observed[present]
-    loss = task_losses.mean()
     per_task = {
         f"loss/task/{task}": float(task_sums[index] / task_observed[index])
         for index, task in enumerate(TACTILE_SPANS)
         if bool(present[index])
     }
-    return loss, per_task
+    return task_losses.mean(), per_task
 
 
 def _compute_losses(
@@ -257,9 +255,8 @@ def _compute_losses(
     metrics["loss/total"] = total.detach().item()
     metrics["logit_scale"] = log_logit_scale.detach().exp().item()
     metrics["logit_bias"] = logit_bias.detach().item()
-    ts_eval = (
+    return total, metrics, (
         (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
         if z_ts is not None
         else (None, [], [], None, None)
     )
-    return total, metrics, ts_eval

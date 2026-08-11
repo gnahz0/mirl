@@ -26,6 +26,7 @@ from .metrics import (
     prediction_metrics,
     update_stats,
 )
+from .model import MultimodalAlignmentModel
 from .objective import (
     _build_tactile_bank,
     _build_text_label_bank,
@@ -33,7 +34,6 @@ from .objective import (
 )
 from .runtime import (
     build_loaders,
-    build_model,
     build_optimizer,
     load_checkpoint,
     load_training_state,
@@ -130,7 +130,6 @@ class AccumulationWindow:
 @torch.no_grad()
 def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_bank, specs):
     """Evaluate the full sharded validation set."""
-    was_training = model.training
     model.eval()
     world_size = accelerator.num_processes
     base_model = accelerator.unwrap_model(model)
@@ -156,10 +155,9 @@ def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_ban
     per_label: list[dict[str, object]] = []
     losses, counts, prediction = window.flush(world_size, per_class, per_label)
 
-    if was_training:
-        model.train()
-        base_model.frozen_visual.eval()
-        base_model.label_text_model.eval()
+    model.train()
+    base_model.frozen_visual.eval()
+    base_model.label_text_model.eval()
     return _metric_groups("val", losses, counts, prediction), per_class, per_label
 
 
@@ -177,8 +175,9 @@ def train(cfg: DictConfig) -> None:
 
     device = accelerator.device
     # Use autocast for frozen towers and fp32 trainable weights.
-    dtypes = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
-    visual_dtype = dtypes[str(cfg.train.amp_dtype)]
+    visual_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[
+        str(cfg.train.amp_dtype)
+    ]
     out_dir = Path(cfg.train.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
@@ -190,17 +189,23 @@ def train(cfg: DictConfig) -> None:
         out_dir,
     )
 
-    init_checkpoint = cfg.train.get("init_checkpoint")
-    resume_checkpoint = cfg.train.get("resume_checkpoint")
-    if init_checkpoint and resume_checkpoint:
-        raise ValueError("train.init_checkpoint and train.resume_checkpoint are mutually exclusive")
+    init_checkpoint = cfg.train.init_checkpoint
+    resume_checkpoint = cfg.train.resume_checkpoint
 
     train_ds, val_ds, train_loader, train_sampler, val_loader = build_loaders(cfg, rank, world_size, seed)
-    model = build_model(cfg, device, visual_dtype)
+    model = MultimodalAlignmentModel(
+        qwen35_path=str(cfg.model.qwen35_path),
+        siglip2_text_path=str(cfg.model.siglip2_text_path),
+        visual_dtype=visual_dtype,
+    ).to(device)
+    if cfg.train.gradient_checkpointing:
+        model.trainable_visual.gradient_checkpointing_enable()
+    trainable = [param for param in model.parameters() if param.requires_grad]
+    for param in trainable:
+        param.data = param.data.float()
     if init_checkpoint or resume_checkpoint:
         load_checkpoint(model, str(init_checkpoint or resume_checkpoint))
-        if init_checkpoint:
-            logger.info("warm start uses a fresh optimizer and schedule")
+
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
@@ -268,7 +273,6 @@ def train(cfg: DictConfig) -> None:
         effective_batch,
     )
 
-    trainable = [param for param in model.parameters() if param.requires_grad]
     window_args = (
         device,
         train_specs,
@@ -278,9 +282,9 @@ def train(cfg: DictConfig) -> None:
     window = AccumulationWindow(*window_args)
     cumulative_counts: Counter[str] = Counter()
     opt_step = int(resume_progress["step"]) if resume_progress else 0
-    best_value = float(resume_progress.get("best_value", float("-inf"))) if resume_progress else float("-inf")
-    start_epoch = int(resume_progress.get("next_epoch", 0)) if resume_progress else 0
-    start_batch_index = int(resume_progress.get("next_batch_index", 0)) if resume_progress else 0
+    best_value = float(resume_progress["best_value"]) if resume_progress else float("-inf")
+    start_epoch = int(resume_progress["next_epoch"]) if resume_progress else 0
+    start_batch_index = int(resume_progress["next_batch_index"]) if resume_progress else 0
     if start_batch_index % grad_accum:
         raise ValueError("resume checkpoint is not at an optimizer-step boundary")
     if start_epoch >= num_epochs:
@@ -449,11 +453,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", "-c", required=True)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args(argv)
-    cfg = OmegaConf.merge(
-        OmegaConf.load(args.config),
-        OmegaConf.from_dotlist(args.overrides),
-    )
-    train(cfg)
+    train(OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_dotlist(args.overrides)))
 
 
 if __name__ == "__main__":

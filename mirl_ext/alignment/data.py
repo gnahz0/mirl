@@ -147,8 +147,7 @@ def _visual_entries(row: dict) -> list[tuple[str, tuple[str, str], dict | str]]:
     """Return every physical image/video entry and its path-based key."""
     media: list[tuple[str, tuple[str, str], dict | str]] = []
     for column, path_key in (("images", "image"), ("videos", "video")):
-        entries = row.get(column) or []
-        for entry in entries:
+        for entry in row.get(column) or []:
             if isinstance(entry, str):
                 path = entry
             elif isinstance(entry, dict):
@@ -286,7 +285,7 @@ def _process_video_with_extreme_aspect_fallback(video: dict, max_frames: int):
 
     path = video["video"]
     frame = VideoDecoder(path, num_ffmpeg_threads=1)[0]
-    height, width = (int(value) for value in frame.shape[-2:])
+    height, width = map(int, frame.shape[-2:])
     resized_height, resized_width = _factor_aligned_video_size(height, width)
     adjusted = dict(video)
     adjusted.update(resized_height=resized_height, resized_width=resized_width)
@@ -439,15 +438,10 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         self.batch_size = batch_size
         self.signal_repeat_factors = dict(signal_repeat_factors or {})
 
-        signal_sources = {source for kind, source in self.groups if kind == "signal"}
-        unknown = sorted(set(self.signal_repeat_factors) - signal_sources)
-        if unknown:
-            raise ValueError(f"signal_repeat_factors contains unknown signal sources: {unknown}")
-        for source, factor in self.signal_repeat_factors.items():
-            if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
-                raise ValueError(f"signal_repeat_factors values must be positive integers; got {source}={factor!r}")
-
-        effective_sizes = {group: len(rows) * self._repeat_factor(group) for group, rows in self.groups.items()}
+        effective_sizes = {
+            group: len(rows) * self.signal_repeat_factors.get(group[1], 1)
+            for group, rows in self.groups.items()
+        }
         global_batch_size = self.batch_size * self.world_size
         batch_counts = {
             group: (size + global_batch_size - 1) // global_batch_size for group, size in effective_sizes.items()
@@ -474,10 +468,6 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
                 },
             )
 
-    def _repeat_factor(self, group: tuple[str, str]) -> int:
-        kind, source = group
-        return self.signal_repeat_factors.get(source, 1) if kind == "signal" else 1
-
     def _global_batches(self, pools: dict) -> list[list[int]]:
         """Build global batches that give every rank a sample."""
         batches: list[list[int]] = []
@@ -497,12 +487,11 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         return self.num_batches
 
     def __iter__(self):
-        epoch_seed = self.seed + self.epoch * 1_000_003
-        rng = random.Random(epoch_seed)
+        rng = random.Random(self.seed + self.epoch * 1_000_003)
         pools: dict[tuple[str, str], list[int]] = {}
         for group, indices in self.groups.items():
             values: list[int] = []
-            for _ in range(self._repeat_factor(group)):
+            for _ in range(self.signal_repeat_factors.get(group[1], 1)):
                 cycle = list(indices)
                 rng.shuffle(cycle)
                 values.extend(cycle)
@@ -534,11 +523,8 @@ def collate_alignment(batch: list[dict]) -> dict:
         "skipped": skipped_counts,
     }
     if kind == "signal" and "targets" in valid[0]:
-        # One (B, 30) target and one (B, 30) weight over the concatenated task
-
-        width = max(stop for _, stop in TACTILE_SPANS.values())
-        targets = torch.zeros(len(valid), width, dtype=torch.float32)
-        masks = torch.zeros(len(valid), width, dtype=torch.float32)
+        targets = torch.zeros(len(valid), TACTILE_NUM_LABELS, dtype=torch.float32)
+        masks = torch.zeros(len(valid), TACTILE_NUM_LABELS, dtype=torch.float32)
         for row, item in enumerate(valid):
             for task, (start, stop) in TACTILE_SPANS.items():
                 masks[row, start:stop] = float(task in item["targets"])

@@ -39,15 +39,15 @@ train:
   init_checkpoint: null
   resume_checkpoint: null
   signal_repeat_factors:
-    smellnet_base: 13
-    haptic_tactile: 5
+    smellnet_base: 45
+    haptic_tactile: 11
   # Two GPUs and four-step accumulation give an effective batch of 256.
   batch_size: 32
   grad_accum_steps: 4
   gradient_checkpointing: true
   num_workers: 4
   lr: 1.0e-5
-  weight_decay: 0.05
+  weight_decay: 0.0
   num_train_epochs: 1
   warmup_ratio: 0.03
   grad_clip: 1.0

@@ -18,7 +18,6 @@ from .data import (
 )
 
 _PUBLIC_STATS = ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
-_ALL_STATS = (*_PUBLIC_STATS, "prediction_coverage")
 
 _REDUCED_METRIC_KEYS = (
     "loss/siglip",
@@ -61,16 +60,7 @@ def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> d
 
 @dataclass(frozen=True)
 class BankSpec:
-    """One scoring unit: some rows ranked against some bank of label embeddings.
-
-    The only thing that differs between smellnet, ecg and the six tactile tasks,
-    and it is data rather than a code path -- all eight score through
-    ``_bank_stats``. ``key`` carries the rest of the identity: it names the unit's
-    W&B keys, it is how ``_microbatch_units`` finds the unit a row belongs to, and
-    its prefix says whether the unit is a family or a task. ``multilabel`` is a
-    field rather than another thing read off ``key`` because it alone decides a
-    published number -- every logit above zero, against the argmax.
-    """
+    """One scoring unit: some rows ranked against some bank of label embeddings."""
 
     key: str  # "ts_smellnet" | "task/force_level"
     labels: tuple[str, ...]
@@ -168,7 +158,6 @@ def _bank_metrics(
     recall = true_positive / support.clamp_min(1)
     f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
     recall_at_5_by_class = stats[f"{spec.key}/recall_at_5_count"] / support.clamp_min(1)
-    supported = support > 0
     task = spec.key.partition("task/")[2]
 
     if rows_out is not None:
@@ -191,31 +180,11 @@ def _bank_metrics(
 
     return {
         "accuracy": float(stats[f"{spec.key}/top_is_positive"] / sample_count),
-        "f1_macro": float(f1[supported].mean()),
+        "f1_macro": float(f1[support > 0].mean()),
         "recall_at_1": float(stats[f"{spec.key}/recall_at_1"] / sample_count),
         "recall_at_5": float(stats[f"{spec.key}/recall_at_5"] / sample_count),
         "map": float(stats[f"{spec.key}/average_precision"] / sample_count),
-        "prediction_coverage": float((predicted > 0).sum()) / len(spec.labels),
     }
-
-
-@torch.no_grad()
-def score_bank(
-    spec: BankSpec,
-    z: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    log_logit_scale: torch.Tensor | None = None,
-    logit_bias: torch.Tensor | None = None,
-    rows_out: list[dict[str, object]] | None = None,
-    world_size: int = 1,
-) -> dict[str, float]:
-    """Score one unit in one shot: accumulate, reduce, derive."""
-    stats = all_reduce_sum(
-        _bank_stats(z, target, spec, log_logit_scale, logit_bias),
-        world_size=world_size,
-    )
-    return _bank_metrics(stats, spec, rows_out=rows_out)
 
 
 def new_stats(specs: tuple[BankSpec, ...], device: torch.device) -> dict[str, torch.Tensor]:
@@ -300,12 +269,12 @@ def prediction_metrics(
         if per_class is not None and (family := spec.key.removeprefix("ts_")) in _CLASSIFICATION_FAMILIES:
             rows_out = per_class.setdefault(family, [])
         scores = _bank_metrics(stats, spec, rows_out=rows_out)
-        for stat in _ALL_STATS:
+        for stat in _PUBLIC_STATS:
             metrics[f"{stat}/{spec.key}"] = scores[stat]
         if is_task:
             task_scores.append(scores)
     if task_scores:
-        for stat in _ALL_STATS:
+        for stat in _PUBLIC_STATS:
             metrics[f"{stat}/ts_tactile"] = sum(s[stat] for s in task_scores) / len(task_scores)
     return _merge_prediction_metrics(metrics)
 
@@ -358,16 +327,13 @@ def _metric_groups(
             key = f"{stat}/ts_{family}"
             if key in prediction_metrics:
                 out[f"{core}/{stat}/{family}"] = prediction_metrics[key]
-        coverage_key = f"prediction_coverage/ts_{family}"
-        if coverage_key in prediction_metrics:
-            out[f"{aux}/prediction_coverage/{family}"] = prediction_metrics[coverage_key]
         out[f"{aux}/n/{family}"] = float(counts[f"n/ts_{family}"])
 
     for task in TASK_LABELS:
         loss_key = f"loss/task/{task}"
         if loss_key in loss_metrics:
             out[f"{aux}/loss/tactile/{task}"] = loss_metrics[loss_key]
-        for stat in _ALL_STATS:
+        for stat in _PUBLIC_STATS:
             key = f"{stat}/task/{task}"
             if key in prediction_metrics:
                 out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]

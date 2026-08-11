@@ -23,12 +23,13 @@ torch = pytest.importorskip("torch")
 
 from mirl_ext.alignment.data import MULTILABEL_TASKS, TACTILE_SPANS  # noqa: E402
 from mirl_ext.alignment.metrics import (  # noqa: E402
+    _bank_metrics,
+    _bank_stats,
     _merge_prediction_metrics,
     _metric_groups,
     build_bank_specs,
     new_stats,
     prediction_metrics,
-    score_bank,
     update_stats,
 )
 
@@ -76,10 +77,10 @@ def test_single_label_families_score_unchanged(golden, case):
     """smellnet and ecg keep every scalar and every per-class row."""
     data = golden["inputs"][case]
     rows: list[dict] = []
-    metrics = score_bank(
-        _single_label_spec(data["candidates"], data["bank"]),
-        _tensor(data["z"]),
-        _one_hot(data["labels"], data["candidates"]),
+    spec = _single_label_spec(data["candidates"], data["bank"])
+    metrics = _bank_metrics(
+        _bank_stats(_tensor(data["z"]), _one_hot(data["labels"], data["candidates"]), spec),
+        spec,
         rows_out=rows,
     )
     name = "smellnet" if case == "smell" else "ecg"
@@ -115,12 +116,12 @@ def test_tactile_ranking_is_unchanged_and_classification_uses_learned_bias(golde
     ranking = {
         key: value
         for key, value in metrics.items()
-        if not key.startswith(("f1_macro/", "prediction_coverage/"))
+        if not key.startswith("f1_macro/")
     }
     expected_ranking = {
         key: value
         for key, value in expected.items()
-        if not key.startswith(("f1_macro/", "prediction_coverage/"))
+        if not key.startswith("f1_macro/")
     }
     _assert_same(ranking, expected_ranking, "tactile ranking")
 
@@ -217,7 +218,5 @@ def test_streaming_equals_one_shot(golden):
     streamed = prediction_metrics(stats, (spec,))
 
     expected = {f"{key}/ts_ecg": value for key, value in golden["golden"]["ecg"].items()}
-    expected.update(
-        {f"{key}/overall": value for key, value in golden["golden"]["ecg"].items() if key != "prediction_coverage"}
-    )
+    expected.update({f"{key}/overall": value for key, value in golden["golden"]["ecg"].items()})
     _assert_same(streamed, expected, "streamed")
