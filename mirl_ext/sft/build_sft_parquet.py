@@ -1,25 +1,11 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Join validated traces back to their rows and emit veRL SFT parquet.
 
-Output schema matches ``verl/utils/dataset/multiturn_sft_dataset.py``:
+The user turn is the SFT half's prompt VERBATIM (placeholder and all): GRPO will
+present the identical string, and a train/serve template mismatch is invisible in
+the loss. Rows without a trace are simply absent.
 
-    messages : [{"role": "user", "content": <prompt>},
-                {"role": "assistant", "content": <trace>}]
-    images   : the row's original ``images`` list, untouched
-    videos   : likewise
-
-The user turn is the SFT half's prompt **verbatim**, `<image>` placeholder and all.
-That is deliberate: GRPO will present the identical string, and a train/serve template
-mismatch is invisible in the loss but shows up as a silent capability gap. Copying the
-prompt rather than rebuilding it also means the image placeholder count keeps matching
-``len(images)``, which the dataset asserts.
-
-Rows whose trace is missing are simply absent -- no placeholder responses, since an
-empty assistant turn would train the model to emit nothing.
-
-    python scripts/mirl/build_sft_parquet.py \\
-        --traces data/sft/ts_traces_grounded.jsonl \\
-        --out /work/.../data/split_grpo/sft_parquet
+    python mirl_ext/sft/build_sft_parquet.py --traces data/sft/traces.jsonl --out .../sft_parquet
 """
 
 from __future__ import annotations
@@ -27,54 +13,18 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import sys
 from pathlib import Path
 
-
-def prompt_messages(row: dict) -> list[dict]:
-    """The row's FULL prompt message list, roles preserved.
-
-    NOT just prompt[0]. smellnet/climb/tactile carry TWO messages -- a system turn
-    with the task framing and a user turn holding the real question plus the
-    `<image>`/`<video>` placeholder. Reading only the first one silently drops the
-    question and the placeholder: it produced smellnet traces answering a question
-    that was never asked, and it broke veRL's SFT dataset, which asserts the
-    placeholder count matches len(images). ecg/haptic_ts have a single user message,
-    which is why they looked fine.
-    """
-    p = row.get("prompt")
-    if isinstance(p, list):
-        out = []
-        for m in p:
-            if isinstance(m, dict):
-                out.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-            else:
-                out.append({"role": "user", "content": str(m)})
-        return out
-    return [{"role": "user", "content": str(p or "")}]
-
-
-def prompt_text(row: dict) -> str:
-    """All message contents joined -- what a text-only API call should receive."""
-    return "\n\n".join(m["content"] for m in prompt_messages(row) if m["content"])
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from export_sft_tasks import prompt_messages  # noqa: E402  (single home for the prompt[0] lesson)
 
 
 def sft_messages(row: dict) -> list[dict]:
-    """Prompt turns reshaped for ``MultiTurnSFTDataset``: leading system merged into user.
-
-    That class tokenizes each message IN ISOLATION (``messages=[message]``) so it can
-    build a per-turn loss mask, and Qwen3.5's chat template refuses to render a
-    system-only list -- it raises "No user query found in messages". So an explicit
-    system turn cannot survive this path, however correct it looks in the parquet.
-
-    KNOWN CONSEQUENCE, do not lose this: GRPO's rl_dataset renders the full list, so at
-    RL time our framing occupies a real ``system`` turn. Here it becomes the head of the
-    ``user`` turn, under the template's default "You are a helpful assistant." system
-    prompt. The model sees the same words in a different structural slot. That is a
-    genuine train/serve rendering difference; it affects smellnet/climb/tactile (which
-    have a system turn) and not ecg/haptic_ts (which do not). Fixing it properly means
-    either teaching the SFT path to batch-render turns, or dropping the system turn from
-    the RL indexes so both sides agree.
-    """
+    """Leading system turn merged into the user turn: MultiTurnSFTDataset
+    tokenizes each message in isolation and Qwen3.5's template rejects a
+    system-only list. KNOWN train/serve difference: GRPO renders a true system
+    turn; here the same words ride at the head of the user turn."""
     msgs = prompt_messages(row)
     head = [m for m in msgs if m["role"] == "system"]
     rest = [m for m in msgs if m["role"] != "system"]
@@ -119,8 +69,7 @@ def main() -> None:
         for t in items:
             row = rows[t["row_index"]]
             gt = (row.get("reward_model") or {}).get("ground_truth")
-            # Same guard as the verifier: a shifted index would pair a trace with a
-            # different example's image and label, and nothing downstream would notice.
+            # A shifted index would pair a trace with the wrong image/label.
             assert gt == t["ground_truth"], f"{t['uid']}: join mismatch, refusing to write"
             records.append(
                 {
@@ -140,7 +89,8 @@ def main() -> None:
                     ),
                 }
             )
-        combined.extend(records)
+        if args.single_file:
+            combined.extend(records)
         total += len(records)
         n_img = sum(1 for r in records if r["images"])
         print(f"{family:22s} traces={len(items):6d} written={len(records):6d} with_images={n_img}")

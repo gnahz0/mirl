@@ -1,22 +1,11 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
-"""Export the SFT half to a compact text-only task file for CoT generation.
+"""Export a split half to a compact task JSONL for trace generation.
 
-Runs on the cluster (that is where the parquets live) and emits a JSONL small
-enough to copy to a laptop, because the generator needs outbound internet and the
-compute nodes do not have it.
+Runs on the cluster (where the parquets live); the JSONL is small enough to copy
+to a laptop, which has the outbound internet the compute nodes lack. Sampling is
+stratified by (data_source, label) so rare classes survive the per-family cap.
 
-Only TEXT is exported. GPT never sees the pseudo-image raster -- it is a grayscale
-signal encoding with no natural-image semantics, so sending it would cost vision
-tokens for no information. The generated `<think>` is therefore an answer-conditioned
-*rationalization* (STaR-style), not grounded perception: it teaches the output format
-and reasoning shape, and RL grounds it later against the real VE features.
-
-Per-family caps matter. The SFT half is ~140k rows and cold-start needs ~10-20k, so
-sampling is stratified by (data_source, label) to keep rare classes represented
-rather than letting a head-heavy family dominate the budget.
-
-    python scripts/mirl/export_sft_tasks.py --limit-per-family 2500 \\
-        --out /work/.../data/split/sft_tasks.jsonl
+    python mirl_ext/sft/export_sft_tasks.py --limit-per-family 2500 --out .../sft_tasks.jsonl
 """
 
 from __future__ import annotations
@@ -36,24 +25,14 @@ FAMILIES = [
     "tactile_train",
 ]
 
-# The three raw-signal families. Their rows carry a rendered plot PNG that GPT-vision
-# CAN read (8-lead ECG traces, per-channel e-nose response curves, a taxel heatmap +
-# force curve), so their traces can be grounded in the actual signal instead of being
-# label-conditioned boilerplate.
+# Raw-signal families whose rows carry a rendered plot PNG GPT-vision can read.
 TS_FAMILIES = ["smellnet_train", "ecg_train", "haptic_ts_train"]
 
 
 def prompt_messages(row: dict) -> list[dict]:
-    """The row's FULL prompt message list, roles preserved.
-
-    NOT just prompt[0]. smellnet/climb/tactile carry TWO messages -- a system turn
-    with the task framing and a user turn holding the real question plus the
-    `<image>`/`<video>` placeholder. Reading only the first one silently drops the
-    question and the placeholder: it produced smellnet traces answering a question
-    that was never asked, and it broke veRL's SFT dataset, which asserts the
-    placeholder count matches len(images). ecg/haptic_ts have a single user message,
-    which is why they looked fine.
-    """
+    """The row's FULL prompt message list -- NOT prompt[0]: smellnet/climb/tactile
+    carry system + user turns, and dropping the user turn loses the question and
+    the <image>/<video> placeholder (this bug shipped once)."""
     p = row.get("prompt")
     if isinstance(p, list):
         out = []
@@ -82,12 +61,7 @@ def extra(row: dict) -> dict:
 
 
 def stratified_sample(rows: list[dict], n: int, seed: int) -> list[int]:
-    """Sample ~n row indices, spreading the budget evenly over (data_source, label).
-
-    Water-fills: strata smaller than the per-stratum quota give everything they have
-    and their unused budget is redistributed, so a cap of 2500 over 132 SmellNet
-    classes does not silently return only the head classes.
-    """
+    """~n row indices, water-filled over (data_source, label) so rare classes survive."""
     buckets: dict[tuple, list[int]] = collections.defaultdict(list)
     for i, r in enumerate(rows):
         buckets[(r.get("data_source"), (r.get("reward_model") or {}).get("ground_truth"))].append(i)
@@ -122,11 +96,12 @@ def main() -> None:
         "--half",
         default="sft",
         choices=["sft", "rl"],
-        help="which split half to export. 'rl' is for GALLERY REFERENCES only: the "
-        "gallery never enters the SFT parquet (only generated traces do), so RL-half "
-        "plots never reach the student -- they only inform how SFT traces are worded. "
-        "This frees every SFT-half row to be a query, which is what makes >1 example "
-        "per class affordable (base has just 2-3 rows per class per half).",
+        help="which split half to export. 'rl' exports the labelled SUPPORT POOL "
+        "consumed by gen_sft_episodes --support-tasks: support plots never enter the "
+        "SFT parquet (only generated traces do), so RL-half plots never reach the "
+        "student -- they only inform how SFT traces are worded. This frees every "
+        "SFT-half row to be a query, which is what makes >1 example per class "
+        "affordable (base has just 2-3 rows per class per half).",
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
@@ -167,13 +142,17 @@ def main() -> None:
                 if images:
                     first = images[0]
                     image_path = (first.get("image") or "") if isinstance(first, dict) else str(first)
-                if image_path:
+                videos = row.get("videos") or []
+                video_path = ""
+                if videos:
+                    first = videos[0]
+                    video_path = (first.get("video") or "") if isinstance(first, dict) else str(first)
+                if image_path or video_path:
                     n_with_image += 1
                 fh.write(
                     json.dumps(
                         {
-                            # uid must survive the round trip: build_sft_parquet joins
-                            # completions back on it, so it encodes the exact source row.
+                            # build_sft_parquet joins completions back on uid.
                             "uid": f"{family}#{i}",
                             "family": family,
                             "row_index": i,
@@ -181,9 +160,8 @@ def main() -> None:
                             "question_type": ei.get("question_type"),
                             "prompt": prompt_text(row),
                             "ground_truth": gt,
-                            # Path only. The generator base64-encodes it at call time so
-                            # this file stays small enough to copy to a laptop.
                             "image_path": image_path,
+                            "video_path": video_path,
                         }
                     )
                     + "\n"
@@ -191,11 +169,10 @@ def main() -> None:
                 total += 1
             print(
                 f"{family:22s} sft_rows={len(rows):7d} exported={len(picked):6d} "
-                f"distinct_labels={len(labels):5d} with_plot={n_with_image}"
+                f"distinct_labels={len(labels):5d} with_media={n_with_image}"
             )
             if n_with_image and n_with_image < len(picked):
-                # Partial coverage silently produces a MIX of grounded and
-                # hallucinated traces under one family name -- worth knowing.
+                # A mix of grounded and ungrounded traces under one family name.
                 print(f"    WARNING: only {n_with_image}/{len(picked)} rows carry a plot")
 
     print(f"\nwrote {total} tasks -> {out_path}")

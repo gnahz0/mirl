@@ -26,7 +26,7 @@ Split rules:
   data/split/split_manifest.json            # row ids per half, seed, counts (reproducible)
   ```
 - **Val sets stay shared/untouched** — both stages evaluate on the same held-out val.
-- Script: `scripts/mirl/split_sft_rl.py` (reads each family parquet, stratified shuffle, writes both halves + manifest).
+- Script: `mirl_ext/sft/split_sft_rl.py` (reads each family parquet, stratified shuffle, writes both halves + manifest).
 
 ## 2. SFT target generation (uses the Microsoft GPT-5.x credits)
 
@@ -41,7 +41,7 @@ Why this format: the reward (`mirl_ext/rewards/*.py`) scores `re.fullmatch(<thin
 **Honest caveat:** GPT does **not** see the pseudo-image raster (it's a non-interpretable grayscale signal encoding), so the CoT is a *plausible rationalization conditioned on the label*, not grounded perception. That's fine for cold-start — it teaches output format + reasoning shape; **RL then grounds it** in the actual VE features. Sending the PNG to GPT-vision would waste tokens for no gain.
 
 Design:
-- `scripts/mirl/gen_sft_targets.py`
+- `mirl_ext/sft/gen_sft_targets.py`
   - OpenAI client → `base_url=http://point.dd.works:18890/v1`, `api_key` read at runtime from `~/.config/mirl/microsoft_openai_key` (never hardcoded, never logged).
   - **Model fallback ladder** on rate-limit / 429 / empty: `gpt-5.5_2026-04-24` → `gpt-5.1_2025-11-13`. (`gpt-5.3-chat_2026-03-03` verified dead — 404 DEPLOYMENT_NOT_FOUND — skip it.)
   - **Use `max_completion_tokens`**, NOT `max_tokens` (these models reject the latter). Endpoint + key smoke-tested OK 2026-07-26.
@@ -52,7 +52,7 @@ Design:
 
 ## 3. Build SFT parquet
 
-`scripts/mirl/build_sft_parquet.py`: join validated completions back to their prompt+image rows and emit veRL SFT format
+`mirl_ext/sft/build_sft_parquet.py`: join validated completions back to their prompt+image rows and emit veRL SFT format
 (`prompt`/`messages` + `response`, image path preserved) → `data/split/sft/<family>_sft.parquet`.
 
 ## 4. Train SFT (veRL's built-in engine — no new trainer)
@@ -73,9 +73,9 @@ Point `examples/mirl/multiverse/run_qwen35_grpo.sh` `MODEL_PATH` at the SFT chec
 ## Files to create
 | Path | Purpose |
 |---|---|
-| `scripts/mirl/split_sft_rl.py` | stratified 50:50 split + manifest |
-| `scripts/mirl/gen_sft_targets.py` | GPT-5.x CoT generation (key from file, fallback ladder, resume) |
-| `scripts/mirl/build_sft_parquet.py` | validated completions → veRL SFT parquet |
+| `mirl_ext/sft/split_sft_rl.py` | stratified 50:50 split + manifest |
+| `mirl_ext/sft/gen_sft_targets.py` | GPT-5.x CoT generation (key from file, fallback ladder, resume) |
+| `mirl_ext/sft/build_sft_parquet.py` | validated completions → veRL SFT parquet |
 | `examples/mirl/slurm/run_sft_b200.sbatch` | SFT launcher |
 | `docs/mirl/sft-plan.md` | this file |
 

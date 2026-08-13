@@ -74,22 +74,14 @@ share that label's total row weight. Tactile averages each task over globally
 observed rows, then averages the six tasks. Counts are global within each
 source-homogeneous microbatch.
 
-**Distributed uses Accelerate's standard DDP wrapper.** DDP buckets gradient
-reductions and `no_sync` skips communication during accumulation. Sensor rows
-stay local because their negatives are the complete frozen label bank, not other
-samples. Small count reductions preserve exact class weighting and tactile means;
-prediction metrics reduce count statistics. There is no embedding gather, string
-metadata gather, Gloo side group, or manual parameter-gradient loop.
-
 **Selection metrics use one uniform family surface.** W&B publishes accuracy,
-macro-F1, Recall@1, Recall@5, mAP, and prediction coverage for SmellNet, ECG, and
-tactile. Accuracy means the top-ranked candidate is positive. Recall@k is the
+Recall@1, Recall@5, and mAP for SmellNet, ECG, and tactile. Accuracy means the
+top-ranked candidate is positive. Recall@k is the
 fraction of ground-truth positives recovered in the top k, so it equals accuracy
 at k=1 for single-label tasks but can be lower for multi-positive tactile tasks.
-Tactile macro-F1 uses the learned SigLIP scale and bias for zero-logit thresholding
-on the two multi-label tasks and argmax for the four exclusive tasks. `overall` is
-the equal-family mean. Training metrics cover the current accumulation window;
-validation uses the full set.
+`overall` is the equal-family mean, and overall mAP selects the best checkpoint.
+Training metrics cover the current accumulation window; validation uses the full
+set.
 
 **Metrics carry no placeholder values.** A key is present iff its branch fired.
 Never pre-populate `loss/*` with `0.0`: a placeholder is indistinguishable from
@@ -97,11 +89,6 @@ a measurement and corrupts both the cross-rank average and the val means. The
 cross-rank loss reduction uses the **static** `_REDUCED_METRIC_KEYS` list —
 deriving keys from a step's dict deadlocks when ranks disagree. Losses are
 averaged over ranks that computed them; `n/*` counts are summed.
-
-**Model construction order matters.** `frozen_visual` is a `deepcopy` of the
-freshly loaded trainable tower. Trainable encoder weights are upcast to fp32
-(bf16 mantissa rounding froze ~25% of params in an earlier run), the Qwen merger
-stays frozen, and feature normalization uses `eps=1e-6` for mixed precision.
 
 **Pseudo-videos use Qwen's own video processor.** Resize, rescale, and image
 normalization stay disabled because sensor tiles are already normalized and
@@ -273,7 +260,7 @@ USER turn, so reading `prompt[0]` silently drops both. That produced smellnet SF
 traces answering a question never asked (no 50-substance option list) and broke
 veRL's SFT dataset, which asserts the placeholder count matches `len(images)`.
 `rl_dataset` reads the full list, so GRPO was unaffected -- only tooling that
-shortcuts to `prompt[0]` breaks. Helpers in `scripts/mirl/` use `prompt_messages()`.
+shortcuts to `prompt[0]` breaks. Helpers in `mirl_ext/sft/` use `prompt_messages()`.
 
 Related: `MultiTurnSFTDataset` tokenizes each message IN ISOLATION and Qwen3.5's
 template rejects a system-only list ("No user query found in messages"), so an
@@ -360,6 +347,45 @@ materially different papers, and v3's headline is 58.5 not 63.3).
   answers are "cannot be determined from the plot alone", which is a fair response:
   88% of smellnet rows are `smellnet_mixture`, whose prompt lists NO options and only
   hints the format with one parenthetical example.
+- Measured 2026-08-11, few-shot prediction episodes (`gen_sft_episodes.py`: 5-way
+  candidates = gt + 2 same-category + 2 random negatives, 2-3 labelled support plots
+  per candidate as individual images, answer withheld): gpt-5.6-sol got **119/121
+  base queries right** within 4 attempts (92% first-attempt) — vs 0.000 blind 50-way
+  and 0.025 with 4 format demos above. Per-class labelled supports carry perception;
+  format demos do not. Traces: `data/sft/ts_traces_episodes.jsonl` (all 50 classes
+  appear as query and as negative); the stored `attempts` field lets a downstream
+  filter drop potential 5-way lucky guesses (6 rows with attempts>=3).
+- Task-prompt provenance, ALL families (verified 2026-08-11 against clones of
+  MIT-MI/SmellNet + DDVD233/CLIMB + QoQ_Med + OpenTouch-MIT/opentouch, the SmellNet
+  HF dataset, the OpenTouch annotations zip, the historical fork's full history, and
+  the raw files on aicr). Three provenance classes:
+  (1) **smellnet = fork-authored.** System+user prompts minted verbatim in the
+  historical fork's `scripts/smellnet_to_combined.py` (commit ece3eb4d); no upstream
+  repo/data carries any prompt text. Facts are faithful to upstream: 50-option list
+  set-identical to `models/utils.py` (ours alphabetized), base channels match
+  `SENSOR_COLS` verbatim, and the mixture prompt's "**C2H5CH**" is NOT a fork typo --
+  it is the literal column header of every upstream mixture CSV
+  (`timestamp_ms,NO2,C2H5CH,VOC,CO` on HF; base CSVs correctly say C2H5OH), inherited
+  by the renderer's `SENSOR_COLS_MIXTURE` and the prompt. `text_description.json`
+  (the 50 substance priors in `data/sft/meta/`) also ships upstream:
+  HF `DeweiFeng/SmellNet` `text_data/text_description.json`.
+  (2) **haptic = upstream data.** The prompts live verbatim in the raw annotation
+  files `/scratch/dvdai_mit/alecz/align_raw/haptic_3ts/annotation_verl_*.json`,
+  already verl-formatted by raofu's 3DHaptic pipeline (source
+  `/orcd/compute/ppliang/001/raofu/3DHaptic/...` per `build_haptic_ts_jsonl.py`);
+  the fork only converts them. The PUBLIC opentouch annotations zip has no prompts
+  at all -- just metadata columns + GPT-5 scene captions (the `description` field
+  our ground truths come from).
+  (3) **ecg = pre-baked upstream of the fork.** Arrived as `problem`/`answer` fields
+  in `/scratch/ecg/ts_{train,valid}.json` on the source (mib/engaging) cluster; the
+  minting script is unreleased, but the 7 options expand CLIMB's
+  `CLASSES = ['normal','cd','mi','sttc','other','afib','hyp']` verbatim IN ARRAY
+  ORDER using CLIMB's `to_qa()` house template (CLIMB ships no ECG `to_qa()`).
+  The shared `<think>`/`\boxed{}` "internal monologue" boilerplate appears verbatim
+  in DDVD233/QoQ_Med `examples/format_prompt/medical_format.jinja` (lineage: verl
+  geo3k -> QoQ_Med -> fork, "put in" -> "wrapped in").
+  ⚠️ The haptic `annotation_verl_*.json` files exist ONLY on aicr `/scratch`
+  (30-day access purge) and in raofu's engaging dir -- they are in no git repo.
 
 **Haptic / tactile** — [OpenTouch](https://opentouch-tactile.github.io/),
 [arXiv:2512.16842](https://arxiv.org/abs/2512.16842), code
@@ -416,12 +442,3 @@ aicr**; they need copying.
 
 The current clean baseline uses each full 8x2500 ECG tensor in both training and
 validation. It does not apply the 2-3 second crop described above.
-
-**Project decision (2026-07-30): do not use ECG-JEPA distillation.** ECG-JEPA and
-CLIMB are references for label semantics, temporal granularity, preprocessing, and
-evaluation only. The trained/deployed encoder remains Qwen3.5's vision encoder,
-optimized directly against the frozen SigLIP2 text tower with sigmoid loss. The
-next Qwen-only ablation replaces the frequency-squared BxB objective with equal-family,
-class-balanced prototype SigLIP and tests a linear mapping for already-standardized
-ECG. `distill` is only the existing same-Qwen frozen image-preservation anchor;
-it is not an ECG teacher.

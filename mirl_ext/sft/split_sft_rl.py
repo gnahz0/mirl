@@ -1,41 +1,15 @@
 # Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Split each MIRL family 50:50 into an SFT half and an RL half.
 
-The point of the split is that GRPO must never be rewarded on something the SFT
-cold-start already memorized. A plain row-level random split does not achieve that
-here, because several families ask MANY questions about ONE underlying recording:
+GRPO must never be rewarded on something SFT already memorized, and several
+families ask many questions about one recording -- so the split unit is a GROUP
+(the underlying recording: shared 3DHaptic clip stem for tactile/haptic_ts,
+media path otherwise), never a row. Groups are shuffled deterministically and
+assigned greedily to the smaller half, stratified by (data_source, label).
+Known limitation (recorded in the manifest): ECG has no patient ids, so
+patient-level leakage cannot be prevented from these indexes.
 
-    tactile           28,164 rows over  1,983 videos   (~14 questions per video)
-    human_behaviour   65,605 rows over 35,426 clips    (~1.9 questions per clip)
-    haptic_ts          1,575 rows over  1,575 clips    (1:1, but SHARES the
-                                                        underlying clips with tactile)
-
-Splitting those by row puts two questions about the same video on opposite sides.
-The model then meets that video in SFT and is scored on it again in RL, which is
-exactly the leakage this split exists to prevent — and it is silent, because both
-rows look like distinct examples.
-
-So the split unit is a GROUP (one underlying recording), never a row:
-
-  * ``tactile``/``haptic_ts`` -> the shared clip stem, so a clip that appears in
-    both families lands on the SAME side in both. Cross-family leakage is real
-    here: `tactile.extra_info.video_path` and `haptic_ts.extra_info.stem` name the
-    same 3DHaptic recordings.
-  * everything else -> the media path (signal/image/video).
-
-Within a stratum, groups are shuffled deterministically (seed) and assigned
-greedily to whichever half currently holds fewer ROWS, so unequal group sizes
-still yield a near-exact 50/50 row split.
-
-KNOWN LIMITATION, recorded in the manifest: ECG rows carry only a record id
-(`HR00521.pt`), not a patient id, and PTB-XL contains multiple ECGs per patient
-(~21.8k records from ~18.9k patients). Patient-level leakage therefore CANNOT be
-prevented from these indexes. It is bounded (~13% of PTB-XL records share a
-patient with another record) but it is not zero, and it would need the original
-PTB-XL metadata to fix.
-
-    python scripts/mirl/split_sft_rl.py --data-root /work/.../trainedve_raw \\
-        --out-root /work/.../data/split
+    python mirl_ext/sft/split_sft_rl.py --out-root /work/.../data/split
 """
 
 from __future__ import annotations
@@ -45,16 +19,15 @@ import collections
 import json
 import random
 import re
+import sys
 from pathlib import Path
 
-# Families to split, and how to derive a row's group id.
-#   "path"  -> the media path (one recording per row)
-#   "stem"  -> the shared 3DHaptic clip stem (tactile + haptic_ts must agree)
-# Default = the ORIGINAL veRL indexes under data/, which is what GRPO actually
-# consumes (see run_qwen35_grpo.sh: train_files reads data/<family>_train.parquet).
-# Those rows carry the rendered plot PNG in `images`; the trainedve_raw/* indexes are
-# the Stage-1 ALIGNMENT data (raw signal paths, no images) and are NOT what RL trains
-# on -- splitting those would produce halves that never reach GRPO.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from export_sft_tasks import extra as _extra  # noqa: E402
+
+# Group-id mode per family: "path" = media path, "stem" = shared 3DHaptic clip
+# stem. Split the data/ veRL indexes (rendered plots) -- NOT trainedve_raw/*,
+# which is Stage-1 alignment data that never reaches GRPO.
 FAMILIES: dict[str, str] = {
     "smellnet_train": "path",
     "ecg_train": "path",
@@ -64,9 +37,7 @@ FAMILIES: dict[str, str] = {
     "tactile_train": "stem",
 }
 
-# Families whose labels are mostly unique free text (one row per label). Stratifying
-# on such a label is meaningless -- every stratum would have one member and the
-# "balance" would be an illusion -- so stratify on data_source alone.
+# Mostly-unique free-text labels: stratify on data_source alone.
 LABEL_STRATIFY_EXCLUDE = {"haptic_ts_train", "human_behaviour_train", "tactile_train"}
 
 _IDX_SUFFIX = re.compile(r"_idx\d+$")
@@ -86,26 +57,9 @@ def _media_path(row: dict) -> str:
     return ""
 
 
-def _extra(row: dict) -> dict:
-    ei = row.get("extra_info")
-    if isinstance(ei, str):
-        try:
-            ei = json.loads(ei)
-        except json.JSONDecodeError:
-            return {}
-    return ei if isinstance(ei, dict) else {}
-
-
 def _clip_stem(row: dict) -> str:
-    """Normalized 3DHaptic recording id, shared between tactile and haptic_ts.
-
-    tactile carries `video_path` like
-      reencoded/visual-tactile/2025-10-10_arnie_recognition_grasp_boardA_idx0.mp4
-    haptic_ts carries `stem` like
-      2025-10-10_arnie_recognition_grasp_boardA_idx0
-    Both reduce to the same key, so one physical recording cannot straddle the split.
-    The trailing `_idx<N>` is kept: it distinguishes separate takes, not questions.
-    """
+    """Normalized 3DHaptic recording id, shared between tactile and haptic_ts
+    so one physical recording cannot straddle the split."""
     ei = _extra(row)
     stem = ei.get("stem")
     if not stem:
@@ -135,20 +89,9 @@ def assign_groups(
     seed: int,
     locked: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Assign each group to 'sft' or 'rl', balancing ROW counts inside each stratum.
-
-    Greedy smallest-half-first over a deterministically shuffled group order. Groups
-    stay intact; only their placement varies, so row balance is approximate but tight
-    (exact when every group is one row, which is the common case).
-
-    ``locked`` carries assignments already made by an EARLIER family and is
-    authoritative: a 3DHaptic clip that tactile placed in the SFT half must go to the
-    SFT half in haptic_ts too. Without this the shared clip stem is cosmetic --
-    assigning each family independently let 808 clips straddle the halves, which the
-    per-family disjointness check cannot see because it never compares families.
-    Locked groups are consumed FIRST so their rows are counted before any free choice
-    is made, otherwise the greedy balance would be computed against a stale total.
-    """
+    """Greedy smallest-half-first per stratum over a seeded shuffle. ``locked``
+    (assignments from an earlier family) is authoritative and consumed FIRST --
+    without it, 808 shared 3DHaptic clips once straddled the halves."""
     locked = locked or {}
     by_stratum: dict[str, list[str]] = collections.defaultdict(list)
     for gid in groups:
@@ -159,10 +102,8 @@ def assign_groups(
         gids = sorted(by_stratum[stratum])          # sort first: dict order is not a spec
         rng = random.Random(f"{seed}::{stratum}")
         rng.shuffle(gids)
-        # Alternate which side wins ties, per stratum. A fixed tie-break looks
-        # harmless but is systematic: every odd-sized stratum hands its extra row to
-        # the same half, and with 132 smellnet strata that compounded into a 54.6/45.4
-        # split. Deciding per stratum makes the leftovers cancel instead of accumulate.
+        # Per-stratum tie-break: a fixed one compounds odd-stratum leftovers
+        # into a skewed split (measured 54.6/45.4).
         tie_to_sft = rng.random() < 0.5
         n_sft = n_rl = 0
         free = []
@@ -214,6 +155,7 @@ def main() -> None:
             "opposite sides across the two runs. Re-split them together to be safe."
         )
 
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     data_root, out_root = Path(args.data_root), Path(args.out_root)
@@ -231,8 +173,7 @@ def main() -> None:
         ],
     }
 
-    # Pass 1: derive groups + strata per family, holding only indices (not rows), so
-    # all six families fit in memory at once and the assignment can be made globally.
+    # Pass 1: groups + strata per family, holding only indices.
     plans: dict[str, tuple[dict[str, list[int]], dict[str, str]]] = {}
     for family, mode in families.items():
         src = data_root / f"{family}.parquet"
@@ -245,17 +186,12 @@ def main() -> None:
         for i, row in enumerate(rows):
             gid = group_id(row, mode)
             groups[gid].append(i)
-            # A group spanning several strata (e.g. one video with questions of
-            # different data_source) is pinned to the FIRST stratum seen, sorted, so
-            # the choice is deterministic rather than dependent on row order.
+            # Pin multi-stratum groups to the min stratum -- deterministic.
             strata[gid] = min(strata.get(gid, "￿"), stratum_of(row, family))
         plans[family] = (dict(groups), strata)
         del rows
 
-    # Assign in descending row count so the family with the most rows riding on a
-    # shared group decides its side; the smaller one inherits. (tactile has 28k rows
-    # over the same 3DHaptic clips that haptic_ts covers with 1.5k, so letting
-    # haptic_ts win those coin flips would distort the larger family's balance.)
+    # Largest family first: it decides shared-group sides, the smaller inherits.
     order = sorted(plans, key=lambda f: -sum(len(v) for v in plans[f][0].values()))
     global_assignment: dict[str, str] = {}
 
@@ -263,8 +199,6 @@ def main() -> None:
         mode = families[family]
         groups, strata = plans[family]
         assignment = assign_groups(groups, strata, args.seed, locked=global_assignment)
-        # Only stem-keyed groups are shared across families; path-keyed ids are unique
-        # per family anyway, but recording them costs nothing and keeps the rule simple.
         global_assignment.update(assignment)
 
         idx = {"sft": [], "rl": []}
@@ -273,10 +207,7 @@ def main() -> None:
         for half in idx:
             idx[half].sort()
 
-        # Each group carries exactly one side, so straddling is impossible by
-        # construction here; assert it anyway because the cross-FAMILY version of this
-        # invariant did silently break once (808 3DHaptic clips), and the per-family
-        # check is what failed to notice.
+        # Straddling is impossible by construction; assert anyway (it broke once).
         sides = collections.Counter(assignment[gid] for gid in groups)
         assert sides["sft"] + sides["rl"] == len(groups), f"{family}: unassigned groups"
 
@@ -301,7 +232,6 @@ def main() -> None:
 
         if args.dry_run:
             continue
-        import pyarrow as pa
 
         table = pq.read_table(data_root / f"{family}.parquet")
         for half in ("sft", "rl"):
