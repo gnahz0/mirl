@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sft"))
-from paths import DATA_ROOT  # noqa: E402  (cluster paths live in sft/config.json)
+from export_sft_tasks import DATA_ROOT  # noqa: E402  (cluster paths live in sft/config.json)
 
 import numpy as np
 import pyarrow as pa

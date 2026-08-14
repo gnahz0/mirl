@@ -22,8 +22,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from export_sft_tasks import DATA_ROOT  # noqa: E402
 from export_sft_tasks import extra as _extra  # noqa: E402
-from paths import DATA_ROOT  # noqa: E402
 
 # Group-id mode per family: "path" = media path, "stem" = shared 3DHaptic clip
 # stem. Split the data/ veRL indexes (rendered plots) -- NOT trainedve_raw/*,

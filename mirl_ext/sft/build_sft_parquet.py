@@ -16,8 +16,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_sft_tasks import prompt_messages  # noqa: E402  (single home for the prompt[0] lesson)
-from paths import DATA_ROOT  # noqa: E402
+from export_sft_tasks import DATA_ROOT, prompt_messages  # noqa: E402
 
 
 def sft_messages(row: dict) -> list[dict]:

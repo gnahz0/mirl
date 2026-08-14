@@ -12,12 +12,23 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import random
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from paths import DATA_ROOT  # noqa: E402
+_CONFIG = Path(__file__).with_name("config.json")
+
+
+def data_root() -> str:
+    """Cluster paths live in config.json (or $MIRL_DATA_ROOT), not in code."""
+    if os.environ.get("MIRL_DATA_ROOT"):
+        return os.environ["MIRL_DATA_ROOT"].rstrip("/")
+    if _CONFIG.is_file():
+        return str(json.loads(_CONFIG.read_text())["cluster_data_root"]).rstrip("/")
+    return "data"  # fallback: relative, for laptop-local experiments
+
+
+DATA_ROOT = data_root()
 
 FAMILIES = [
     "smellnet_train",
