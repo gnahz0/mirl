@@ -6,7 +6,6 @@ is ~100x lighter than shipping videos). Rewrites the task JSONL with
 `image_path`/`frame_paths` pointing at the staged copies, resolvable on the
 laptop via --image-root.
 
-    # on the cluster (cv2 lives in the alec-mv env)
     python mirl_ext/sft/stage_media.py --tasks iv_tasks.jsonl --out-root data/sft/media
 """
 
@@ -52,7 +51,7 @@ def main() -> None:
     )
     ap.add_argument("--tasks", type=Path, required=True)
     ap.add_argument("--out-root", type=Path, required=True, help="media lands in <out-root>/<family>/")
-    ap.add_argument("--frames", type=int, default=6, help="frames sampled per video")
+    ap.add_argument("--frames", type=int, default=8, help="frames sampled per video")
     args = ap.parse_args()
 
     tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
