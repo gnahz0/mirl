@@ -13,7 +13,11 @@ import argparse
 import collections
 import json
 import random
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import DATA_ROOT  # noqa: E402
 
 FAMILIES = [
     "smellnet_train",
@@ -88,8 +92,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--split-root", default="/work/mit/ppliang_mit/alecz/data/split_grpo")
-    ap.add_argument("--out", default="/work/mit/ppliang_mit/alecz/data/split/sft_tasks.jsonl")
+    ap.add_argument("--split-root", default=f"{DATA_ROOT}/split_grpo")
+    ap.add_argument("--out", default=f"{DATA_ROOT}/split/sft_tasks.jsonl")
     ap.add_argument("--limit-per-family", type=int, default=2500)
     ap.add_argument(
         "--half",

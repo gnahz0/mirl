@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import sys
 from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sft"))
+from paths import DATA_ROOT  # noqa: E402  (cluster paths live in sft/config.json)
 
 import numpy as np
 import pyarrow as pa
@@ -113,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("/work/mit/ppliang_mit/alecz/data/trainedve_raw"),
+        default=Path(f"{DATA_ROOT}/trainedve_raw"),
     )
     args = parser.parse_args()
     write_clean(args.data_root)

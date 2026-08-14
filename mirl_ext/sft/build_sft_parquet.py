@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from export_sft_tasks import prompt_messages  # noqa: E402  (single home for the prompt[0] lesson)
+from paths import DATA_ROOT  # noqa: E402
 
 
 def sft_messages(row: dict) -> list[dict]:
@@ -40,8 +41,8 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--traces", required=True)
-    ap.add_argument("--split-root", default="/work/mit/ppliang_mit/alecz/data/split_grpo")
-    ap.add_argument("--out", default="/work/mit/ppliang_mit/alecz/data/split_grpo/sft_parquet")
+    ap.add_argument("--split-root", default=f"{DATA_ROOT}/split_grpo")
+    ap.add_argument("--out", default=f"{DATA_ROOT}/split_grpo/sft_parquet")
     ap.add_argument(
         "--single-file",
         action="store_true",

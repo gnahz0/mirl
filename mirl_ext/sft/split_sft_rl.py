@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from export_sft_tasks import extra as _extra  # noqa: E402
+from paths import DATA_ROOT  # noqa: E402
 
 # Group-id mode per family: "path" = media path, "stem" = shared 3DHaptic clip
 # stem. Split the data/ veRL indexes (rendered plots) -- NOT trainedve_raw/*,
@@ -130,8 +131,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--data-root", default="/work/mit/ppliang_mit/alecz/data")
-    ap.add_argument("--out-root", default="/work/mit/ppliang_mit/alecz/data/split")
+    ap.add_argument("--data-root", default=DATA_ROOT)
+    ap.add_argument("--out-root", default=f"{DATA_ROOT}/split")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--families",
