@@ -156,20 +156,15 @@ def test_structured_tactile_loss_accepts_multiple_positive_labels():
 
 def _reference_per_task_mean(z, targets, masks, embeddings, scale, bias):
     """The pre-refactor objective: one masked BCE per task, then a plain mean.
-
-    Written the way the six-call version was -- select the task's rows, sum its BCE,
-    divide by rows x labels -- so it is an independent oracle rather than a
-    restatement of the implementation.
-    """
+    Written the way the six-call version was, so it is an independent oracle
+    rather than a restatement of the implementation."""
     losses = []
     for start, stop in TACTILE_SPANS.values():
         rows = masks[:, start] > 0
         if not bool(rows.any()):
             continue
         logits = scale.exp() * (z[rows] @ embeddings[start:stop].t()) + bias
-        total = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, targets[rows, start:stop], reduction="sum"
-        )
+        total = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets[rows, start:stop], reduction="sum")
         losses.append(total / (int(rows.sum()) * (stop - start)))
     return torch.stack(losses).mean()
 
@@ -184,8 +179,7 @@ def test_unified_tactile_loss_matches_per_task_reference(partial):
     targets = (torch.rand(5, width) > 0.5).float()
     masks = torch.ones(5, width)
     if partial:
-        # Row 3 answers only the first task; row 4 answers nothing -- the two shapes
-        # of incomplete join that actually occur in the data.
+        # Row 3 answers only the first task; row 4 answers nothing -- the two real shapes of incomplete join.
         first_stop = next(iter(TACTILE_SPANS.values()))[1]
         masks[3, first_stop:] = 0.0
         masks[4] = 0.0
@@ -200,12 +194,8 @@ def test_unified_tactile_loss_matches_per_task_reference(partial):
 
 
 def test_unmasked_labels_contribute_no_gradient():
-    """A row with no annotation for a task must not push that task's labels.
-
-    This is the whole reason the mask exists: an unannotated row keeps an all-zero
-    target, which under BCE would otherwise read as "every one of these labels is
-    absent" rather than "nobody said".
-    """
+    """A row with no annotation for a task must not push that task's labels: its
+    all-zero target would otherwise read under BCE as "every label is absent"."""
     torch.manual_seed(0)
     width = TACTILE_NUM_LABELS
     z = torch.nn.functional.normalize(torch.randn(3, 8), dim=-1).requires_grad_(True)
@@ -221,8 +211,7 @@ def test_unmasked_labels_contribute_no_gradient():
 
     assert torch.equal(z.grad[2], torch.zeros(8)), "a fully masked row must not move"
     assert (z.grad[:2] != 0).any(), "annotated rows must still receive gradient"
-    # The divisor counts known pairs only, so masking must not silently rescale the
-    # surviving rows' contribution.
+    # The divisor counts known pairs only, so masking must not silently rescale surviving rows.
     assert loss.item() == pytest.approx(
         _tactile_siglip_loss(
             z.detach()[:2],
@@ -281,9 +270,7 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
     # One loss for the whole family, and a per-task breakdown for every task.
     assert total.detach().item() == pytest.approx(metrics["loss/ts_tactile"])
     assert metrics["loss/siglip"] == pytest.approx(metrics["loss/ts_tactile"])
-    assert {key for key in metrics if key.startswith("loss/task/")} == {
-        f"loss/task/{task}" for task in TACTILE_SPANS
-    }
+    assert {key for key in metrics if key.startswith("loss/task/")} == {f"loss/task/{task}" for task in TACTILE_SPANS}
     # ts_eval now carries the (B, 30) target/mask pair rather than per-task dicts.
     assert task_eval[3].shape == (2, TACTILE_NUM_LABELS)
     assert task_eval[4].shape == (2, TACTILE_NUM_LABELS)
@@ -293,8 +280,7 @@ def test_structured_tactile_metrics_merge_as_one_family():
     scale = torch.tensor(math.log(10.0))
     multi_z = torch.tensor([[2**-0.5, 2**-0.5]])
     multi_text = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-(2**-0.5), -(2**-0.5)]])
-    # Only the first task is exercised; the rest are masked out entirely, which is
-    # also a check that a wholly-unobserved task is skipped rather than scored.
+    # Only the first task is exercised; a wholly-unobserved task must be skipped rather than scored.
     width = TACTILE_NUM_LABELS
     first_stop = next(iter(TACTILE_SPANS.values()))[1]
     embeddings = torch.zeros(width, 2)
@@ -314,15 +300,14 @@ def test_structured_tactile_metrics_merge_as_one_family():
         torch.tensor(-1.0),
     )
     merged = _merge_prediction_metrics(
-        {"f1_macro/ts_smellnet": 0.5, "f1_macro/overall": 0.5},
+        {"map/ts_smellnet": 0.5, "map/overall": 0.5},
         tactile,
     )
 
     assert tactile["accuracy/task/initial_fingers"] == 1.0
-    assert tactile["f1_macro/task/initial_fingers"] == 1.0
     assert tactile["recall_at_1/ts_tactile"] == 0.5
     assert tactile["map/ts_tactile"] == 1.0
-    assert merged["f1_macro/overall"] == pytest.approx(0.75)
+    assert merged["map/overall"] == pytest.approx(0.75)
 
 
 def test_structured_tactile_bank_preserves_task_label_order():
@@ -338,32 +323,7 @@ def test_structured_tactile_bank_preserves_task_label_order():
     assert labels[start:stop] == TASK_LABELS["force_level"]
 
 
-def test_effective_batch_macro_f1_is_not_an_average_of_micro_batches():
-    prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    first = _rank(
-        torch.tensor([[1.0, 0.0]]),
-        ["A"],
-        ("A", "B"),
-        prototypes,
-    )
-    second = _rank(
-        torch.tensor([[1.0, 0.0]]),
-        ["B"],
-        ("A", "B"),
-        prototypes,
-    )
-    combined = _rank(
-        torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
-        ["A", "B"],
-        ("A", "B"),
-        prototypes,
-    )
-
-    assert (first["f1_macro"] + second["f1_macro"]) / 2 == pytest.approx(0.5)
-    assert combined["f1_macro"] == pytest.approx(1 / 3)
-
-
-def test_absent_ground_truth_classes_do_not_cap_macro_f1():
+def test_absent_ground_truth_classes_remain_in_report():
     report = []
     metrics = _rank(
         torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
@@ -373,7 +333,7 @@ def test_absent_ground_truth_classes_do_not_cap_macro_f1():
         rows_out=report,
     )
 
-    assert metrics["accuracy"] == metrics["f1_macro"] == 1.0
+    assert metrics["accuracy"] == 1.0
     assert report[2] == {
         "class_id": 2,
         "label": "C",
@@ -381,7 +341,6 @@ def test_absent_ground_truth_classes_do_not_cap_macro_f1():
         "predicted": 0,
         "precision": 0.0,
         "recall": 0.0,
-        "f1": 0.0,
         "recall_at_5": 0.0,
     }
 
@@ -398,16 +357,16 @@ def test_prototype_recall_at_five_uses_ranked_classes():
     assert metrics["recall_at_5"] == 1.0
 
 
-def test_macro_f1_exposes_single_class_prediction_collapse():
+def test_prediction_coverage_exposes_top1_collapse():
     labels = ("normal", "a", "b", "c", "d", "e", "f")
-    true = ["normal"] * 5 + ["a", "b", "c", "d", "e", "f", "a"]
-    z = torch.tensor([[1.0, 0.0]] * len(true))
-    prototypes = torch.tensor([[1.0, 0.0]] + [[0.0, 1.0]] * (len(labels) - 1))
+    metrics = _rank(
+        torch.tensor([[1.0, 0.0]] * 12),
+        ["normal"] * 5 + ["a", "b", "c", "d", "e", "f", "a"],
+        labels,
+        torch.tensor([[1.0, 0.0]] + [[0.0, 1.0]] * (len(labels) - 1)),
+    )
 
-    metrics = _rank(z, true, labels, prototypes)
-
-    assert metrics["accuracy"] == pytest.approx(5 / 12)
-    assert metrics["f1_macro"] == pytest.approx((10 / 17) / 7)
+    assert metrics["prediction_coverage"] == pytest.approx(1 / 7)
 
 
 def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
@@ -417,8 +376,7 @@ def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
     bank = {
         "smellnet": (("a", "b"), z[[0, 1]]),
         "ecg": (("a", "b"), z[[2, 3]]),
-        # Reverse tactile candidates so its top-1 metrics are zero while
-        # Recall@5 remains one for this two-candidate example.
+        # Reverse tactile candidates so top-1 is zero while Recall@5 stays one.
         "tactile": (("a", "b"), z[[5, 4]]),
     }
     reports = {}
@@ -426,18 +384,18 @@ def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
     metrics = _score_units(specs, (z, labels, families, None, None), per_class=reports)
 
     for family in ("smellnet", "ecg", "tactile"):
-        for stat in ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map"):
+        for stat in ("accuracy", "recall_at_1", "recall_at_5", "map"):
             assert f"{stat}/ts_{family}" in metrics
+        assert metrics[f"prediction_coverage/ts_{family}"] == 1.0
     assert metrics["accuracy/ts_tactile"] == 0.0
-    assert metrics["f1_macro/ts_tactile"] == 0.0
     assert metrics["recall_at_1/ts_tactile"] == 0.0
     assert metrics["recall_at_5/ts_tactile"] == 1.0
     assert metrics["map/ts_tactile"] == 0.5
     assert metrics["accuracy/overall"] == pytest.approx(2 / 3)
-    assert metrics["f1_macro/overall"] == pytest.approx(2 / 3)
     assert metrics["recall_at_1/overall"] == pytest.approx(2 / 3)
     assert metrics["recall_at_5/overall"] == 1.0
     assert metrics["map/overall"] == pytest.approx(5 / 6)
+    assert metrics["prediction_coverage/overall"] == 1.0
     assert set(reports) == {"smellnet", "ecg"}
 
 
@@ -462,35 +420,35 @@ def test_validation_metrics_keep_a_compact_core():
         },
         prediction_metrics={
             "accuracy/ts_smellnet": 0.5,
-            "f1_macro/ts_smellnet": 0.4,
             "recall_at_1/ts_smellnet": 0.5,
             "recall_at_5/ts_smellnet": 0.8,
+            "prediction_coverage/ts_smellnet": 0.2,
             "accuracy/overall": 0.5,
-            "f1_macro/overall": 0.4,
             "recall_at_1/overall": 0.3,
             "recall_at_5/overall": 0.7,
             "map/overall": 0.45,
+            "prediction_coverage/overall": 0.3,
             "accuracy/ts_tactile": 0.1,
-            "f1_macro/ts_tactile": 0.05,
             "recall_at_1/ts_tactile": 0.1,
             "recall_at_5/ts_tactile": 0.3,
             "map/ts_tactile": 0.2,
+            "prediction_coverage/ts_tactile": 0.4,
         },
     )
 
     assert metrics["val-core/accuracy/smellnet"] == 0.5
-    assert metrics["val-core/f1_macro/smellnet"] == 0.4
     assert metrics["val-core/recall_at_5/smellnet"] == 0.8
     assert metrics["val-core/accuracy/overall"] == 0.5
-    assert metrics["val-core/f1_macro/overall"] == 0.4
     assert metrics["val-core/recall_at_1/overall"] == 0.3
     assert metrics["val-core/recall_at_5/overall"] == 0.7
     assert metrics["val-core/map/overall"] == 0.45
     assert metrics["val-core/accuracy/tactile"] == 0.1
-    assert metrics["val-core/f1_macro/tactile"] == 0.05
     assert metrics["val-core/recall_at_1/tactile"] == 0.1
     assert metrics["val-core/recall_at_5/tactile"] == 0.3
     assert metrics["val-core/map/tactile"] == 0.2
+    assert metrics["val-aux/prediction_coverage/smellnet"] == 0.2
+    assert metrics["val-aux/prediction_coverage/tactile"] == 0.4
+    assert metrics["val-aux/prediction_coverage/overall"] == 0.3
     assert metrics["val-core/loss/aggregate"] == 0.25
     assert metrics["val-core/loss/smellnet"] == 0.14
     assert metrics["val-core/loss/ecg"] == 0.16
@@ -502,14 +460,14 @@ def test_validation_metrics_keep_a_compact_core():
 def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     metrics = {
         "accuracy/ts_smellnet": 0.5,
-        "f1_macro/ts_smellnet": 0.4,
         "recall_at_1/ts_smellnet": 0.5,
         "recall_at_5/ts_smellnet": 0.8,
+        "prediction_coverage/ts_smellnet": 0.2,
         "accuracy/overall": 0.5,
-        "f1_macro/overall": 0.4,
         "recall_at_1/overall": 0.45,
         "recall_at_5/overall": 0.75,
         "map/overall": 0.55,
+        "prediction_coverage/overall": 0.3,
         "loss/siglip": 0.75,
         "loss/ts_smellnet": 0.7,
         "loss/ts_ecg": 0.8,
@@ -520,7 +478,7 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         "recall_at_5/ts_tactile": 0.75,
         "map/ts_tactile": 0.5,
         "accuracy/ts_tactile": 0.25,
-        "f1_macro/ts_tactile": 0.2,
+        "prediction_coverage/ts_tactile": 0.4,
         "grad_norm": 2.0,
         "logit_scale": 10.0,
         "logit_bias": -10.0,
@@ -539,16 +497,17 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     grouped = _metric_groups("train", metrics, counts, metrics)
 
     assert grouped["train-core/accuracy/smellnet"] == 0.5
-    assert grouped["train-core/f1_macro/overall"] == 0.4
     assert grouped["train-core/recall_at_1/overall"] == 0.45
     assert grouped["train-core/recall_at_5/overall"] == 0.75
     assert grouped["train-core/map/overall"] == 0.55
     assert grouped["train-core/recall_at_5/smellnet"] == 0.8
     assert grouped["train-core/accuracy/tactile"] == 0.25
-    assert grouped["train-core/f1_macro/tactile"] == 0.2
     assert grouped["train-core/recall_at_1/tactile"] == 0.25
     assert grouped["train-core/recall_at_5/tactile"] == 0.75
     assert grouped["train-core/map/tactile"] == 0.5
+    assert grouped["train-aux/prediction_coverage/smellnet"] == 0.2
+    assert grouped["train-aux/prediction_coverage/tactile"] == 0.4
+    assert grouped["train-aux/prediction_coverage/overall"] == 0.3
     assert grouped["train-aux/n/img"] == 3.0
     assert grouped["train-aux/n/skipped/image"] == 1.0
     assert grouped["train-aux/n/skipped/video"] == 2.0

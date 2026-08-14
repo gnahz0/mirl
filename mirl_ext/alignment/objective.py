@@ -56,12 +56,6 @@ def _build_tactile_bank(
     labels: list[str] = []
     for task, task_labels in TASK_LABELS.items():
         labels.extend(task_labels)
-        logger.info(
-            "tactile bank: task=%s cols=%s labels=%d",
-            task,
-            TACTILE_SPANS[task],
-            len(task_labels),
-        )
     return tuple(labels), model.encode_text(labels, device=device).float().detach()
 
 
@@ -95,9 +89,8 @@ def _label_siglip_loss(
         weight=sample_weight[:, None],
         reduction="sum",
     )
-    # Match SigLIP's reduction: sum candidate-pair losses for each anchor, then
-    # average anchors. Here the anchor mean is class-balanced, and DDP averages
-    # rank gradients, so scale local rows back to the global supported-class mean.
+    # SigLIP reduction: sum candidate-pair losses per anchor, then a class-balanced anchor mean.
+    # DDP averages rank gradients, so scale local rows back to the global supported-class mean.
     denominator = (class_count > 0).sum()
     return local_sum * world_size / denominator
 
@@ -111,18 +104,9 @@ def _tactile_siglip_loss(
     logit_bias: torch.Tensor,
     world_size: int = 1,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
-    """Score all six tactile tasks in one masked pass over the 30-label bank.
-
-    The tasks are independent Bernoulli decisions under the sigmoid objective, so
-    they share one bank and one matmul; ``mask`` carries which ``(row, label)``
-    entries have a known answer. Rows whose QA join was incomplete keep an all-zero
-    target, and a zero weight is what stops that from being read as "every finger
-    is absent" -- see ``_annotation_targets`` for why those rows exist at all.
-
-    The reduction is unchanged from the per-task formulation this replaced: each
-    task is meaned over its own known pairs and the tasks are then weighted equally.
-    Only the plumbing collapsed -- one bank, one target/mask pair, one collective.
-    """
+    """Score all six tactile tasks in one masked pass over the shared 30-label bank.
+    ``mask`` marks known (row, label) pairs; only a zero weight stops an unannotated
+    row's all-zero target from reading as "every finger is absent"."""
     device = z_ts.device
     target = targets.to(device)
     weight = mask.to(device)
@@ -136,14 +120,9 @@ def _tactile_siglip_loss(
         reduction="none",
     )
 
-    # One collective for the whole family. Every rank runs it unconditionally and
-    # with the same shape, so it cannot desync the way a per-task reduce could.
-    per_task_sum = torch.stack(
-        [elementwise[:, start:stop].sum() for start, stop in TACTILE_SPANS.values()]
-    )
-    per_task_observed = torch.stack(
-        [weight[:, start:stop].sum() for start, stop in TACTILE_SPANS.values()]
-    )
+    # One unconditional same-shape collective for the whole family: it cannot desync like a per-task reduce could.
+    per_task_sum = torch.stack([elementwise[:, start:stop].sum() for start, stop in TACTILE_SPANS.values()])
+    per_task_observed = torch.stack([weight[:, start:stop].sum() for start, stop in TACTILE_SPANS.values()])
     packed = torch.cat((per_task_sum.detach(), per_task_observed))
     if world_size > 1:
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
@@ -152,9 +131,8 @@ def _tactile_siglip_loss(
     present = task_observed > 0
     if not bool(present.any()):
         return None, {}
-    # Per-task mean over its own known pairs, then an equal mean across the tasks
-    # that appeared. DDP averages rank gradients, so the local sum is scaled back up
-    # by world_size against the globally reduced pair count.
+    # Per-task mean over its own known pairs, then an equal mean across present tasks.
+    # DDP averages rank gradients, so the local sum is rescaled by world_size / global pair count.
     task_losses = per_task_sum[present] * world_size / task_observed[present]
     per_task = {
         f"loss/task/{task}": float(task_sums[index] / task_observed[index])
@@ -220,8 +198,7 @@ def _compute_losses(
                 logit_bias,
                 world_size,
             )
-        # A tactile batch whose rows are all unannotated for every task yields no
-        # loss at all. Every rank sees the same batch, so they agree on the skip.
+        # A fully-unannotated tactile batch yields no loss; every rank sees the same batch, so they agree on the skip.
         if l_ts is not None:
             total = total + float(cfg.loss.siglip_weight) * l_ts
             metrics["loss/siglip"] = l_ts.detach().item()
@@ -254,8 +231,12 @@ def _compute_losses(
     metrics["loss/total"] = total.detach().item()
     metrics["logit_scale"] = log_logit_scale.detach().exp().item()
     metrics["logit_bias"] = logit_bias.detach().item()
-    return total, metrics, (
-        (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
-        if z_ts is not None
-        else (None, [], [], None, None)
+    return (
+        total,
+        metrics,
+        (
+            (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
+            if z_ts is not None
+            else (None, [], [], None, None)
+        ),
     )

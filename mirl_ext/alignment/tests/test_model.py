@@ -109,5 +109,3 @@ def test_text_encoder_truncates_each_text_to_model_context():
     encoded = model.encode_text(["short", "long"], torch.device("cpu"))
 
     assert torch.equal(encoded, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
-
-

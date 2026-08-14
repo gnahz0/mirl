@@ -42,14 +42,15 @@ export TMPDIR=/scratch/dvdai_mit/alecz/tmp
 export TRITON_CACHE_DIR="$MIRL_CLUSTER_ROOT/.cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="$MIRL_CLUSTER_ROOT/.cache/inductor"
 export XDG_CACHE_HOME="$MIRL_CLUSTER_ROOT/.cache/xdg"
-export WANDB_DIR=/scratch/dvdai_mit/alecz/wandb
+export WANDB_DIR="$MIRL_CLUSTER_ROOT/wandb"
+export WANDB_DATA_DIR="$MIRL_CLUSTER_ROOT/wandb-data"
 export WANDB_PROJECT=mirl-alignment
 export WANDB_ENTITY=aleczhang-massachusetts-institute-of-technology
 export WANDB_RUN_ID="stage1-qwen35-canonical-siglip-${SLURM_JOB_ID}"
 export WANDB_RESUME=never
 export MIRL_OUTPUT_DIR="/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_canonical_siglip_${SLURM_JOB_ID}"
 mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
-  "$XDG_CACHE_HOME" "$WANDB_DIR" "$MIRL_OUTPUT_DIR"
+  "$XDG_CACHE_HOME" "$WANDB_DIR" "$WANDB_DATA_DIR" "$MIRL_OUTPUT_DIR"
 
 if [ -r "$MIRL_CLUSTER_ROOT/.wandb_key" ]; then
   export WANDB_API_KEY="$(<"$MIRL_CLUSTER_ROOT/.wandb_key")"
@@ -68,5 +69,5 @@ python -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' ||
 
 echo "Stage-1 job=$SLURM_JOB_ID node=$(hostname) output=$MIRL_OUTPUT_DIR"
 CONFIG="$PWD/mirl_ext/alignment/config/stage1_qwen35_siglip2_aicr.yaml" \
-NUM_GPUS=4 \
+NUM_GPUS="${SLURM_GPUS_ON_NODE:-4}" \
 bash examples/alignment/run_stage1_qwen35_siglip2.sh "$@"

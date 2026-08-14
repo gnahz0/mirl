@@ -46,12 +46,8 @@ logger = logging.getLogger("alignment.trainer")
 @dataclass
 class AccumulationWindow:
     """One window's running loss sums, sample counts, and prediction statistics.
-
-    Every published statistic is a ratio of sums over rows, so a microbatch folds
-    into fixed float64 accumulators as it is seen and the window keeps no
-    embeddings. The key set is fixed in ``__post_init__``, before any data, so the
-    single all-reduce in ``flush()`` is identical on every rank.
-    """
+    Statistics are ratios of sums, so microbatches fold in without retaining embeddings;
+    the key set is fixed pre-data, so ``flush()``'s one all-reduce matches on every rank."""
 
     device: torch.device
     specs: tuple = ()
@@ -91,11 +87,8 @@ class AccumulationWindow:
         update_stats(self.stats, self.specs, ts_eval, self.log_logit_scale, self.logit_bias)
 
     def flush(self, world_size: int = 1, per_class=None, per_label=None):
-        """Reduce the whole window in one collective, then derive every number.
-
-        Losses are averaged over the rank/microbatch pairs that produced them and
-        dropped when nobody did.
-        """
+        """Reduce the whole window in one collective; losses average over the
+        rank/microbatch pairs that produced them and drop when nobody did."""
         payload = dict(self.stats)
         payload["_loss_sum"] = torch.tensor(
             [self.loss_sums[key] for key in _REDUCED_METRIC_KEYS],
@@ -118,9 +111,7 @@ class AccumulationWindow:
         weights = dict(zip(_REDUCED_METRIC_KEYS, reduced["_loss_count"].tolist(), strict=True))
         losses = {key: sums[key] / weights[key] for key in _REDUCED_METRIC_KEYS if weights[key]}
         losses.update({key: sum(v) / len(v) for key, v in self.local_values.items()})
-        counts = {
-            key: int(value) for key, value in zip(_COUNT_KEYS, reduced["_count"].tolist(), strict=True)
-        }
+        counts = {key: int(value) for key, value in zip(_COUNT_KEYS, reduced["_count"].tolist(), strict=True)}
         counts["n/ts_signal"] = sum(counts[f"n/ts_{family}"] for family in _TS_FAMILIES)
         prediction = prediction_metrics(reduced, self.specs, per_class=per_class, per_label=per_label)
         return losses, counts, prediction
@@ -173,10 +164,6 @@ def train(cfg: DictConfig) -> None:
         logging.getLogger().setLevel(logging.WARNING)
 
     device = accelerator.device
-    # Use autocast for frozen towers and fp32 trainable weights.
-    visual_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[
-        str(cfg.train.amp_dtype)
-    ]
     out_dir = Path(cfg.train.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
@@ -195,7 +182,6 @@ def train(cfg: DictConfig) -> None:
     model = MultimodalAlignmentModel(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
-        visual_dtype=visual_dtype,
     ).to(device)
     if cfg.train.gradient_checkpointing:
         model.trainable_visual.gradient_checkpointing_enable()
@@ -209,8 +195,7 @@ def train(cfg: DictConfig) -> None:
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
     val_label_bank = _build_text_label_bank(model, val_ds.ts_label_vocabs, device)
     tactile_bank = _build_tactile_bank(model, device)
-    # One scoring-unit list per split for the whole run: every window reuses it, so
-    # the derived bank constants are built once rather than per optimizer step.
+    # One scoring-unit list per split for the whole run; every window reuses it.
     train_specs = build_bank_specs(train_label_bank, tactile_bank)
     val_specs = build_bank_specs(val_label_bank, tactile_bank)
     free, total = torch.cuda.mem_get_info()
@@ -347,9 +332,7 @@ def train(cfg: DictConfig) -> None:
                     + cumulative_counts["n/ts_signal"]
                 )
                 for kind in ("image", "video", "signal"):
-                    payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(
-                        cumulative_counts[f"n/skipped_{kind}"]
-                    )
+                    payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(cumulative_counts[f"n/skipped_{kind}"])
                 payload["train-aux/n/skipped_cumulative/total"] = float(skipped_total)
                 payload["train-aux/skipped_fraction_cumulative"] = skipped_total / max(
                     valid_total + skipped_total,
@@ -391,7 +374,6 @@ def train(cfg: DictConfig) -> None:
                         "predicted",
                         "precision",
                         "recall",
-                        "f1",
                         "recall_at_5",
                     )
                     for family, rows in per_class.items():
@@ -406,7 +388,6 @@ def train(cfg: DictConfig) -> None:
                         "predicted",
                         "precision",
                         "recall",
-                        "f1",
                     )
                     if per_label:
                         payload["val-aux/per_label/tactile"] = wandb.Table(

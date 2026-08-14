@@ -1,15 +1,11 @@
 """Record the metric surface produced by the PRE-REFACTOR implementation.
 
-Ran once against the working tree as it stood before the 2026-08-09 metrics
-rewrite; the result is ``fixtures/metrics_golden.json``. Kept for provenance --
-the functions it calls no longer exist. Every scalar dict plus ``smellnet_rows``
-and ``ecg_rows`` also reproduces from ``0e1f4272``; ``tactile_rows`` does not,
-because the tree already carried the ``_score_against_bank`` merge, so treat that
-block as a lock-forward pin rather than evidence about the old code.
-
-Do not regenerate against current code: that would overwrite the record of the
-old behaviour with the new, and the golden test would assert only that the code
-agrees with itself.
+Ran once before the 2026-08-09 metrics rewrite to produce
+``fixtures/metrics_golden.json``; the functions it calls no longer exist. Every
+block also reproduces from ``0e1f4272`` except ``tactile_rows`` (that tree already
+carried the ``_score_against_bank`` merge) -- treat that block as a lock-forward
+pin. Do NOT regenerate against current code: the golden test would then only
+assert that the code agrees with itself.
 """
 
 from __future__ import annotations
@@ -57,8 +53,7 @@ def _inputs() -> dict:
     ecg_labels = ("normal", "af", "lbbb", "rbbb", "pvc", "pac", "st")
     ecg_draw = [0] * 14 + [1] * 6 + [2] * 4 + [3] * 4 + [4] * 3 + [5] * 1
 
-    # tactile: every task observed except local_shape, plus one row that answers
-    # only initial_fingers -- the incomplete-join case the mask exists for.
+    # tactile: every task observed except local_shape; row 15 answers only initial_fingers (incomplete join).
     targets = torch.zeros(16, TACTILE_NUM_LABELS)
     masks = torch.zeros(16, TACTILE_NUM_LABELS)
     for row in range(16):

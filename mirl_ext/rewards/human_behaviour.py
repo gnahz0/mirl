@@ -12,7 +12,6 @@ from ._common import extract_boxed_answer, format_reward
 
 
 def acc_reward(pred_label: str, gt_label: str) -> float:
-    """Exact-match accuracy on lowercased labels."""
     return 1.0 if pred_label == gt_label else 0.0
 
 

@@ -122,8 +122,7 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     }
 
     batch = collate_alignment([sample])
-    # One (1, 30) target/mask pair over the concatenated task vocabularies; a task's
-    # answer lands inside its own column span.
+    # One (1, 30) target/mask pair over the concatenated vocabularies; each answer lands in its task's span.
     assert batch["targets"].shape == (1, TACTILE_NUM_LABELS)
     assert batch["masks"].shape == (1, TACTILE_NUM_LABELS)
     start, stop = TACTILE_SPANS["initial_fingers"]
@@ -131,8 +130,7 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
         batch["targets"][0, start:stop],
         torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
     )
-    # Every task this fixture answers is fully unmasked; a task's columns are all-or-
-    # nothing, which is what lets the metrics recover the per-row mask from column 0.
+    # A task's mask columns are all-or-nothing; that lets the metrics recover the per-row mask from column 0.
     for task, (task_start, task_stop) in TACTILE_SPANS.items():
         expected = 1.0 if task in sample["targets"] else 0.0
         assert batch["masks"][0, task_start:task_stop].tolist() == [expected] * (task_stop - task_start), task

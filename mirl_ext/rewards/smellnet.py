@@ -4,6 +4,9 @@ The prompt asks for a single substance label (e.g. "allspice", "brazil_nut")
 chosen from a fixed list, with <think> reasoning and the answer in \\boxed{}.
 
 Training reward = acc_weight * acc + sim_weight * jaccard + format_weight * format
+
+sim_weight defaults to 0.0 by design: base labels have no meaningful partial
+credit, and token overlap would reward shared substrings (brazil_nut vs pili_nut).
 """
 
 import re

@@ -17,7 +17,6 @@ def parse_labels(answer_str: str) -> set[str]:
 
 
 def acc_reward(pred_labels: set[str], gt_labels: set[str]) -> float:
-    """1.0 iff predicted label set equals ground truth."""
     return 1.0 if pred_labels == gt_labels else 0.0
 
 

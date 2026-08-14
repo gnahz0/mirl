@@ -32,14 +32,9 @@ def _extra_info_as_dict(value: Any) -> dict[str, Any]:
 
 
 class MIRLDataset(RLHFDataset):
-    """Normalize historical MIRL rows without patching upstream verl.
-
-    MIRL parquet files intentionally use one schema across modality families.
-    ``extra_info`` is a JSON string, nullable video fields are materialized as
-    ``None``, and human-behaviour prompts contain an informational ``<audio>``
-    marker although no raw audio column is consumed.  Upstream verl expects a
-    dict, concrete video limits, and a real audio payload for that marker.
-    """
+    """Normalize MIRL parquet rows for upstream verl: ``extra_info`` arrives as
+    a JSON string, video limit fields may be None, and human-behaviour prompts
+    carry an ``<audio>`` marker with no audio payload."""
 
     def _build_messages(self, example: dict, key: str):
         normalized = copy.deepcopy(example)
@@ -61,10 +56,7 @@ class MIRLDataset(RLHFDataset):
                     video["max_frames"] = min(video.get("max_frames", 768), int(max_video_frames))
             videos.append(video)
         normalized[self.video_key] = videos
-        # This class is loaded from a file path by verl. Hugging Face Dataset's
-        # multiprocess filter serializes that dynamic class; zero-argument
-        # ``super()`` can then resolve against a reconstructed class object.
-        # Calling the stable imported base explicitly remains pickle-safe.
+        # Explicit base call, not super(): HF's multiprocess filter pickles this file-loaded class, and zero-arg super() can then resolve against a reconstructed class.
         return RLHFDataset._build_messages(self, normalized, key=key)
 
     def __getitem__(self, item):

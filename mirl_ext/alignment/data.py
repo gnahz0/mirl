@@ -16,7 +16,6 @@ from torch.utils.data import Dataset, Sampler
 
 logger = logging.getLogger(__name__)
 
-# Select the video backend before worker imports.
 os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
 os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 
@@ -28,9 +27,8 @@ _CLASSIFICATION_FAMILIES: tuple[str, ...] = ("smellnet", "ecg")
 _SIGNAL_FORMATS = {"": "smellnet", "ts_pt": "ecg", "tactile_pt": "tactile"}
 _SKIPPABLE_LOAD_ERRORS = (OSError, ValueError, RuntimeError, EOFError)
 
-# Closed-label tactile tasks. The haptic signal Parquets contain open-ended
-# descriptions; these labels are joined from the tactile QA Parquets by the
-# recording stem. SFT/RL should keep the original ordered QA rows instead.
+# Closed-label tactile tasks, joined from the tactile QA Parquets by recording stem;
+# SFT/RL should keep the original ordered QA rows instead.
 TASK_LABELS: dict[str, tuple[str, ...]] = {
     "initial_fingers": (
         "initial contact: thumb",
@@ -77,10 +75,8 @@ TASK_LABELS: dict[str, tuple[str, ...]] = {
 }
 MULTILABEL_TASKS = frozenset(("initial_fingers", "highest_pressure"))
 
-# Column span of each task inside the concatenated tactile bank. The six tasks are
-# independent Bernoulli decisions under the sigmoid objective -- nothing couples
-# them -- so one bank of TACTILE_NUM_LABELS entries is equivalent to six banks, and
-# anything wanting a single task slices these columns instead of holding its own.
+# Column span of each task inside the concatenated tactile bank: the six tasks are
+# independent Bernoulli decisions under the sigmoid, so one bank is equivalent to six.
 TACTILE_SPANS: dict[str, tuple[int, int]] = {}
 _offset = 0
 for _task, _task_labels in TASK_LABELS.items():
@@ -110,8 +106,7 @@ def _parse_annotation_answer(answer: object, task: str) -> tuple[int, ...]:
     choices = [choice.strip() for choice in str(answer).split(",")]
     if any(len(choice) != 1 or not choice.isalpha() for choice in choices):
         raise ValueError(f"invalid answer {answer!r}")
-    # Splitting always yields a choice and no alphabetic codepoint sits below "A", so
-    # the upper bound is the only reachable range failure -- it also rejects lowercase.
+    # The upper bound is the only reachable range failure (nothing alphabetic sits below "A"); it also rejects lowercase.
     indices = tuple(sorted({ord(choice) - ord("A") for choice in choices}))
     if indices[-1] >= len(labels):
         raise ValueError(f"answer {answer!r} is outside A-{chr(ord('A') + len(labels) - 1)}")
@@ -134,8 +129,7 @@ def _annotation_targets(
         if stem not in valid_stems:
             continue
         answers[stem][task].add(_parse_annotation_answer(row["reward_model"]["ground_truth"], task))
-    # Duplicate QA rows that disagree drop the pair, not the recording: the stem stays
-    # a key so its other tasks still supervise.
+    # Disagreeing duplicate QA rows drop the task, not the recording: other tasks on the stem still supervise.
     return {
         stem: {task: next(iter(choices)) for task, choices in tasks.items() if len(choices) == 1}
         for stem, tasks in answers.items()
@@ -168,9 +162,8 @@ def _expand_and_deduplicate_visual_rows(rows: list[dict]) -> tuple[list[dict], i
             unique.append(row)
             continue
 
-        # Stage 1 ignores QA text, so each physical item is an independent
-        # preservation anchor. SFT/RL must instead retain the complete ordered
-        # media list so it remains aligned with the prompt placeholders.
+        # Stage 1 ignores QA text, so each physical item is an independent preservation
+        # anchor; SFT/RL must keep the complete ordered media list instead.
         entries = _visual_entries(row)
         if not entries:
             unique.append(row)
@@ -413,11 +406,8 @@ class AlignmentDataset(Dataset):
 
 
 class HomogeneousBatchSampler(Sampler[list[int]]):
-    """Yield source-homogeneous batches with one nonempty shard per rank.
-
-    Training may repeat complete shuffled passes over selected signal sources.
-    Visual sources and omitted signal sources always retain one-pass sampling.
-    """
+    """Yield source-homogeneous batches with one nonempty shard per rank; repeated
+    signal sources take complete shuffled passes, everything else stays one-pass."""
 
     def __init__(
         self,
@@ -438,8 +428,7 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         self.signal_repeat_factors = dict(signal_repeat_factors or {})
 
         effective_sizes = {
-            group: len(rows) * self.signal_repeat_factors.get(group[1], 1)
-            for group, rows in self.groups.items()
+            group: len(rows) * self.signal_repeat_factors.get(group[1], 1) for group, rows in self.groups.items()
         }
         global_batch_size = self.batch_size * self.world_size
         batch_counts = {

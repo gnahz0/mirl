@@ -16,7 +16,9 @@ from .data import (
     TASK_LABELS,
 )
 
-_PUBLIC_STATS = ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
+_PUBLIC_STATS = ("accuracy", "recall_at_1", "recall_at_5", "map")
+_AUX_STATS = ("prediction_coverage",)
+_PREDICTION_STATS = _PUBLIC_STATS + _AUX_STATS
 
 _REDUCED_METRIC_KEYS = (
     "loss/siglip",
@@ -39,10 +41,8 @@ _COUNT_KEYS: tuple[str, ...] = (
 
 def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> dict[str, torch.Tensor]:
     """Sum every entry of ``values`` across ranks with exactly one collective.
-
-    Callers build ``values`` from a key set fixed before any data is seen, so the
-    packed buffer is identical on every rank whatever rows landed locally.
-    """
+    Callers fix the key set before any data is seen, so the packed buffer is
+    identical on every rank whatever rows landed locally."""
     if world_size <= 1:
         return values
     keys = sorted(values)
@@ -68,13 +68,9 @@ class BankSpec:
 
 
 def build_bank_specs(label_bank: dict, tactile_bank: tuple | None) -> tuple[BankSpec, ...]:
-    """Enumerate every scoring unit, once, before any data is seen.
-
-    Depends only on the label banks and ``TACTILE_SPANS``, so the unit list -- and
-    the reduce buffer's length -- is identical on every rank for the whole run.
-    ``update_stats`` re-reads ``TACTILE_SPANS`` to slice the same columns back out,
-    so the two must see the same span table; nothing is cached to disagree with it.
-    """
+    """Enumerate every scoring unit once, before any data is seen, so the unit list
+    -- and the reduce buffer's length -- is identical on every rank for the run.
+    ``update_stats`` re-reads ``TACTILE_SPANS``; both must see the same span table."""
     specs = [BankSpec(f"ts_{family}", *label_bank[family]) for family in _TS_FAMILIES if family in label_bank]
     if tactile_bank is not None:
         labels, embeddings = tactile_bank
@@ -94,21 +90,12 @@ def _bank_stats(
     logit_bias: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Sufficient statistics for one (rows x bank) scoring problem. No collective.
-
-    Single-label units pass a one-hot target and every statistic collapses to its
-    familiar form: average precision over one positive is ``1 / rank``, recall@1 is
-    accuracy. These sums add across microbatches exactly as they add across ranks,
-    so nothing retains embeddings and macro-F1 stays a pooled-confusion number.
-    Zero rows is legal and yields zeros, which keeps an empty rank in lockstep and
-    is what ``new_stats`` uses to size the buffer.
-    """
+    Sums add across microbatches exactly as across ranks, so nothing retains
+    embeddings; zero rows legally yields zeros (``new_stats`` sizes the buffer with it)."""
     target = target.to(z.device).bool()
-    # A transposed view, never .contiguous(): fresh strides make cuBLAS pick a
-    # different kernel and move the similarities in their last bits, which
-    # argsort(stable=True) can turn into a different tie order.
+    # A transposed view, never .contiguous(): fresh strides change the cuBLAS kernel and can flip tie order.
     sims = z.float() @ spec.embeddings.to(z.device).float().t()
-    # stable=True pins tie order to label index, so a row scores identically
-    # however the rows were chunked.
+    # stable=True pins tie order to label index, so a row scores identically however the rows were chunked.
     ranked = sims.argsort(dim=1, descending=True, stable=True)
     top, top_k = ranked[:, :1], ranked[:, :5]  # a slice already clamps to a narrower bank
 
@@ -155,15 +142,13 @@ def _bank_metrics(
 
     precision = true_positive / predicted.clamp_min(1)
     recall = true_positive / support.clamp_min(1)
-    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
     recall_at_5_by_class = stats[f"{spec.key}/recall_at_5_count"] / support.clamp_min(1)
     task = spec.key.partition("task/")[2]
 
     if rows_out is not None:
         rows_out.extend(
             {
-                # The six tasks share one table, so their rows say which task; a
-                # family has its own table and would only repeat its own name.
+                # The six tasks share one table, so their rows say which task; a family table would only repeat its name.
                 **({"task": task} if task else {}),
                 "class_id": index,
                 "label": label,
@@ -171,7 +156,6 @@ def _bank_metrics(
                 "predicted": predicted[index].item(),
                 "precision": precision[index].item(),
                 "recall": recall[index].item(),
-                "f1": f1[index].item(),
                 "recall_at_5": recall_at_5_by_class[index].item(),
             }
             for index, label in enumerate(spec.labels)
@@ -179,19 +163,17 @@ def _bank_metrics(
 
     return {
         "accuracy": float(stats[f"{spec.key}/top_is_positive"] / sample_count),
-        "f1_macro": float(f1[support > 0].mean()),
         "recall_at_1": float(stats[f"{spec.key}/recall_at_1"] / sample_count),
         "recall_at_5": float(stats[f"{spec.key}/recall_at_5"] / sample_count),
         "map": float(stats[f"{spec.key}/average_precision"] / sample_count),
+        "prediction_coverage": float((predicted > 0).sum() / len(spec.labels)),
     }
 
 
 def new_stats(specs: tuple[BankSpec, ...], device: torch.device) -> dict[str, torch.Tensor]:
-    """Zero-fill the complete statistic key set before any data is seen.
-
-    Sized by asking the producer for the statistics of zero rows, which are exactly
-    zeros, so the buffer cannot fall out of step with what ``update_stats`` writes.
-    """
+    """Zero-fill the complete statistic key set before any data is seen, sized by
+    the producer's zero-row statistics so the buffer cannot fall out of step with
+    what ``update_stats`` writes."""
     return {
         key: value.to(device)
         for spec in specs
@@ -206,15 +188,9 @@ def new_stats(specs: tuple[BankSpec, ...], device: torch.device) -> dict[str, to
 
 
 def _microbatch_units(specs, z, texts, families, targets, masks):
-    """Every unit holding rows here, as (spec, its rows of ``z``, its multi-hot target).
-
-    The one place that knows the two kinds of answer apart: a family row names its
-    label as a string, a tactile row carries an answered span of the collated
-    target. Both leave as the same triple, which is why nothing downstream branches
-    on unit kind. Enumerating the families the microbatch actually carries -- rather
-    than asking every unit whether the batch is its own -- is what makes a visual
-    microbatch, which carries none and whose ``z`` is None, yield nothing at all.
-    """
+    """Yield (spec, rows of ``z``, multi-hot target) for every unit with rows here.
+    The one place that tells family label strings from tactile answered spans apart;
+    a visual microbatch carries no families, so it yields nothing at all."""
     by_key = {spec.key: spec for spec in specs}
     if masks is None:
         rows_by_key: dict[str, list[int]] = {}
@@ -226,8 +202,7 @@ def _microbatch_units(specs, z, texts, families, targets, masks):
             yield spec, z[rows], F.one_hot(ids, len(spec.labels))
         return
     for task, (start, stop) in TACTILE_SPANS.items():
-        # collate_alignment writes a task's whole span in one assignment, so requiring
-        # the whole span drops a partly-answered row rather than misreading it.
+        # collate writes whole task spans; requiring the whole span drops a partly-answered row, not misreads it.
         rows = (masks[:, start:stop] > 0).all(dim=1)
         yield by_key[f"task/{task}"], z[rows], targets[rows, start:stop]
 
@@ -268,12 +243,12 @@ def prediction_metrics(
         if per_class is not None and (family := spec.key.removeprefix("ts_")) in _CLASSIFICATION_FAMILIES:
             rows_out = per_class.setdefault(family, [])
         scores = _bank_metrics(stats, spec, rows_out=rows_out)
-        for stat in _PUBLIC_STATS:
+        for stat in _PREDICTION_STATS:
             metrics[f"{stat}/{spec.key}"] = scores[stat]
         if is_task:
             task_scores.append(scores)
     if task_scores:
-        for stat in _PUBLIC_STATS:
+        for stat in _PREDICTION_STATS:
             metrics[f"{stat}/ts_tactile"] = sum(s[stat] for s in task_scores) / len(task_scores)
     return _merge_prediction_metrics(metrics)
 
@@ -283,7 +258,7 @@ def _merge_prediction_metrics(*metric_sets: dict[str, float]) -> dict[str, float
     merged: dict[str, float] = {}
     for values in metric_sets:
         merged.update(values)
-    for stat in _PUBLIC_STATS:
+    for stat in _PREDICTION_STATS:
         family_values = [merged[f"{stat}/ts_{family}"] for family in _TS_FAMILIES if f"{stat}/ts_{family}" in merged]
         if family_values:
             merged[f"{stat}/overall"] = sum(family_values) / len(family_values)
@@ -326,6 +301,10 @@ def _metric_groups(
             key = f"{stat}/ts_{family}"
             if key in prediction_metrics:
                 out[f"{core}/{stat}/{family}"] = prediction_metrics[key]
+        for stat in _AUX_STATS:
+            key = f"{stat}/ts_{family}"
+            if key in prediction_metrics:
+                out[f"{aux}/{stat}/{family}"] = prediction_metrics[key]
         out[f"{aux}/n/{family}"] = float(counts[f"n/ts_{family}"])
 
     for task in TASK_LABELS:
@@ -336,11 +315,19 @@ def _metric_groups(
             key = f"{stat}/task/{task}"
             if key in prediction_metrics:
                 out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]
+        for stat in _AUX_STATS:
+            key = f"{stat}/task/{task}"
+            if key in prediction_metrics:
+                out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]
 
     for stat in _PUBLIC_STATS:
         key = f"{stat}/overall"
         if key in prediction_metrics:
             out[f"{core}/{stat}/overall"] = prediction_metrics[key]
+    for stat in _AUX_STATS:
+        key = f"{stat}/overall"
+        if key in prediction_metrics:
+            out[f"{aux}/{stat}/overall"] = prediction_metrics[key]
 
     if split == "train":
         for key, value in loss_metrics.items():

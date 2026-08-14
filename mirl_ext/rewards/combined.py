@@ -55,12 +55,8 @@ MEDICAL_SOURCES = {"chest_xray", "ct", "derm", "fundus", "mammo", "mri", "pathol
 
 
 def _restore_qwen35_think_prefix(solution: str) -> str:
-    """Restore the opening tag rendered into Qwen3.5's generation prompt.
-
-    The default Qwen3.5 chat template ends the prompt with ``<think>``.  verl
-    decodes only generated response tokens, so the reward sees the closing tag
-    but not the opening one.  Historical MIRL format rewards expect both.
-    """
+    """Qwen3.5's chat template ends the prompt with ``<think>``, so verl's decoded
+    response carries only the closing tag; the format rewards expect both."""
     if "</think>" in solution and "<think>" not in solution:
         return "<think>" + solution
     return solution

@@ -27,12 +27,8 @@ class _ToyModel(torch.nn.Module):
 
 
 def _free_port() -> int:
-    """Claim an unused port for one rendezvous.
-
-    Hardcoding a port makes two concurrent runs of this file deadlock on the
-    rendezvous rather than fail, which on a shared login node means orphaned
-    gloo processes that outlive the test session.
-    """
+    """Claim an unused port for one rendezvous: a hardcoded port makes concurrent
+    runs deadlock on the rendezvous, orphaning gloo processes on a shared login node."""
     import socket
 
     with socket.socket() as sock:
@@ -109,8 +105,7 @@ def _worker(rank: int, results: dict, port: int) -> None:
         reference.zero_grad()
         embeddings, scale, bias = model(inputs)
         tactile_targets = (torch.tensor([[1.0, 0.0], [1.0, 0.0]]), torch.tensor([[0.0, 1.0]]))[rank]
-        # Rank 1's only row is unannotated, so the sharded loss must equal a
-        # single-process reference over rank 0's two rows alone.
+        # Rank 1's only row is unannotated, so the sharded loss must equal a reference over rank 0's rows alone.
         tactile_mask = (torch.ones(2, 2), torch.zeros(1, 2))[rank]
         # The toy bank is 2 labels wide; pretend it is one task spanning both.
         with mock.patch.dict(TACTILE_SPANS, {"toy": (0, 2)}, clear=True):
@@ -179,8 +174,7 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
         smell_z = torch.tensor([[1.0, 0.0], [0.2, 0.8]])
         ecg_z = torch.tensor([[0.0, 1.0], [0.9, 0.1], [0.3, 0.7]])
 
-        # Rank 0 sees only smellnet; rank 1 sees only ecg. Under the old
-        # per-family reduce this shape could not agree on a collective at all.
+        # Rank 0 sees only smellnet, rank 1 only ecg -- the shape the old per-family reduce could not agree on.
         shard = (
             (smell_z, ["A", "B"], ["smellnet"] * 2),
             (ecg_z, ["B", "A", "B"], ["ecg"] * 3),
@@ -210,12 +204,9 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
 
 
 def test_metrics_agree_when_a_rank_holds_no_rows_for_a_family():
-    """A rank with zero rows of a family must still reach the same collective.
-
-    The reduce buffer is sized from the label banks before any data, so a rank
-    contributing nothing to a family contributes exact zeros rather than skipping
-    the reduce -- the shape that would otherwise hang instead of failing.
-    """
+    """A rank with zero rows of a family must still reach the same collective:
+    the reduce buffer is sized from the label banks pre-data, so it contributes
+    exact zeros rather than skipping the reduce (which would hang, not fail)."""
     ctx = mp.get_context("spawn")
     results = ctx.Manager().dict()
     port = _free_port()

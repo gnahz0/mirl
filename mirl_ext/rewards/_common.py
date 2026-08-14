@@ -1,9 +1,6 @@
-"""Shared scoring primitives for the mirl reward modules.
-
-Each task module keeps only its own parsing and weight triple; the boxed-answer
-extractor, the ``<think>…</think>…\\boxed{}`` format check, and the set-based
-precision/recall/F1 + Jaccard were byte-identical across every reward file.
-"""
+"""Shared scoring primitives for the mirl reward modules: boxed-answer
+extraction, the ``<think>…</think>…\\boxed{}`` format check, and set-based
+precision/recall/F1 + Jaccard."""
 
 import re
 

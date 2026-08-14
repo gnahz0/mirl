@@ -1,14 +1,10 @@
 """Guard the metric surface established by the 2026-08-09 rewrite.
 
-``fixtures/metrics_golden.json`` was produced by ``regen_metrics_golden.py`` run
-against the implementation that preceded the rewrite -- the one that hand-packed
-every statistic into a positional buffer and reduced it with torchmetrics
-``MeanMetric``s alongside. It stores both the inputs and the outputs, so these
-tests replay the same inputs through the new unified path and compare exactly.
-
-Exact equality remains the assertion except for tactile multi-label F1 and
-coverage, which now use canonical SigLIP's learned scalar bias instead of fixed
-per-task priors. Ranking metrics remain unchanged by that calibration change.
+``fixtures/metrics_golden.json`` stores inputs and outputs produced by
+``regen_metrics_golden.py`` against the pre-rewrite implementation; these tests
+replay the same inputs through the new unified path and compare exactly, except
+tactile thresholded coverage, which now uses SigLIP's learned scalar bias
+instead of fixed per-task priors (ranking metrics are unchanged by that).
 """
 
 from __future__ import annotations
@@ -60,6 +56,8 @@ def _tactile_specs(case) -> tuple:
 
 
 def _assert_same(actual: dict, expected: dict, label: str) -> None:
+    # Prediction coverage is a later additive diagnostic (tested in test_losses.py), absent from the fixture.
+    actual = {key: value for key, value in actual.items() if "prediction_coverage" not in key}
     assert set(actual) == set(expected), f"{label}: key set changed"
     for key, value in expected.items():
         assert actual[key] == value, f"{label}: {key} moved {value!r} -> {actual[key]!r}"
@@ -88,7 +86,7 @@ def test_single_label_families_score_unchanged(golden, case):
 
 
 def test_tactile_ranking_is_unchanged_and_classification_uses_learned_bias(golden):
-    """Changing calibration leaves ranking intact and changes multi-label F1."""
+    """Changing calibration leaves ranking intact and changes thresholded predictions."""
     case = golden["inputs"]["tactile"]
     rows: list[dict] = []
     specs = _tactile_specs(case)
@@ -102,34 +100,22 @@ def test_tactile_ranking_is_unchanged_and_classification_uses_learned_bias(golde
     )
     metrics = prediction_metrics(stats, specs, per_label=rows)
 
-    # The rewrite folded the equal-family rollup into prediction_metrics, so it now
-    # emits the /overall keys the old caller derived in a second step. With tactile
-    # the only family present, each one is just its ts_tactile value.
+    # prediction_metrics now emits /overall itself; with only tactile present each equals its ts_tactile value.
     expected = dict(golden["golden"]["tactile"])
     expected.update(
         {
             f"{stat}/overall": expected[f"{stat}/ts_tactile"]
-            for stat in ("accuracy", "f1_macro", "recall_at_1", "recall_at_5", "map")
+            for stat in ("accuracy", "recall_at_1", "recall_at_5", "map")
         }
     )
-    ranking = {
-        key: value
-        for key, value in metrics.items()
-        if not key.startswith("f1_macro/")
-    }
-    expected_ranking = {
-        key: value
-        for key, value in expected.items()
-        if not key.startswith("f1_macro/")
-    }
-    _assert_same(ranking, expected_ranking, "tactile ranking")
+    _assert_same(metrics, expected, "tactile ranking")
 
     expected_rows = golden["golden"]["tactile_rows"]
     for actual, old in zip(rows, expected_rows, strict=True):
         for field in ("task", "class_id", "label", "support", "recall_at_5"):
             assert actual[field] == old[field]
         if actual["task"] in MULTILABEL_TASKS:
-            assert actual["predicted"] == actual["precision"] == actual["recall"] == actual["f1"] == 0
+            assert actual["predicted"] == actual["precision"] == actual["recall"] == 0
         else:
             assert actual == old
     # local_shape was answered by no row, so it must be absent rather than nan.
@@ -162,9 +148,7 @@ def test_mixed_families_and_overall_rollup_unchanged(golden):
         None,
         None,
     )
-    mixed = _merge_prediction_metrics(
-        prediction_metrics(stats, specs, per_class=reports), golden["golden"]["tactile"]
-    )
+    mixed = _merge_prediction_metrics(prediction_metrics(stats, specs, per_class=reports), golden["golden"]["tactile"])
 
     _assert_same(mixed, golden["golden"]["mixed"], "mixed")
     assert sorted(reports) == golden["golden"]["mixed_report_families"]
@@ -192,14 +176,8 @@ def test_metric_groups_surface_unchanged(golden):
 
 
 def test_streaming_equals_one_shot(golden):
-    """Three microbatches must produce exactly the whole-batch numbers.
-
-    This is the property the rewrite trades embedding retention for: because every
-    statistic is a sum over rows, folding rows in as they arrive has to be
-    indistinguishable from ranking them all at once. Macro-F1 is the sharp case --
-    it is a pooled-confusion number, so an implementation that averaged
-    per-microbatch F1s would diverge here.
-    """
+    """Streaming microbatches must exactly match the one-shot numbers: every
+    statistic is a sum over rows, the property that replaced embedding retention."""
     data = golden["inputs"]["ecg"]
     spec = _single_label_spec(data["candidates"], data["bank"])
     z = _tensor(data["z"])

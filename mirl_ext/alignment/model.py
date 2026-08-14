@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import logging
 import math
 from contextlib import nullcontext
 
@@ -11,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
 
 class MultimodalAlignmentModel(nn.Module):
     """Trainable Qwen vision tower, frozen image anchor, and SigLIP2 text tower."""
@@ -20,19 +18,17 @@ class MultimodalAlignmentModel(nn.Module):
         self,
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
-        visual_dtype: torch.dtype = torch.bfloat16,
     ):
-        super().__init__()
-        from transformers import AutoConfig, AutoProcessor, AutoTokenizer, Siglip2TextModel
+        from transformers import AutoProcessor, AutoTokenizer, Siglip2TextModel
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
+        super().__init__()
+
         self.qwen_processor = AutoProcessor.from_pretrained(qwen35_path, local_files_only=True)
-        vision_config = AutoConfig.from_pretrained(qwen35_path, local_files_only=True).vision_config
-        vision_config._attn_implementation = "sdpa"
         self.trainable_visual = Qwen3_5VisionModel.from_pretrained(
             qwen35_path,
-            dtype=visual_dtype,
-            config=vision_config,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
             local_files_only=True,
             key_mapping={r"^model\.visual\.": ""},
         )
@@ -44,18 +40,11 @@ class MultimodalAlignmentModel(nn.Module):
         vcfg = self.trainable_visual.config
         self.vit_patch_size = int(vcfg.patch_size)
         self.vit_merge_size = int(vcfg.spatial_merge_size)
-        logger.info(
-            "[ts] signal-video formatting: patch_size=%d merge_size=%d temporal_patch_size=%d",
-            self.vit_patch_size,
-            self.vit_merge_size,
-            int(vcfg.temporal_patch_size),
-        )
 
         self.label_tokenizer = AutoTokenizer.from_pretrained(siglip2_text_path, local_files_only=True)
-        # The model class loads the text prefix and ignores the vision weights.
-        self.label_text_model = Siglip2TextModel.from_pretrained(
-            siglip2_text_path, local_files_only=True
-        ).to(dtype=visual_dtype)
+        self.label_text_model = Siglip2TextModel.from_pretrained(siglip2_text_path, local_files_only=True).to(
+            dtype=torch.bfloat16
+        )
         self.label_text_model.requires_grad_(False).eval()
 
         self.log_logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
@@ -137,9 +126,8 @@ class MultimodalAlignmentModel(nn.Module):
         std = x.std(dim=-1, keepdim=True, unbiased=False)
         mad_blend, tanh_gain = 0.7, 2.0
         blended = mad_blend * mad + (1.0 - mad_blend) * std
-        # Quantized or sparse traces can have MAD=0 despite carrying variation.
-        # In that case, use the full standard deviation instead of shrinking it
-        # by the blend's 0.3 coefficient. Constant rows still map exactly to 0.
+        # Quantized/sparse traces can have MAD=0 despite variation: use full std, not the 0.3-shrunk blend.
+        # Constant rows still map exactly to 0.
         scale = torch.where(mad > 1e-6, blended, std).clamp_min(1e-6)
         return torch.tanh(centered / (tanh_gain * scale))
 
@@ -148,11 +136,7 @@ class MultimodalAlignmentModel(nn.Module):
         cell = self.vit_patch_size * self.vit_merge_size
         finite = torch.isfinite(signal)
         raw = signal.float()
-        value = (
-            torch.nan_to_num(raw).clamp(-4.0, 4.0) / 4.0
-            if prestandardized
-            else self._robust_normalize_rows(raw)
-        )
+        value = torch.nan_to_num(raw).clamp(-4.0, 4.0) / 4.0 if prestandardized else self._robust_normalize_rows(raw)
         value = value.masked_fill(~finite, -1.0)
 
         channels, steps = value.shape
@@ -182,10 +166,7 @@ class MultimodalAlignmentModel(nn.Module):
         if family == "tactile":
             videos = [self._tactile_frames(signal.to(device)) for signal in signals]
         else:
-            videos = [
-                self._timeseries_frames(signal.to(device), prestandardized=family == "ecg")
-                for signal in signals
-            ]
+            videos = [self._timeseries_frames(signal.to(device), prestandardized=family == "ecg") for signal in signals]
 
         # Sensor frames are already normalized and merger-aligned.
         processed = self.qwen_processor.video_processor.preprocess(

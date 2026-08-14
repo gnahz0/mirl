@@ -38,23 +38,24 @@ train:
   # state and must use the same planned schedule and sampler geometry.
   init_checkpoint: null
   resume_checkpoint: null
+  # Approximate square-root sampling across the signal sources.
   signal_repeat_factors:
-    smellnet_base: 45
-    haptic_tactile: 11
+    smellnet_base: 13
+    haptic_tactile: 5
   # Two GPUs and four-step accumulation give an effective batch of 256.
   batch_size: 32
   grad_accum_steps: 4
   gradient_checkpointing: true
   num_workers: 4
-  lr: 1.0e-5
+  lr: 5.0e-5
   weight_decay: 0.0
-  num_train_epochs: 1
+  num_train_epochs: 3
   warmup_ratio: 0.03
   grad_clip: 1.0
   amp_dtype: bf16
   val_every: 200
   val_batch_size: 128
-  best_metric: val-core/f1_macro/overall
+  best_metric: val-core/map/overall
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,/orcd/scratch/orcd/010/alecz/mirl-qwen35/checkpoints/alignment_qwen35_canonical_siglip_orcd}
 
 wandb:

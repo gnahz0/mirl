@@ -26,7 +26,6 @@ data:
   # Batches contain one media kind and one data_source.
 
   max_video_frames: 8
-  # Images use at most 1024 merged tokens; videos retain Qwen's native budgets.
   max_image_tokens: 1024
 
 model:
@@ -43,7 +42,7 @@ train:
   resume_checkpoint: null
   # Repeat complete shuffled passes over low-resource signal sources. Values are
   # positive integers; omitted sources and all visual sources repeat once.
-  # Validation is always one-pass. These integer factors approximate alpha=0.25
+  # Validation is always one-pass. These factors approximate alpha=0.25
   # temperature sampling across the signal sources.
   signal_repeat_factors:
     smellnet_base: 45
@@ -55,16 +54,13 @@ train:
   num_workers: 4
   lr: 1.0e-5
   weight_decay: 0.0
-  # Optimizer steps are derived from the sampler and accumulation.
-  num_train_epochs: 1
+  num_train_epochs: 3
   warmup_ratio: 0.03
-  # val_every is measured in optimizer steps.
   grad_clip: 1.0
   amp_dtype: bf16
   val_every: 200
   val_batch_size: 256
-  # Tactile contributes its equal-task structured F1 to the equal-family score.
-  best_metric: val-core/f1_macro/overall
+  best_metric: val-core/map/overall
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_canonical_siglip}
 
 wandb:

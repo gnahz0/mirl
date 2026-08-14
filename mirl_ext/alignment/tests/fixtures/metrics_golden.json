@@ -2,7 +2,6 @@
  "golden": {
   "ecg": {
    "accuracy": 0.1875,
-   "f1_macro": 0.1494949494949495,
    "map": 0.4142857175320387,
    "recall_at_1": 0.1875,
    "recall_at_5": 0.6875
@@ -10,7 +9,6 @@
   "ecg_rows": [
    {
     "class_id": 0,
-    "f1": 0.36363636363636365,
     "label": "normal",
     "precision": 0.5,
     "predicted": 8.0,
@@ -20,7 +18,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.0,
     "label": "af",
     "precision": 0.0,
     "predicted": 3.0,
@@ -30,7 +27,6 @@
    },
    {
     "class_id": 2,
-    "f1": 0.0,
     "label": "lbbb",
     "precision": 0.0,
     "predicted": 3.0,
@@ -40,7 +36,6 @@
    },
    {
     "class_id": 3,
-    "f1": 0.3333333333333333,
     "label": "rbbb",
     "precision": 0.5,
     "predicted": 2.0,
@@ -50,7 +45,6 @@
    },
    {
     "class_id": 4,
-    "f1": 0.2,
     "label": "pvc",
     "precision": 0.14285714285714285,
     "predicted": 7.0,
@@ -60,7 +54,6 @@
    },
    {
     "class_id": 5,
-    "f1": 0.0,
     "label": "pac",
     "precision": 0.0,
     "predicted": 3.0,
@@ -70,7 +63,6 @@
    },
    {
     "class_id": 6,
-    "f1": 0.0,
     "label": "st",
     "precision": 0.0,
     "predicted": 6.0,
@@ -85,11 +77,6 @@
    "val-aux/accuracy/tactile/grip_stability": 0.8,
    "val-aux/accuracy/tactile/highest_pressure": 0.06666666666666667,
    "val-aux/accuracy/tactile/initial_fingers": 0.3125,
-   "val-aux/f1_macro/tactile/contact_feature": 0.1125,
-   "val-aux/f1_macro/tactile/force_level": 0.46785714285714286,
-   "val-aux/f1_macro/tactile/grip_stability": 0.7963800904977376,
-   "val-aux/f1_macro/tactile/highest_pressure": 0.17777777777777776,
-   "val-aux/f1_macro/tactile/initial_fingers": 0.19444444444444445,
    "val-aux/loss/distill": 0.1,
    "val-aux/loss/siglip": 0.15,
    "val-aux/map/tactile/contact_feature": 0.3334127008914948,
@@ -119,10 +106,6 @@
    "val-core/accuracy/overall": 0.1811111111111111,
    "val-core/accuracy/smellnet": 0.0,
    "val-core/accuracy/tactile": 0.35583333333333333,
-   "val-core/f1_macro/ecg": 0.1494949494949495,
-   "val-core/f1_macro/overall": 0.16642894687012333,
-   "val-core/f1_macro/smellnet": 0.0,
-   "val-core/f1_macro/tactile": 0.34979189111542053,
    "val-core/loss/aggregate": 0.25,
    "val-core/loss/ecg": 0.16,
    "val-core/map/ecg": 0.4142857175320387,
@@ -148,15 +131,6 @@
    "accuracy/ts_ecg": 0.1875,
    "accuracy/ts_smellnet": 0.0,
    "accuracy/ts_tactile": 0.35583333333333333,
-   "f1_macro/overall": 0.16642894687012333,
-   "f1_macro/task/contact_feature": 0.1125,
-   "f1_macro/task/force_level": 0.46785714285714286,
-   "f1_macro/task/grip_stability": 0.7963800904977376,
-   "f1_macro/task/highest_pressure": 0.17777777777777776,
-   "f1_macro/task/initial_fingers": 0.19444444444444445,
-   "f1_macro/ts_ecg": 0.1494949494949495,
-   "f1_macro/ts_smellnet": 0.0,
-   "f1_macro/ts_tactile": 0.34979189111542053,
    "map/overall": 0.3488107467142658,
    "map/task/contact_feature": 0.3334127008914948,
    "map/task/force_level": 0.6888888895511627,
@@ -191,7 +165,6 @@
   ],
   "smellnet": {
    "accuracy": 0.0,
-   "f1_macro": 0.0,
    "map": 0.08037370218274494,
    "recall_at_1": 0.0,
    "recall_at_5": 0.125
@@ -199,7 +172,6 @@
   "smellnet_rows": [
    {
     "class_id": 0,
-    "f1": 0.0,
     "label": "smell_00",
     "precision": 0.0,
     "predicted": 0.0,
@@ -209,7 +181,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.0,
     "label": "smell_01",
     "precision": 0.0,
     "predicted": 0.0,
@@ -219,7 +190,6 @@
    },
    {
     "class_id": 2,
-    "f1": 0.0,
     "label": "smell_02",
     "precision": 0.0,
     "predicted": 0.0,
@@ -229,7 +199,6 @@
    },
    {
     "class_id": 3,
-    "f1": 0.0,
     "label": "smell_03",
     "precision": 0.0,
     "predicted": 0.0,
@@ -239,7 +208,6 @@
    },
    {
     "class_id": 4,
-    "f1": 0.0,
     "label": "smell_04",
     "precision": 0.0,
     "predicted": 0.0,
@@ -249,7 +217,6 @@
    },
    {
     "class_id": 5,
-    "f1": 0.0,
     "label": "smell_05",
     "precision": 0.0,
     "predicted": 0.0,
@@ -259,7 +226,6 @@
    },
    {
     "class_id": 6,
-    "f1": 0.0,
     "label": "smell_06",
     "precision": 0.0,
     "predicted": 0.0,
@@ -269,7 +235,6 @@
    },
    {
     "class_id": 7,
-    "f1": 0.0,
     "label": "smell_07",
     "precision": 0.0,
     "predicted": 0.0,
@@ -279,7 +244,6 @@
    },
    {
     "class_id": 8,
-    "f1": 0.0,
     "label": "smell_08",
     "precision": 0.0,
     "predicted": 0.0,
@@ -289,7 +253,6 @@
    },
    {
     "class_id": 9,
-    "f1": 0.0,
     "label": "smell_09",
     "precision": 0.0,
     "predicted": 1.0,
@@ -299,7 +262,6 @@
    },
    {
     "class_id": 10,
-    "f1": 0.0,
     "label": "smell_10",
     "precision": 0.0,
     "predicted": 0.0,
@@ -309,7 +271,6 @@
    },
    {
     "class_id": 11,
-    "f1": 0.0,
     "label": "smell_11",
     "precision": 0.0,
     "predicted": 3.0,
@@ -319,7 +280,6 @@
    },
    {
     "class_id": 12,
-    "f1": 0.0,
     "label": "smell_12",
     "precision": 0.0,
     "predicted": 0.0,
@@ -329,7 +289,6 @@
    },
    {
     "class_id": 13,
-    "f1": 0.0,
     "label": "smell_13",
     "precision": 0.0,
     "predicted": 0.0,
@@ -339,7 +298,6 @@
    },
    {
     "class_id": 14,
-    "f1": 0.0,
     "label": "smell_14",
     "precision": 0.0,
     "predicted": 1.0,
@@ -349,7 +307,6 @@
    },
    {
     "class_id": 15,
-    "f1": 0.0,
     "label": "smell_15",
     "precision": 0.0,
     "predicted": 0.0,
@@ -359,7 +316,6 @@
    },
    {
     "class_id": 16,
-    "f1": 0.0,
     "label": "smell_16",
     "precision": 0.0,
     "predicted": 1.0,
@@ -369,7 +325,6 @@
    },
    {
     "class_id": 17,
-    "f1": 0.0,
     "label": "smell_17",
     "precision": 0.0,
     "predicted": 0.0,
@@ -379,7 +334,6 @@
    },
    {
     "class_id": 18,
-    "f1": 0.0,
     "label": "smell_18",
     "precision": 0.0,
     "predicted": 1.0,
@@ -389,7 +343,6 @@
    },
    {
     "class_id": 19,
-    "f1": 0.0,
     "label": "smell_19",
     "precision": 0.0,
     "predicted": 2.0,
@@ -399,7 +352,6 @@
    },
    {
     "class_id": 20,
-    "f1": 0.0,
     "label": "smell_20",
     "precision": 0.0,
     "predicted": 3.0,
@@ -409,7 +361,6 @@
    },
    {
     "class_id": 21,
-    "f1": 0.0,
     "label": "smell_21",
     "precision": 0.0,
     "predicted": 1.0,
@@ -419,7 +370,6 @@
    },
    {
     "class_id": 22,
-    "f1": 0.0,
     "label": "smell_22",
     "precision": 0.0,
     "predicted": 1.0,
@@ -429,7 +379,6 @@
    },
    {
     "class_id": 23,
-    "f1": 0.0,
     "label": "smell_23",
     "precision": 0.0,
     "predicted": 0.0,
@@ -439,7 +388,6 @@
    },
    {
     "class_id": 24,
-    "f1": 0.0,
     "label": "smell_24",
     "precision": 0.0,
     "predicted": 0.0,
@@ -449,7 +397,6 @@
    },
    {
     "class_id": 25,
-    "f1": 0.0,
     "label": "smell_25",
     "precision": 0.0,
     "predicted": 0.0,
@@ -459,7 +406,6 @@
    },
    {
     "class_id": 26,
-    "f1": 0.0,
     "label": "smell_26",
     "precision": 0.0,
     "predicted": 1.0,
@@ -469,7 +415,6 @@
    },
    {
     "class_id": 27,
-    "f1": 0.0,
     "label": "smell_27",
     "precision": 0.0,
     "predicted": 1.0,
@@ -479,7 +424,6 @@
    },
    {
     "class_id": 28,
-    "f1": 0.0,
     "label": "smell_28",
     "precision": 0.0,
     "predicted": 0.0,
@@ -489,7 +433,6 @@
    },
    {
     "class_id": 29,
-    "f1": 0.0,
     "label": "smell_29",
     "precision": 0.0,
     "predicted": 1.0,
@@ -499,7 +442,6 @@
    },
    {
     "class_id": 30,
-    "f1": 0.0,
     "label": "smell_30",
     "precision": 0.0,
     "predicted": 0.0,
@@ -509,7 +451,6 @@
    },
    {
     "class_id": 31,
-    "f1": 0.0,
     "label": "smell_31",
     "precision": 0.0,
     "predicted": 1.0,
@@ -519,7 +460,6 @@
    },
    {
     "class_id": 32,
-    "f1": 0.0,
     "label": "smell_32",
     "precision": 0.0,
     "predicted": 0.0,
@@ -529,7 +469,6 @@
    },
    {
     "class_id": 33,
-    "f1": 0.0,
     "label": "smell_33",
     "precision": 0.0,
     "predicted": 0.0,
@@ -539,7 +478,6 @@
    },
    {
     "class_id": 34,
-    "f1": 0.0,
     "label": "smell_34",
     "precision": 0.0,
     "predicted": 1.0,
@@ -549,7 +487,6 @@
    },
    {
     "class_id": 35,
-    "f1": 0.0,
     "label": "smell_35",
     "precision": 0.0,
     "predicted": 1.0,
@@ -559,7 +496,6 @@
    },
    {
     "class_id": 36,
-    "f1": 0.0,
     "label": "smell_36",
     "precision": 0.0,
     "predicted": 0.0,
@@ -569,7 +505,6 @@
    },
    {
     "class_id": 37,
-    "f1": 0.0,
     "label": "smell_37",
     "precision": 0.0,
     "predicted": 0.0,
@@ -579,7 +514,6 @@
    },
    {
     "class_id": 38,
-    "f1": 0.0,
     "label": "smell_38",
     "precision": 0.0,
     "predicted": 0.0,
@@ -589,7 +523,6 @@
    },
    {
     "class_id": 39,
-    "f1": 0.0,
     "label": "smell_39",
     "precision": 0.0,
     "predicted": 0.0,
@@ -599,7 +532,6 @@
    },
    {
     "class_id": 40,
-    "f1": 0.0,
     "label": "smell_40",
     "precision": 0.0,
     "predicted": 1.0,
@@ -609,7 +541,6 @@
    },
    {
     "class_id": 41,
-    "f1": 0.0,
     "label": "smell_41",
     "precision": 0.0,
     "predicted": 1.0,
@@ -619,7 +550,6 @@
    },
    {
     "class_id": 42,
-    "f1": 0.0,
     "label": "smell_42",
     "precision": 0.0,
     "predicted": 0.0,
@@ -629,7 +559,6 @@
    },
    {
     "class_id": 43,
-    "f1": 0.0,
     "label": "smell_43",
     "precision": 0.0,
     "predicted": 0.0,
@@ -639,7 +568,6 @@
    },
    {
     "class_id": 44,
-    "f1": 0.0,
     "label": "smell_44",
     "precision": 0.0,
     "predicted": 0.0,
@@ -649,7 +577,6 @@
    },
    {
     "class_id": 45,
-    "f1": 0.0,
     "label": "smell_45",
     "precision": 0.0,
     "predicted": 0.0,
@@ -659,7 +586,6 @@
    },
    {
     "class_id": 46,
-    "f1": 0.0,
     "label": "smell_46",
     "precision": 0.0,
     "predicted": 0.0,
@@ -669,7 +595,6 @@
    },
    {
     "class_id": 47,
-    "f1": 0.0,
     "label": "smell_47",
     "precision": 0.0,
     "predicted": 2.0,
@@ -679,7 +604,6 @@
    },
    {
     "class_id": 48,
-    "f1": 0.0,
     "label": "smell_48",
     "precision": 0.0,
     "predicted": 0.0,
@@ -689,7 +613,6 @@
    },
    {
     "class_id": 49,
-    "f1": 0.0,
     "label": "smell_49",
     "precision": 0.0,
     "predicted": 0.0,
@@ -705,12 +628,6 @@
    "accuracy/task/highest_pressure": 0.06666666666666667,
    "accuracy/task/initial_fingers": 0.3125,
    "accuracy/ts_tactile": 0.35583333333333333,
-   "f1_macro/task/contact_feature": 0.1125,
-   "f1_macro/task/force_level": 0.46785714285714286,
-   "f1_macro/task/grip_stability": 0.7963800904977376,
-   "f1_macro/task/highest_pressure": 0.17777777777777776,
-   "f1_macro/task/initial_fingers": 0.19444444444444445,
-   "f1_macro/ts_tactile": 0.34979189111542053,
    "map/task/contact_feature": 0.3334127008914948,
    "map/task/force_level": 0.6888888895511627,
    "map/task/grip_stability": 0.9,
@@ -733,7 +650,6 @@
   "tactile_rows": [
    {
     "class_id": 0,
-    "f1": 0.3333333333333333,
     "label": "tactile_00",
     "precision": 0.3333333333333333,
     "predicted": 3.0,
@@ -744,7 +660,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.0,
     "label": "tactile_01",
     "precision": 0.0,
     "predicted": 2.0,
@@ -755,7 +670,6 @@
    },
    {
     "class_id": 2,
-    "f1": 0.5,
     "label": "tactile_02",
     "precision": 1.0,
     "predicted": 1.0,
@@ -766,7 +680,6 @@
    },
    {
     "class_id": 3,
-    "f1": 0.0,
     "label": "tactile_03",
     "precision": 0.0,
     "predicted": 3.0,
@@ -777,7 +690,6 @@
    },
    {
     "class_id": 4,
-    "f1": 0.0,
     "label": "tactile_04",
     "precision": 0.0,
     "predicted": 1.0,
@@ -788,7 +700,6 @@
    },
    {
     "class_id": 5,
-    "f1": 0.33333333333333337,
     "label": "tactile_05",
     "precision": 1.0,
     "predicted": 1.0,
@@ -799,7 +710,6 @@
    },
    {
     "class_id": 0,
-    "f1": 0.0,
     "label": "tactile_06",
     "precision": 0.0,
     "predicted": 3.0,
@@ -810,7 +720,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.6666666666666666,
     "label": "tactile_07",
     "precision": 0.6666666666666666,
     "predicted": 3.0,
@@ -821,7 +730,6 @@
    },
    {
     "class_id": 2,
-    "f1": 0.0,
     "label": "tactile_08",
     "precision": 0.0,
     "predicted": 3.0,
@@ -832,7 +740,6 @@
    },
    {
     "class_id": 3,
-    "f1": 0.0,
     "label": "tactile_09",
     "precision": 0.0,
     "predicted": 5.0,
@@ -843,7 +750,6 @@
    },
    {
     "class_id": 4,
-    "f1": 0.0,
     "label": "tactile_10",
     "precision": 0.0,
     "predicted": 6.0,
@@ -854,7 +760,6 @@
    },
    {
     "class_id": 5,
-    "f1": 0.22222222222222224,
     "label": "tactile_11",
     "precision": 0.25,
     "predicted": 4.0,
@@ -865,7 +770,6 @@
    },
    {
     "class_id": 0,
-    "f1": 0.4,
     "label": "tactile_12",
     "precision": 0.25,
     "predicted": 4.0,
@@ -876,7 +780,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.5,
     "label": "tactile_13",
     "precision": 0.5,
     "predicted": 4.0,
@@ -887,7 +790,6 @@
    },
    {
     "class_id": 2,
-    "f1": 0.5714285714285715,
     "label": "tactile_14",
     "precision": 0.6666666666666666,
     "predicted": 3.0,
@@ -898,7 +800,6 @@
    },
    {
     "class_id": 3,
-    "f1": 0.4,
     "label": "tactile_15",
     "precision": 0.5,
     "predicted": 4.0,
@@ -909,7 +810,6 @@
    },
    {
     "class_id": 0,
-    "f1": 0.7692307692307692,
     "label": "tactile_16",
     "precision": 0.8333333333333334,
     "predicted": 6.0,
@@ -920,7 +820,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.823529411764706,
     "label": "tactile_17",
     "precision": 0.7777777777777778,
     "predicted": 9.0,
@@ -931,7 +830,6 @@
    },
    {
     "class_id": 0,
-    "f1": 0.5,
     "label": "tactile_18",
     "precision": 1.0,
     "predicted": 1.0,
@@ -942,7 +840,6 @@
    },
    {
     "class_id": 1,
-    "f1": 0.4,
     "label": "tactile_19",
     "precision": 1.0,
     "predicted": 1.0,
@@ -953,7 +850,6 @@
    },
    {
     "class_id": 2,
-    "f1": 0.0,
     "label": "tactile_20",
     "precision": 0.0,
     "predicted": 2.0,
@@ -964,7 +860,6 @@
    },
    {
     "class_id": 3,
-    "f1": 0.0,
     "label": "tactile_21",
     "precision": 0.0,
     "predicted": 4.0,
@@ -975,7 +870,6 @@
    },
    {
     "class_id": 4,
-    "f1": 0.0,
     "label": "tactile_22",
     "precision": 0.0,
     "predicted": 2.0,
@@ -986,7 +880,6 @@
    },
    {
     "class_id": 5,
-    "f1": 0.0,
     "label": "tactile_23",
     "precision": 0.0,
     "predicted": 2.0,
@@ -997,7 +890,6 @@
    },
    {
     "class_id": 6,
-    "f1": 0.0,
     "label": "tactile_24",
     "precision": 0.0,
     "predicted": 2.0,
@@ -1008,7 +900,6 @@
    },
    {
     "class_id": 7,
-    "f1": 0.0,
     "label": "tactile_25",
     "precision": 0.0,
     "predicted": 1.0,

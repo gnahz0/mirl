@@ -1,20 +1,11 @@
 """Reward scoring for ECG pathology classification (PTB-XL superclasses).
 
-The prompt asks the model to answer with one of a fixed set of categories
-(e.g. "Normal", "Myocardial Infarction", "Atrial fibrillation/atrial flutter").
+The prompt asks for one of a fixed set of categories.
 
 Training reward = acc_weight * acc + sim_weight * jaccard + format_weight * format
 
-The format term is NOT cosmetic here: ECG was the only task run with
-format_weight=0.0, and the only one that collapsed to a constant majority-class
-answer ("Normal" for 100% of samples by step 150). Under GRPO, advantages are
-standardized within each prompt's rollout group (A_i = (r_i - mean)/std), and
-every rollout of one ECG prompt shares the same label -- so a reward that lets a
-bare one-token "Normal" earn full credit lets the policy shrink to a single token
-with zero intra-group diversity => std 0 => advantage 0 => no gradient to escape.
-Forcing <think> reasoning via the format term restores rollout diversity. (Per-class
-reward *weighting* would NOT help -- anything constant within a group cancels in
-the std normalization.)
+format_weight must stay > 0: at 0.0 ECG collapsed to a constant majority-class
+answer, and identical rollouts zero GRPO's within-group std and hence the gradient.
 """
 
 import re
