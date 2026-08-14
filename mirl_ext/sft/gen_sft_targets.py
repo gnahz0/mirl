@@ -30,10 +30,9 @@ from mirl_ext.rewards._common import extract_boxed_answer, format_reward  # noqa
 
 BASE_URL = "http://point.dd.works:18890/v1"
 
-# Single model by default = one provenance per corpus; retries re-try the SAME
-# model. --model-ladder opts into fallback. (gpt-5.3-chat is dead, 404.)
+# One model = one provenance per corpus; retries re-try the same model.
+# TRAPI needs the full dated deployment id (bare "gpt-5.6-sol" 404s).
 DEFAULT_MODEL = "gpt-5.6-sol_2026-07-09"
-FALLBACK_MODELS = ["gpt-5.5_2026-04-24", "gpt-5.1_2025-11-13"]
 
 KEY_PATHS = [
     Path.home() / ".config/mirl/microsoft_openai_key",
@@ -267,7 +266,7 @@ def validate(text: str, ground_truth: str) -> tuple[bool, str]:
 
 
 def generate_one(client, task: dict, args, stats: dict) -> dict | None:
-    """One task -> one validated completion, or None. Retries across the ladder."""
+    """One task -> one validated completion, or None."""
     # Deterministic per task (rng keyed seed::uid) -- build once, retry many.
     content, used_image = build_user_content(
         task, args.image_root, args.grounded, blind=args.blind
@@ -282,12 +281,10 @@ def generate_one(client, task: dict, args, stats: dict) -> dict | None:
     )
 
     last_reason = "unattempted"
-    ladder = args.ladder
     for attempt in range(args.max_attempts):
-        model = ladder[min(attempt, len(ladder) - 1)]
         try:
             resp = client.chat.completions.create(
-                model=model,
+                model=args.model,
                 messages=[{"role": "system", "content": system}]
                 + demo_turns
                 + [{"role": "user", "content": content}],
@@ -308,7 +305,7 @@ def generate_one(client, task: dict, args, stats: dict) -> dict | None:
             "row_index": task["row_index"],
             "data_source": task.get("data_source"),
             "ground_truth": task["ground_truth"],
-            "model": model,
+            "model": args.model,
             "attempts": attempt + 1,
             "grounded": used_image,
             "response": text,
@@ -389,11 +386,6 @@ def main() -> None:
         default=None,
         help="local dir holding <family>/<hash>.png when plots were staged off-cluster",
     )
-    ap.add_argument(
-        "--model-ladder",
-        action="store_true",
-        help="on retry, fall back to older models (mixes provenance; off by default)",
-    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--no-shuffle",
@@ -403,7 +395,6 @@ def main() -> None:
     )
     ap.add_argument("--dry-run", action="store_true", help="one call, print result, exit")
     args = ap.parse_args()
-    args.ladder = [args.model] + (FALLBACK_MODELS if args.model_ladder else [])
 
     all_tasks = [
         json.loads(line) for line in Path(args.tasks).read_text().splitlines() if line.strip()
