@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Stage-1 CUDA runtime, data/model construction, and checkpoints."""
 
 from __future__ import annotations

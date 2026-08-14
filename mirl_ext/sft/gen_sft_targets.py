@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Answer-conditioned (STaR-style) SFT targets + shared API-client helpers.
 
 GPT is given the question AND the correct answer and writes `<think>…</think>

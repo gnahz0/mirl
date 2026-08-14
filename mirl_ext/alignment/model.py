@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Qwen3.5 vision alignment model with a frozen SigLIP2 text tower."""
 
 from __future__ import annotations

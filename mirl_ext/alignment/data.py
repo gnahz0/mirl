@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Lazy media and native-signal loading for Stage-1 alignment."""
 
 from __future__ import annotations

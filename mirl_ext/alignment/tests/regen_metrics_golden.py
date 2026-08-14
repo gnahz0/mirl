@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Record the metric surface produced by the PRE-REFACTOR implementation.
 
 Ran once against the working tree as it stood before the 2026-08-09 metrics

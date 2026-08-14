@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Stage task media for off-cluster trace generation.
 
 Copies each task's image next to the task file and extracts N evenly-spaced

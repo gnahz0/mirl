@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Sensor-to-text ranking metrics and their single distributed reduction."""
 
 from __future__ import annotations

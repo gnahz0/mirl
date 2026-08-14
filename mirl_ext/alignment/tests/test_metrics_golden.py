@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Guard the metric surface established by the 2026-08-09 rewrite.
 
 ``fixtures/metrics_golden.json`` was produced by ``regen_metrics_golden.py`` run

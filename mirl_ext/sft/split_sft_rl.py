@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Split each MIRL family 50:50 into an SFT half and an RL half.
 
 GRPO must never be rewarded on something SFT already memorized, and several

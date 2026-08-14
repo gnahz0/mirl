@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Train Qwen3.5's vision encoder against SigLIP2 text-label banks."""
 
 from __future__ import annotations

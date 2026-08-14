@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Few-shot prediction episodes: SmellNet SFT traces the teacher must EARN.
 
 The teacher is never given the answer: each episode shows N candidate classes

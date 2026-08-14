@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Export a split half to a compact task JSONL for trace generation.
 
 Runs on the cluster (where the parquets live); the JSONL is small enough to copy

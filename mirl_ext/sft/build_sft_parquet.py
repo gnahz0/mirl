@@ -1,4 +1,3 @@
-# Copyright 2026 Alec Zhang. Licensed under the Apache License, Version 2.0.
 """Join validated traces back to their rows and emit veRL SFT parquet.
 
 The user turn is the SFT half's prompt VERBATIM (placeholder and all): GRPO will
