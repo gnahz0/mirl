@@ -90,9 +90,11 @@ SYSTEM_PROMPT = (
     "The provided images show time-series readings from multiple gas sensors "
     "(each subplot is a different sensor channel: NO2, C2H5OH, VOC, CO, "
     "Alcohol, LPG).\n\n"
-    "You will be shown, for several candidate substances, a few LABELLED "
-    "recordings each, followed by one UNLABELLED recording. Decide which "
-    "candidate substance the unlabelled recording shows. What distinguishes "
+    "You will be shown, for several candidate substances, a short substance "
+    "profile and a few LABELLED recordings each, followed by one UNLABELLED "
+    "recording. Decide which candidate substance the unlabelled recording "
+    "shows. Treat the profiles as your own background knowledge -- never cite "
+    "them as provided text. What distinguishes "
     "substances is the JOINT pattern across channels -- relative rise rates, "
     "plateau levels, which channels respond and in what order, response shape "
     "-- not absolute values, since baselines drift between sessions.\n\n"
@@ -226,8 +228,9 @@ def resample_episode(ep, args, attempt) -> dict:
     return make_episode(task, hard, rand, args.pool_by_class, args.shots, rng)
 
 
-def build_episode_content(ep) -> list[dict]:
-    """One interleaved user turn: per-class labelled blocks, then the query."""
+def build_episode_content(ep, descriptions=None) -> list[dict]:
+    """One interleaved user turn: per-class blocks (profile + labelled plots),
+    then the query."""
     parts = [{
         "type": "text",
         "text": (
@@ -237,10 +240,10 @@ def build_episode_content(ep) -> list[dict]:
     }]
     for cls in ep["order"]:
         rows = ep["supports"][cls]
-        parts.append({
-            "type": "text",
-            "text": f"=== Substance: {cls} — {len(rows)} labelled recordings ===",
-        })
+        header = f"=== Substance: {cls} — {len(rows)} labelled recordings ==="
+        if descriptions and cls in descriptions:
+            header += f"\nProfile: {descriptions[cls]}"
+        parts.append({"type": "text", "text": header})
         parts.extend(_img(r["resolved_image"]) for r in rows)
     parts.append({"type": "text", "text": "=== UNLABELLED RECORDING ==="})
     parts.append(_img(ep["task"]["resolved_image"]))
@@ -278,7 +281,7 @@ def generate_one(client, ep0: dict, args, stats: dict) -> dict | None:
                 model=args.model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": build_episode_content(ep)},
+                    {"role": "user", "content": build_episode_content(ep, args.descriptions_map)},
                 ],
                 # These deployments reject `max_tokens`.
                 max_completion_tokens=args.max_completion_tokens,
@@ -313,6 +316,7 @@ def generate_one(client, ep0: dict, args, stats: dict) -> dict | None:
                 "n_shot": args.shots,
                 "n_way": args.n_way,
                 "resampled": attempt >= 2,
+                "descriptions": bool(args.descriptions_map),
                 "seed": args.seed,
             }
         last_reason = reason
@@ -333,7 +337,7 @@ def dry_run(client, ep, args) -> None:
     for cls in ep["order"]:
         print(f"  {cls}: {[Path(r['image_path']).name for r in ep['supports'][cls]]}")
     print("\n---- prompt layout ----")
-    for part in build_episode_content(ep):
+    for part in build_episode_content(ep, args.descriptions_map):
         if part["type"] == "text":
             print(part["text"])
         else:
@@ -403,6 +407,11 @@ def main() -> None:
     ap.add_argument("--max-attempts", type=int, default=4)
     ap.add_argument("--max-completion-tokens", type=int, default=2048)
     ap.add_argument("--request-timeout", type=float, default=180.0)
+    ap.add_argument(
+        "--descriptions", type=Path, default=Path("data/sft/meta/text_description.json"),
+        help="upstream SmellNet per-substance profiles, shown per candidate; "
+        "missing file or --descriptions '' disables",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dry-run", action="store_true", help="one episode: layout + call + verdict")
     args = ap.parse_args()
@@ -411,6 +420,13 @@ def main() -> None:
         raise SystemExit("--hard-negatives must be < --n-way")
     if args.n_way * args.shots + 1 > 50:
         raise SystemExit("n_way*shots+1 exceeds the endpoint's 50-image cap")
+
+    args.descriptions_map = {}
+    if str(args.descriptions) and args.descriptions.is_file():
+        args.descriptions_map = json.loads(args.descriptions.read_text())
+        print(f"substance profiles: {len(args.descriptions_map)} loaded")
+    else:
+        print("substance profiles: none (file missing or disabled)")
 
     queries = load_tasks(args.tasks, args.image_root)
     supports = load_tasks(args.support_tasks, args.image_root)
