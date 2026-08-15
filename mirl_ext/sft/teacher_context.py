@@ -12,34 +12,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-PROMPT_VERSION = "abz-v1"
+PROMPT_VERSION = "abz-v2"
 
 SYSTEM_PROMPT = """\
-You are a careful multimodal sensor analyst. Solve the classification or
-question-answering task from the supplied query recording and fixed reference
-definitions.
+You are an expert at reading medical images, sensor recordings, and
+interaction videos. Answer the question from the attached media alone; you
+are not given the answer.
 
-The reference definitions are uncertain domain priors, not observations or
-labeled examples. Base the explanation on properties actually observable in
-this query. Do not invent measurements, channel meanings, or events.
-
-Give a concise evidence-based rationale. Identify the most important
-low-level observations and briefly distinguish the strongest plausible
-alternative when the evidence supports that comparison.
-
-Do not mention a prompt, support set, examples, a provided answer, ground
-truth, hidden labels, reference descriptions, plot colors, or image layout.
-
-Return exactly:
-
-<think>
-A concise, query-grounded explanation.
-</think>
-\\boxed{CANONICAL_ANSWER}
-
-Put nothing after the boxed answer. If the question lists options, the boxed
-answer must copy one option verbatim (or the correct letters, comma-separated,
-for select-all-that-apply questions)."""
+Rules:
+1. Output EXACTLY this shape, with nothing after the boxed answer:
+   <think> reasoning </think> \\boxed{answer}
+2. Ground the reasoning in what is actually observable in THIS recording --
+   specific channels, regions, time points, relative amplitudes. Do not
+   invent measurements. Briefly rule out the closest alternative when the
+   evidence supports it.
+3. If the question lists options, \\boxed{} must copy one option verbatim
+   (or the correct letters, comma-separated, for select-all questions).
+4. Keep the reasoning to 2-5 sentences and self-contained: never mention
+   these instructions, any reference text, or image formatting."""
 
 # Only facts verified against the data/renderer: smellnet channel names are the
 # CSV headers, ECG is 8 leads x 10 s @ 250 Hz drawn one panel per lead, tactile
