@@ -274,6 +274,7 @@ def generate_one(client, ep0: dict, args, stats: dict) -> dict | None:
     2+ resample negatives (a systematic confusion won't fix by re-rolling)."""
     task, y = ep0["task"], ep0["y"]
     last_reason = "unattempted"
+    wrong_guesses: list[str] = []
     for attempt in range(args.max_attempts):
         ep = ep0 if attempt < 2 else resample_episode(ep0, args, attempt)
         try:
@@ -316,11 +317,13 @@ def generate_one(client, ep0: dict, args, stats: dict) -> dict | None:
                 "n_shot": args.shots,
                 "n_way": args.n_way,
                 "resampled": attempt >= 2,
+                "wrong_guesses": wrong_guesses,
                 "descriptions": bool(args.descriptions_map),
                 "seed": args.seed,
             }
         last_reason = reason
         if predicted is not None:
+            wrong_guesses.append(predicted)
             with _print_lock:
                 stats["confusion"][(y, predicted)] += 1
 
