@@ -156,7 +156,6 @@ class TeacherTask:
     prompt: str
     image_paths: tuple[str, ...]
     frame_paths: tuple[str, ...]
-    label_space: tuple[str, ...]
     staging_version: str | None
 
     @classmethod
@@ -168,7 +167,6 @@ class TeacherTask:
             prompt=t["prompt"],
             image_paths=tuple(t.get("image_paths") or []),
             frame_paths=tuple(t.get("frame_paths") or []),
-            label_space=tuple(t.get("label_space") or []),
             staging_version=t.get("staging_version"),
         )
 
@@ -178,15 +176,13 @@ class MediaMissing(Exception):
 
 
 def build_request(task: TeacherTask, image_root, descriptions) -> tuple[list[dict], int]:
-    """(chat messages, media count). Order: context, label set, question, media."""
-    blocks = [teacher_context.family_context(task.family, descriptions)]
-    if task.label_space:  # only exported when the prompt itself lists no options
-        blocks.append(
-            "Valid answers (copy one exactly):\n" + "\n".join(task.label_space)
-        )
+    """(chat messages, media count). Order: family context, question, media."""
     question = re.sub(r"<(image|video|audio)>", "", task.prompt).strip()
-    blocks.append(f"QUESTION:\n{question}")
-    content: list[dict] = [{"type": "text", "text": "\n\n".join(blocks)}]
+    content: list[dict] = [{
+        "type": "text",
+        "text": f"{teacher_context.family_context(task.family, descriptions)}"
+        f"\n\nQUESTION:\n{question}",
+    }]
 
     media = task.frame_paths or task.image_paths  # frames staged oldest -> newest
     for raw in media:
@@ -238,9 +234,7 @@ def validate(text: str, ground_truth: str, task: TeacherTask) -> tuple[bool, str
     else:
         correct = combined.compute_score(task.data_source, text, ground_truth)["acc"] == 1.0
     if not correct:
-        space = {_norm(s) for s in task.label_space}
-        reason = "wrong" if not space or predicted in space else "wrong_out_of_space"
-        return False, reason, predicted
+        return False, "wrong", predicted
     return True, "ok", predicted
 
 

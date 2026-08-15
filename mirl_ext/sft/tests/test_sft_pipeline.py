@@ -22,12 +22,10 @@ from mirl_ext.sft.build_sft_parquet import (  # noqa: E402
     sft_messages,
 )
 from mirl_ext.sft.export_sft_tasks import (  # noqa: E402
-    extract_choices,
+    OPEN_SOURCES,
     keep_row,
     prompt_messages,
     prompt_text,
-    source_styles,
-    stratified_sample,
 )
 from mirl_ext.sft.gen_sft_targets import (  # noqa: E402
     TeacherTask,
@@ -53,7 +51,6 @@ def _task(**kw) -> TeacherTask:
         prompt="<image>\nWhat is shown? Answer with one of the following:\nNo PE\nAcute PE",
         image_paths=(),
         frame_paths=(),
-        label_space=(),
         staging_version="v2",
     )
     base.update(kw)
@@ -86,13 +83,6 @@ def test_request_contains_no_demonstrations():
     assert messages[0]["content"] == teacher_context.SYSTEM_PROMPT
 
 
-def test_label_space_block_only_when_prompt_has_no_options():
-    with_space, _ = build_request(_task(label_space=("ptsd", "no ptsd")), None, None)
-    without, _ = build_request(_task(), None, None)
-    assert "Valid answers (copy one exactly)" in with_space[1]["content"][0]["text"]
-    assert "Valid answers" not in without[1]["content"][0]["text"]
-
-
 # ---- export helpers ----
 
 def test_prompt_flattening_keeps_all_turns():
@@ -109,52 +99,9 @@ def test_smellnet_mixture_and_gcms_rows_excluded():
     assert keep_row("climb_train", "ct")
 
 
-def test_extract_choices_formats():
-    assert extract_choices("Q? Answer with one of the following:\nNormal\nOther") == [
-        "Normal", "Other"]
-    assert extract_choices("Answer with one word from the following: a, b, c") == ["a", "b", "c"]
-    assert extract_choices("Pick.\nOptions:\nA. Thumb\nB. Palm") == ["A. Thumb", "B. Palm"]
-    assert extract_choices("Answer with one or more of the following:\nEdema\nAtelectasis") == [
-        "Edema", "Atelectasis"]
-    assert extract_choices("Describe the video in a few sentences.") == []
-
-
-def test_source_styles_closed_open_and_label_space():
-    rows = (
-        [{"data_source": "mcq", "prompt": [{"role": "user", "content": "Options:\nA. x\nB. y"}],
-          "reward_model": {"ground_truth": "A"}}]
-        + [{"data_source": "smallset", "prompt": [{"role": "user", "content": "Feeling?"}],
-            "reward_model": {"ground_truth": gt}} for gt in ("happy", "sad")]
-        + [{"data_source": "freetext", "prompt": [{"role": "user", "content": "Describe."}],
-            "reward_model": {"ground_truth": f"A long unique open answer number {i} " * 3}}
-           for i in range(80)]
-    )
-    styles = source_styles(rows)
-    assert styles["mcq"] == {"answer_style": "closed", "label_space": None}
-    assert styles["smallset"] == {"answer_style": "closed", "label_space": ["happy", "sad"]}
-    assert styles["freetext"]["answer_style"] == "open"
-
-
-def test_stratified_sample_deterministic_and_water_filled():
-    rows = [{"data_source": "a", "reward_model": {"ground_truth": f"c{i % 10}"}}
-            for i in range(100)] + [
-        {"data_source": "b", "reward_model": {"ground_truth": "rare"}}]
-    first, second = stratified_sample(rows, 20, 7), stratified_sample(rows, 20, 7)
-    assert first == second and len(first) == 20
-    assert 100 in first, "water-fill must keep the single rare-class row"
-
-
-def test_stratified_sample_spreads_across_sources_under_small_cap():
-    # Regression: 3 sources whose labels are all unique (singleton buckets);
-    # a small cap must still cover every source, not drain into the
-    # alphabetically-first one.
-    rows = [{"data_source": src, "reward_model": {"ground_truth": f"{src}-{i}"}}
-            for src in ("aaa", "bbb", "ccc") for i in range(50)]
-    picked = stratified_sample(rows, 30, 7)
-    counts = {}
-    for i in picked:
-        counts[rows[i]["data_source"]] = counts.get(rows[i]["data_source"], 0) + 1
-    assert counts == {"aaa": 10, "bbb": 10, "ccc": 10}, counts
+def test_open_sources_never_marked_gradable():
+    assert "haptic_tactile" in OPEN_SOURCES and "description" in OPEN_SOURCES
+    assert "initial_fingers" not in OPEN_SOURCES and "ecg" not in OPEN_SOURCES
 
 
 # ---- split ----
@@ -168,6 +115,14 @@ def test_split_groups_disjoint_and_locked_first():
     locked = {"g0": "rl", "g1": "rl"}
     relocked = assign_groups(groups, strata, seed=1, locked=locked)
     assert relocked["g0"] == relocked["g1"] == "rl"
+
+
+def test_split_ratio_targets_20_80():
+    groups = {f"g{i}": [i] for i in range(1000)}
+    strata = {gid: "s" for gid in groups}
+    assignment = assign_groups(groups, strata, seed=3, sft_frac=0.2)
+    n_sft = sum(1 for side in assignment.values() if side == "sft")
+    assert 180 <= n_sft <= 220, n_sft
 
 
 # ---- validation ----
@@ -205,8 +160,6 @@ def test_leakage_phrases_rejected():
 def test_wrong_answers_are_wrong_not_repaired():
     ok, reason, predicted = _v(GOOD_THINK + " \\boxed{Acute PE}")
     assert (ok, predicted) == (False, "acute pe") and reason == "wrong"
-    ok, reason, _ = _v(GOOD_THINK + " \\boxed{Banana}", task=_task(label_space=("No PE", "Acute PE")))
-    assert reason == "wrong_out_of_space"
 
 
 def test_ecg_gate_requires_verbatim_category():

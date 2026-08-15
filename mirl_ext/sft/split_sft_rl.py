@@ -1,10 +1,12 @@
-"""Split each MIRL family 50:50 into an SFT half and an RL half.
+"""Split each MIRL family into an SFT part and an RL part (default 20:80).
 
 GRPO must never be rewarded on something SFT already memorized, and several
 families ask many questions about one recording -- so the split unit is a GROUP
 (the underlying recording: shared 3DHaptic clip stem for tactile/haptic_ts,
 media path otherwise), never a row. Groups are shuffled deterministically and
-assigned greedily to the smaller half, stratified by (data_source, label).
+assigned greedily to whichever side is furthest below its target share,
+stratified by (data_source, label). SFT is the small side because every SFT
+row gets a teacher trace (gen_sft_targets.py generates for each row).
 Known limitation (recorded in the manifest): ECG has no patient ids, so
 patient-level leakage cannot be prevented from these indexes.
 
@@ -88,6 +90,7 @@ def assign_groups(
     strata: dict[str, str],
     seed: int,
     locked: dict[str, str] | None = None,
+    sft_frac: float = 0.2,
 ) -> dict[str, str]:
     """Greedy smallest-half-first per stratum over a seeded shuffle. ``locked``
     (assignments from an earlier family) is authoritative and consumed FIRST --
@@ -119,7 +122,9 @@ def assign_groups(
                 n_rl += len(groups[gid])
         for gid in free:
             size = len(groups[gid])
-            to_sft = n_sft < n_rl or (n_sft == n_rl and tie_to_sft)
+            # Fill whichever side is furthest below its target share.
+            sft_deficit, rl_deficit = n_sft * (1 - sft_frac), n_rl * sft_frac
+            to_sft = sft_deficit < rl_deficit or (sft_deficit == rl_deficit and tie_to_sft)
             if to_sft:
                 assignment[gid], n_sft = "sft", n_sft + size
             else:
@@ -133,6 +138,7 @@ def main() -> None:
     )
     ap.add_argument("--data-root", default=DATA_ROOT)
     ap.add_argument("--out-root", default=f"{DATA_ROOT}/split")
+    ap.add_argument("--sft-frac", type=float, default=0.2, help="target SFT share of rows")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--families",
@@ -161,6 +167,7 @@ def main() -> None:
     data_root, out_root = Path(args.data_root), Path(args.out_root)
     manifest: dict = {
         "seed": args.seed,
+        "sft_frac": args.sft_frac,
         "split_unit": "group (underlying recording), not row",
         "families": {},
         "known_limitations": [
@@ -198,7 +205,9 @@ def main() -> None:
     for family in order:
         mode = families[family]
         groups, strata = plans[family]
-        assignment = assign_groups(groups, strata, args.seed, locked=global_assignment)
+        assignment = assign_groups(
+            groups, strata, args.seed, locked=global_assignment, sft_frac=args.sft_frac
+        )
         global_assignment.update(assignment)
 
         idx = {"sft": [], "rl": []}

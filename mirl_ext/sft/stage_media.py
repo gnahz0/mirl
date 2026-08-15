@@ -90,16 +90,37 @@ def main() -> None:
     ap.add_argument("--max-side", type=int, default=0,
                     help="if >0, bound staged images to this long side (teacher copies "
                     "only; use when full-size images overflow the API payload limit)")
+    ap.add_argument("--workers", type=int, default=8, help="parallel video extractions")
     args = ap.parse_args()
 
     tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
     n_img = n_vid = n_miss = 0
+
+    # Many rows share one recording: extract each unique (video, n_frames) once.
+    from concurrent.futures import ProcessPoolExecutor
+
+    jobs: dict[tuple[str, int], Path] = {}
+    for task in tasks:
+        if task.get("video_path"):
+            n = int(task.get("max_frames") or args.frames)
+            jobs[(task["video_path"], n)] = args.out_root / task["family"]
+    for dest in set(jobs.values()):
+        dest.mkdir(parents=True, exist_ok=True)
+    frame_names: dict[tuple[str, int], list[str]] = {}
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futs = {
+            key: pool.submit(frames_from_video, Path(src), n, dest, _stem(src))
+            for (src, n), dest in jobs.items()
+            for key in [(src, n)]
+            if Path(src).is_file()
+        }
+        frame_names = {key: fut.result() for key, fut in futs.items()}
+
     for task in tasks:
         dest_dir = args.out_root / task["family"]
         dest_dir.mkdir(parents=True, exist_ok=True)
-        images = task.get("image_paths") or []
         staged_images = []
-        for raw in images:
+        for raw in task.get("image_paths") or []:
             p = Path(raw)
             if not p.is_file():
                 n_miss += 1
@@ -111,17 +132,13 @@ def main() -> None:
             task["image_paths"] = staged_images
             n_img += 1
         if task.get("video_path"):
-            p = Path(task["video_path"])
-            if not p.is_file():
-                n_miss += 1
+            n = int(task.get("max_frames") or args.frames)
+            names = frame_names.get((task["video_path"], n)) or []
+            if names:
+                task["frame_paths"] = [str(dest_dir / name) for name in names]
+                n_vid += 1
             else:
-                n = int(task.get("max_frames") or args.frames)
-                names = frames_from_video(p, n, dest_dir, _stem(str(p)))
-                if names:
-                    task["frame_paths"] = [str(dest_dir / n) for n in names]
-                    n_vid += 1
-                else:
-                    n_miss += 1
+                n_miss += 1
         task["staging_version"] = STAGING_VERSION
     staged = args.tasks.with_suffix(".staged.jsonl")
     staged.write_text("".join(json.dumps(t) + "\n" for t in tasks))
