@@ -182,6 +182,7 @@ def train(cfg: DictConfig) -> None:
     model = MultimodalAlignmentModel(
         qwen35_path=str(cfg.model.qwen35_path),
         siglip2_text_path=str(cfg.model.siglip2_text_path),
+        max_video_frames=int(cfg.data.max_video_frames),
     ).to(device)
     if cfg.train.gradient_checkpointing:
         model.trainable_visual.gradient_checkpointing_enable()

@@ -95,6 +95,11 @@ normalization stay disabled because sensor tiles are already normalized and
 aligned. Semantic boundaries must land on 32px (patch 16 × merger 2×2) so a
 merged token never spans two sensors/leads.
 
+**CLIMB INSPECT has an upstream axis-order issue.** Its converter treats axis
+0 as time although scan depth is last. The 12 `512×2` clips that cannot pass
+Qwen were repaired in place as two `512×512` frames; other CLIMB sources are
+unaffected.
+
 **Zero MAD falls back to the full standard deviation.** SmellNet quantization
 and sparse tactile traces can have `MAD=0` while `std>0`. In that case robust
 normalization uses `std`, not the usual `0.7 * MAD + 0.3 * std` blend; otherwise

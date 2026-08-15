@@ -18,13 +18,20 @@ class MultimodalAlignmentModel(nn.Module):
         self,
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
+        max_video_frames: int = 8,
     ):
         from transformers import AutoProcessor, AutoTokenizer, Siglip2TextModel
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
         super().__init__()
 
-        self.qwen_processor = AutoProcessor.from_pretrained(qwen35_path, local_files_only=True)
+        self.qwen_processor = AutoProcessor.from_pretrained(
+            qwen35_path,
+            local_files_only=True,
+            fps=None,
+            min_frames=1,
+            max_frames=max_video_frames,
+        )
         self.trainable_visual = Qwen3_5VisionModel.from_pretrained(
             qwen35_path,
             dtype=torch.bfloat16,
@@ -74,7 +81,6 @@ class MultimodalAlignmentModel(nn.Module):
         media: list,
         family: str | None,
         max_image_tokens: int,
-        max_video_frames: int,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -100,11 +106,7 @@ class MultimodalAlignmentModel(nn.Module):
             )
             pixel_key, grid_key = "pixel_values", "image_grid_thw"
         else:
-            video_processor = self.qwen_processor.video_processor
-            video_processor.fps = None
-            video_processor.min_frames = 1
-            video_processor.max_frames = max_video_frames
-            processed = video_processor(media, return_tensors="pt")
+            processed = self.qwen_processor.video_processor(media, return_tensors="pt")
             pixel_key, grid_key = "pixel_values_videos", "video_grid_thw"
 
         pixels = processed[pixel_key].to(device=device)
@@ -167,7 +169,7 @@ class MultimodalAlignmentModel(nn.Module):
             videos = [self._timeseries_frames(signal.to(device), prestandardized=family == "ecg") for signal in signals]
 
         # Sensor frames are already normalized and merger-aligned.
-        processed = self.qwen_processor.video_processor.preprocess(
+        processed = self.qwen_processor.video_processor(
             videos,
             do_convert_rgb=False,
             do_sample_frames=False,

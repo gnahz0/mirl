@@ -126,7 +126,6 @@ def load_training_state(path: str | Path, optimizer, scheduler) -> dict[str, Any
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     optimizer.load_state_dict(state.pop("optimizer"))
     scheduler.load_state_dict(state.pop("scheduler"))
-    logger.info("loaded trainer state %s (step=%d)", state_path, int(state["step"]))
     return state
 
 
@@ -158,9 +157,3 @@ def save_checkpoint(
         }
         torch.save(trainer_state, path / "trainer_state.pt")
     OmegaConf.save(cfg, path / "config.yaml")
-    logger.info(
-        "checkpoint saved to %s (step=%d, trainer_state=%s)",
-        path,
-        step,
-        optimizer is not None,
-    )

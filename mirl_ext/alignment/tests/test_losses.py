@@ -233,8 +233,8 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
             self.log_logit_scale = torch.nn.Parameter(torch.tensor(math.log(2.0)))
             self.logit_bias = torch.nn.Parameter(torch.tensor(-1.0))
 
-        def forward(self, kind, media, family, max_image_tokens, max_video_frames):
-            assert (kind, family, max_image_tokens, max_video_frames) == ("signal", "tactile", 1024, 8)
+        def forward(self, kind, media, family, max_image_tokens):
+            assert (kind, family, max_image_tokens) == ("signal", "tactile", 1024)
             return None, None, None, torch.eye(2), self.log_logit_scale, self.logit_bias
 
     width = TACTILE_NUM_LABELS
@@ -254,7 +254,7 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
         "Cfg",
         (),
         {
-            "data": type("Data", (), {"max_image_tokens": 1024, "max_video_frames": 8})(),
+            "data": type("Data", (), {"max_image_tokens": 1024})(),
             "loss": type("Loss", (), {"siglip_weight": 1.0, "distill_weight": 1.0})(),
         },
     )()

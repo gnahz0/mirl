@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -15,9 +14,6 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 logger = logging.getLogger(__name__)
-
-os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
-os.environ.setdefault("TORCHCODEC_LOG_LEVEL", "0")
 
 
 # Metric reduction order must be identical on every rank, so this tuple is the one
