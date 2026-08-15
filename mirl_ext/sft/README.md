@@ -1,7 +1,7 @@
 # SFT data pipeline (answer-blind zero-shot, 20:80 SFT/RL split)
 
-The split (`split_sft_rl.py --sft-frac 0.2`, group-level, stratified by
-(data_source, label)) puts 20% of each family in SFT and 80% in RL. Every SFT
+The split (`split_sft_rl.py`; ratio from `sft_frac` in config.json, group-level,
+stratified by (data_source, label)) puts 20% of each family in SFT and 80% in RL. Every SFT
 row gets a teacher trace: the teacher sees the family context
 (`teacher_context.py`), the original question (options and all), and the query
 media — never the answer or demonstrations. Up to 4 attempts; the first
@@ -21,8 +21,8 @@ Cluster parquet commands run inside srun (`srun -p cpu -c 8 --mem=32G …`);
 `data/sft/` is not synced — scp task/trace files.
 
 ```bash
-# cluster: split 20/80, export every SFT row, stage teacher media
-python mirl_ext/sft/split_sft_rl.py --out-root $DATA/split_grpo --sft-frac 0.2
+# cluster: split (ratio = sft_frac in config.json), export every SFT row, stage media
+python mirl_ext/sft/split_sft_rl.py --out-root $DATA/split_grpo
 python mirl_ext/sft/export_sft_tasks.py --out $DATA/split/sft_tasks.jsonl
 python mirl_ext/sft/stage_media.py --tasks $DATA/split/sft_tasks.jsonl \
     --out-root /scratch/dvdai_mit/alecz/data/sft_media --workers 16 --max-side 1536

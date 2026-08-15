@@ -24,8 +24,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_sft_tasks import DATA_ROOT  # noqa: E402
+from export_sft_tasks import DATA_ROOT, _config_path  # noqa: E402
 from export_sft_tasks import extra as _extra  # noqa: E402
+
+# Target SFT share of rows; lives in config.json ("sft_frac") like the paths.
+SFT_FRAC = float(_config_path("sft_frac", "MIRL_SFT_FRAC", "0.2"))
 
 # Group-id mode per family: "path" = media path, "stem" = shared 3DHaptic clip
 # stem. Split the data/ veRL indexes (rendered plots) -- NOT trainedve_raw/*,
@@ -138,7 +141,6 @@ def main() -> None:
     )
     ap.add_argument("--data-root", default=DATA_ROOT)
     ap.add_argument("--out-root", default=f"{DATA_ROOT}/split")
-    ap.add_argument("--sft-frac", type=float, default=0.2, help="target SFT share of rows")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--families",
@@ -167,7 +169,7 @@ def main() -> None:
     data_root, out_root = Path(args.data_root), Path(args.out_root)
     manifest: dict = {
         "seed": args.seed,
-        "sft_frac": args.sft_frac,
+        "sft_frac": SFT_FRAC,
         "split_unit": "group (underlying recording), not row",
         "families": {},
         "known_limitations": [
@@ -206,7 +208,7 @@ def main() -> None:
         mode = families[family]
         groups, strata = plans[family]
         assignment = assign_groups(
-            groups, strata, args.seed, locked=global_assignment, sft_frac=args.sft_frac
+            groups, strata, args.seed, locked=global_assignment, sft_frac=SFT_FRAC
         )
         global_assignment.update(assignment)
 
