@@ -1,10 +1,11 @@
-"""Answer-conditioned SFT traces + the shared API-client helpers.
+"""Prediction-based SFT traces + the shared API-client helpers.
 
-GPT is given the question AND the correct answer, and writes the completion the
-student should have produced: `<think>…</think> \\boxed{answer}` describing the
-attached media. Kept only if it passes the reward-format gates and leak filter.
-Resume-by-uid: reruns skip finished rows. gen_sft_episodes imports the client
-helpers from here.
+GPT answers each task from the question + attached media ALONE (never shown the
+answer) in `<think>…</think> \\boxed{answer}` form; a trace is kept iff the boxed
+answer matches ground truth. Yield therefore IS the teacher's accuracy, and every
+kept trace is earned. For classification/MCQ families (climb, tactile, ecg);
+smellnet needs support examples -> gen_sft_episodes. Resume-by-uid: reruns skip
+finished rows. gen_sft_episodes imports the client helpers from here.
 
     python mirl_ext/sft/gen_sft_targets.py --tasks tasks.jsonl --out traces.jsonl --grounded
 """
@@ -36,7 +37,8 @@ KEY_PATHS = [
     Path.home() / "mit/rlm-compaction/.env",
 ]
 
-# Phrases that reveal the answer was supplied.
+# _LEAK_RE guards traces written with the answer visible; kept for import by
+# gen_sft_episodes (its prompts state rules that mention "the answer").
 _LEAK_RE = re.compile(
     r"\b(the (correct|given|provided|true|target) answer|we (are|were) told|"
     r"as (given|provided|stated above)|the label is|according to the (label|answer)|"
@@ -45,25 +47,17 @@ _LEAK_RE = re.compile(
 )
 
 SYSTEM_PROMPT = (
-    "You write supervised fine-tuning targets for a multimodal signal-reasoning model.\n"
-    "You are given a question and its correct answer. Write the completion the model "
-    "should have produced.\n\n"
+    "You are an expert at reading medical images, sensor recordings, and "
+    "interaction videos.\n"
+    "Answer the question from the attached media ALONE. You are NOT given the answer.\n\n"
     "Rules:\n"
     "1. Output EXACTLY this shape and nothing else:\n"
     "   <think> reasoning </think> \\boxed{answer}\n"
-    "2. The text inside \\boxed{} must be the correct answer, copied VERBATIM.\n"
-    "3. The reasoning must read as if you derived the answer from the signal yourself. "
-    "NEVER mention that the answer was given to you.\n"
-    "4. Reference concrete, modality-appropriate evidence that would plausibly support "
-    "this answer.\n"
-    "5. Keep the reasoning to 2-4 sentences. Concise beats florid.\n"
-)
-
-GROUNDED_SUFFIX = (
-    "\n6. An image of the actual recording is attached. Your reasoning MUST describe "
-    "what is genuinely visible in THAT recording -- specific channels/regions, where "
-    "in time features occur, relative amplitudes. Do not emit generic findings that "
-    "would fit any recording with this label.\n"
+    "2. Base the reasoning on features you can actually see -- specific "
+    "channels/regions, where in time features occur, relative amplitudes.\n"
+    "3. If the question lists options, \\boxed{} MUST hold exactly one of them "
+    "verbatim (or comma-separated letters, in order, for select-all-that-apply).\n"
+    "4. Keep the reasoning to 2-4 sentences. Concise beats florid.\n"
 )
 
 
@@ -135,15 +129,12 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
-# ---- answer-conditioned generation ----
+# ---- prediction-based generation ----
 
 def build_user_content(task: dict, image_root, grounded: bool):
-    """(content, used_image): question + answer as text, plus the media if grounded."""
+    """(content, used_image): the question, plus the media if grounded. No answer."""
     question = task["prompt"].replace("<image>", "").replace("<video>", "").strip()
-    text = (
-        f"QUESTION:\n{question}\n\n"
-        f"CORRECT ANSWER:\n{task['ground_truth']}\n\nWrite the completion now."
-    )
+    text = f"QUESTION:\n{question}\n\nAnswer from the attached media."
     if not grounded:
         return text, False
     frames = task.get("frame_paths") or []
@@ -160,32 +151,30 @@ def build_user_content(task: dict, image_root, grounded: bool):
     return text, False
 
 
-def validate(text: str, ground_truth: str) -> tuple[bool, str]:
-    """Accept only what the GRPO reward would score as well-formed and correct."""
+def validate(text: str, ground_truth: str) -> tuple[bool, str, str | None]:
+    """(accepted, reason, predicted): reward-format gates + boxed == ground truth."""
     if not text:
-        return False, "empty"
+        return False, "empty", None
     if format_reward(text) != 1.0:
-        return False, "format"
+        return False, "format", None
     boxed = extract_boxed_answer(text)
     if boxed is None:
-        return False, "no_boxed"
+        return False, "no_boxed", None
     if _norm(boxed) != _norm(ground_truth):
-        return False, "answer_mismatch"
-    if _LEAK_RE.search(text):
-        return False, "oracle_leak"
-    return True, "ok"
+        return False, "wrong", _norm(boxed)
+    return True, "ok", _norm(boxed)
 
 
 def generate_one(client, task: dict, args, stats) -> dict | None:
     content, used_image = build_user_content(task, args.image_root, args.grounded)
-    system = SYSTEM_PROMPT + (GROUNDED_SUFFIX if used_image else "")
     last_reason = "unattempted"
+    wrong_guesses: list[str] = []
     for attempt in range(args.max_attempts):
         try:
             resp = client.chat.completions.create(
                 model=args.model,
                 messages=[
-                    {"role": "system", "content": system},
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": content},
                 ],
                 # This endpoint rejects `max_tokens`.
@@ -197,7 +186,7 @@ def generate_one(client, task: dict, args, stats) -> dict | None:
             if attempt + 1 < args.max_attempts:
                 backoff(attempt)
             continue
-        good, reason = validate(text, task["ground_truth"])
+        good, reason, predicted = validate(text, task["ground_truth"])
         if good:
             return {
                 "uid": task["uid"],
@@ -208,9 +197,12 @@ def generate_one(client, task: dict, args, stats) -> dict | None:
                 "model": args.model,
                 "attempts": attempt + 1,
                 "grounded": used_image,
+                "wrong_guesses": wrong_guesses,
                 "response": text,
             }
         last_reason = reason
+        if predicted is not None:
+            wrong_guesses.append(predicted)
     stats[last_reason] += 1
     return None
 
@@ -224,6 +216,11 @@ def main() -> None:
     ap.add_argument("--image-root", type=Path, default=None)
     ap.add_argument("--grounded", action="store_true", help="attach the recording's media")
     ap.add_argument("--families", nargs="*", default=None)
+    ap.add_argument(
+        "--skip-sources", nargs="*", default=["description"],
+        help="data_sources to exclude (default: tactile's open-response captions, "
+        "which exact-match can't score)",
+    )
     ap.add_argument("--limit", type=int, default=0, help="0 = all remaining")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--max-attempts", type=int, default=3)
@@ -237,6 +234,8 @@ def main() -> None:
     tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
     if args.families:
         tasks = [t for t in tasks if t["family"] in args.families]
+    if args.skip_sources:
+        tasks = [t for t in tasks if t.get("data_source") not in set(args.skip_sources)]
     done = read_done_uids(args.out)
     todo = [t for t in tasks if t["uid"] not in done]
     # Shuffle so --limit samples all families; resume is keyed on uid, not position.
