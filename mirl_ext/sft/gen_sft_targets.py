@@ -1,22 +1,21 @@
 """Answer-blind zero-shot SFT trace generation (+ the shared API-client helpers).
 
-v1 teacher protocol (--mode answer_blind_zero_shot): for every exported task the
-teacher sees the fixed family context (teacher_context.py), the task's own label
-definitions, the original question, and the query media -- never the ground
-truth, labeled demonstrations, or a gold-derived shortlist. Up to --max-attempts
-independent completions are drawn; the first that passes deterministic
-validation (structure, leak phrases, rationale length, and answer == ground
-truth under the SAME scorer RL uses) is kept. Every attempted task writes
-exactly one record with status accepted/exhausted/error, so pass@1/pass@k and
-per-class acceptance are derivable from the output file alone (report_traces.py).
-Resume is by uid: accepted/exhausted skip, transport errors retry.
+For every exported task the teacher sees the fixed family context
+(teacher_context.py), the task's own label definitions, the original question,
+and the query media -- never the ground truth, labeled demonstrations, or a
+gold-derived shortlist. Up to --max-attempts independent completions are drawn;
+the first that passes deterministic validation (structure, leak phrases,
+rationale length, and answer == ground truth under the SAME scorer RL uses) is
+kept. Every attempted task writes one record with status accepted/exhausted/
+error, so pass@1/pass@k and per-class yield come from the output file alone
+(report_traces.py). Resume is by uid: accepted/exhausted skip, errors retry.
 
 Open-response tasks (answer_style == "open": haptic_ts descriptions, tactile
 notes/captions, free-text QA) have no exact-match gate and are skipped unless
 --include-open. gen_sft_episodes imports the client helpers from here.
 
-    python mirl_ext/sft/gen_sft_targets.py --mode answer_blind_zero_shot \\
-        --tasks tasks.staged.jsonl --out traces.jsonl --image-root data/sft/media --dry-run
+    python mirl_ext/sft/gen_sft_targets.py --tasks tasks.staged.jsonl \\
+        --out traces.jsonl --image-root data/sft/media --dry-run
 """
 
 from __future__ import annotations
@@ -44,6 +43,10 @@ from mirl_ext.sft import teacher_context  # noqa: E402
 BASE_URL = "http://point.dd.works:18890/v1"
 # TRAPI needs the full dated deployment id (bare "gpt-5.6-sol" 404s).
 DEFAULT_MODEL = "gpt-5.6-sol_2026-07-09"
+
+MODE = "answer_blind_zero_shot"
+MIN_THINK_CHARS, MAX_THINK_CHARS = 60, 3000
+TRANSPORT_RETRIES = 3  # network retries per reasoning attempt
 
 KEY_PATHS = [
     Path.home() / ".config/mirl/microsoft_openai_key",
@@ -150,27 +153,22 @@ class TeacherTask:
     uid: str
     family: str
     data_source: str | None
-    question_type: str | None
     prompt: str
     image_paths: tuple[str, ...]
     frame_paths: tuple[str, ...]
     label_space: tuple[str, ...]
-    answer_style: str
     staging_version: str | None
 
     @classmethod
     def from_row(cls, t: dict) -> "TeacherTask":
-        images = t.get("image_paths") or ([t["image_path"]] if t.get("image_path") else [])
         return cls(
             uid=t["uid"],
             family=t["family"],
             data_source=t.get("data_source"),
-            question_type=t.get("question_type"),
             prompt=t["prompt"],
-            image_paths=tuple(images),
+            image_paths=tuple(t.get("image_paths") or []),
             frame_paths=tuple(t.get("frame_paths") or []),
             label_space=tuple(t.get("label_space") or []),
-            answer_style=t.get("answer_style", "closed"),
             staging_version=t.get("staging_version"),
         )
 
@@ -205,9 +203,7 @@ def build_request(task: TeacherTask, image_root, descriptions) -> tuple[list[dic
     )
 
 
-def validate(
-    text: str, ground_truth: str, task: TeacherTask, min_chars: int, max_chars: int
-) -> tuple[bool, str, str | None]:
+def validate(text: str, ground_truth: str, task: TeacherTask) -> tuple[bool, str, str | None]:
     """(accepted, reason, predicted). Deterministic; correctness is judged by the
     SAME per-family scorer RL uses (rewards.combined), so multilabel set
     semantics and label normalization match training exactly."""
@@ -218,9 +214,9 @@ def validate(
     think = text.split("<think>", 1)[1].split("</think>", 1)[0].strip()
     if not think:
         return False, "empty_think", None
-    if len(think) < min_chars:
+    if len(think) < MIN_THINK_CHARS:
         return False, "think_too_short", None
-    if len(think) > max_chars:
+    if len(think) > MAX_THINK_CHARS:
         return False, "think_too_long", None
     if _LEAK_RE.search(text) or _SCAFFOLD_LEAK_RE.search(text):
         return False, "leak", None
@@ -235,7 +231,13 @@ def validate(
     if format_reward(text) != 1.0:
         return False, "format", None
     predicted = _norm(boxed)
-    if combined.compute_score(task.data_source, text, ground_truth)["acc"] != 1.0:
+    if task.data_source == "ecg":
+        # rewards.ecg matches category MENTIONS (lenient partial credit for RL) and
+        # would accept "Abnormal" for "Normal"; the keep-gate needs the verbatim label.
+        correct = predicted == _norm(ground_truth)
+    else:
+        correct = combined.compute_score(task.data_source, text, ground_truth)["acc"] == 1.0
+    if not correct:
         space = {_norm(s) for s in task.label_space}
         reason = "wrong" if not space or predicted in space else "wrong_out_of_space"
         return False, reason, predicted
@@ -249,15 +251,10 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
         "family": task.family,
         "row_index": int(task.uid.rsplit("#", 1)[1]) if "#" in task.uid else None,
         "data_source": task.data_source,
-        "question_type": task.question_type,
         "status": None,
         "model": args.model,
-        "mode": "answer_blind_zero_shot",
+        "mode": MODE,
         "prompt_version": teacher_context.PROMPT_VERSION,
-        "prompt_hash": teacher_context.prompt_fingerprint(descriptions),
-        "answer_blind": True,
-        "few_shot": False,
-        "answer_conditioned": False,
         "n_attempts": 0,
         "accepted_attempt": None,
         "response": None,
@@ -265,13 +262,8 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
         "attempts": [],
         "error": None,
         "ground_truth": ground_truth,  # local audit only; never in the request
-        "grounded": False,
         "media_count": 0,
         "staging_version": task.staging_version,
-        "gen_params": {
-            "temperature": args.temperature,
-            "max_completion_tokens": args.max_completion_tokens,
-        },
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
     try:
@@ -279,7 +271,7 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
     except MediaMissing as exc:
         record.update(status="error", error=f"media_missing:{exc}")
         return record
-    record.update(grounded=n_media > 0, media_count=n_media)
+    record["media_count"] = n_media
 
     kwargs = {"model": args.model, "max_completion_tokens": args.max_completion_tokens}
     if args.temperature is not None:
@@ -287,23 +279,21 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
 
     for attempt in range(1, args.max_attempts + 1):
         text = None
-        for transport_try in range(args.transport_retries):  # transport != reasoning
+        for transport_try in range(TRANSPORT_RETRIES):  # transport != reasoning
             try:
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 text = (resp.choices[0].message.content or "").strip()
                 break
             except Exception as exc:  # noqa: BLE001
                 record["error"] = f"api:{type(exc).__name__}"
-                if transport_try + 1 < args.transport_retries:
+                if transport_try + 1 < TRANSPORT_RETRIES:
                     backoff(transport_try)
         if text is None:
             record.update(status="error", n_attempts=attempt)
             return record
         record["error"] = None
         record["n_attempts"] = attempt
-        good, reason, predicted = validate(
-            text, ground_truth, task, args.min_rationale_chars, args.max_rationale_chars
-        )
+        good, reason, predicted = validate(text, ground_truth, task)
         if good:
             record.update(
                 status="accepted", accepted_attempt=attempt, response=text, parsed_answer=predicted
@@ -340,7 +330,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--mode", default="answer_blind_zero_shot", choices=["answer_blind_zero_shot"])
     ap.add_argument("--tasks", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--image-root", type=Path, default=None)
@@ -351,22 +340,14 @@ def main() -> None:
         "they will almost never validate). Default: skip them.",
     )
     ap.add_argument(
-        "--skip-sources", nargs="*", default=["description", "haptic_tactile"],
-        help="data_sources to exclude on top of the open-style skip "
-        "(covers legacy task files that predate answer_style)",
-    )
-    ap.add_argument(
         "--descriptions", type=Path, default=Path("data/sft/meta/text_description.json"),
         help="the 50 upstream SmellNet substance descriptions",
     )
     ap.add_argument("--limit", type=int, default=0, help="0 = all remaining")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--max-attempts", type=int, default=4, help="independent reasoning attempts")
-    ap.add_argument("--transport-retries", type=int, default=3, help="network retries per attempt")
     ap.add_argument("--temperature", type=float, default=None, help="omit = endpoint default (1.0)")
     ap.add_argument("--max-completion-tokens", type=int, default=2048)
-    ap.add_argument("--min-rationale-chars", type=int, default=60)
-    ap.add_argument("--max-rationale-chars", type=int, default=3000)
     ap.add_argument("--request-timeout", type=float, default=180.0)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--seed", type=int, default=42)
@@ -375,12 +356,17 @@ def main() -> None:
     args = ap.parse_args()
 
     rows = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
+    legacy = sum(1 for t in rows if "answer_style" not in t)
+    if legacy:
+        raise SystemExit(
+            f"{legacy} tasks lack answer_style (legacy task file) -- re-export with "
+            "export_sft_tasks.py first"
+        )
     if args.families:
         rows = [t for t in rows if t["family"] in args.families]
-    n_open = sum(1 for t in rows if t.get("answer_style") == "open")
+    n_open = sum(1 for t in rows if t["answer_style"] == "open")
     if not args.include_open:
-        rows = [t for t in rows if t.get("answer_style", "closed") != "open"]
-        rows = [t for t in rows if t.get("data_source") not in set(args.skip_sources or [])]
+        rows = [t for t in rows if t["answer_style"] != "open"]
     answers = {t["uid"]: t["ground_truth"] for t in rows}
     tasks = [TeacherTask.from_row(t) for t in rows]
 
@@ -405,17 +391,41 @@ def main() -> None:
     if not todo:
         return
 
+    # Fail before billing if any data_source has no reward scorer to validate with.
+    bad = []
+    for src in sorted({str(t.data_source) for t in todo}):
+        try:
+            combined.compute_score(src, "<think>x</think> \\boxed{y}", "y")
+        except NotImplementedError:
+            bad.append(src)
+    if bad:
+        raise SystemExit(f"no reward scorer for data_source(s) {bad} -- fix before generating")
+    # A killed run can leave a partial last line; never fuse the next record onto it.
+    if args.out.exists() and args.out.stat().st_size:
+        with args.out.open("rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            ends_clean = fh.read(1) == b"\n"
+        if not ends_clean:
+            with args.out.open("a") as fh:
+                fh.write("\n")
+
     client = make_client(args.request_timeout)
     stats: collections.Counter = collections.Counter()
     t0 = time.time()
     # Append+flush per record (a kill must not lose paid work); as_completed so a
     # slow call never stalls the resume checkpoint.
     with args.out.open("a") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futs = [
-            pool.submit(generate_one, client, t, answers[t.uid], args, descriptions) for t in todo
-        ]
+        futs = {
+            pool.submit(generate_one, client, t, answers[t.uid], args, descriptions): t
+            for t in todo
+        }
         for done, fut in enumerate(as_completed(futs), 1):
-            rec = fut.result()
+            try:
+                rec = fut.result()
+            except Exception as exc:  # noqa: BLE001 -- never drop the other paid records
+                t = futs[fut]
+                rec = {"uid": t.uid, "family": t.family, "data_source": t.data_source,
+                       "status": "error", "error": f"worker:{type(exc).__name__}: {exc}"}
             fh.write(json.dumps(rec) + "\n")
             fh.flush()
             stats[(rec["family"], rec["status"])] += 1

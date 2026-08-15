@@ -139,6 +139,8 @@ def load_tasks(path: Path, image_root: Path | None) -> list[dict]:
         rec = json.loads(line)
         if rec.get("data_source") != DATA_SOURCE:
             continue
+        # Current exporter writes image_paths (a list); older files image_path.
+        rec["image_path"] = rec.get("image_path") or (rec.get("image_paths") or [""])[0]
         resolved = _resolve_image(rec["image_path"], image_root)
         if resolved is None:
             missing.append(rec["image_path"])

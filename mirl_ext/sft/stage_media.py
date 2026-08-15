@@ -97,9 +97,7 @@ def main() -> None:
     for task in tasks:
         dest_dir = args.out_root / task["family"]
         dest_dir.mkdir(parents=True, exist_ok=True)
-        images = task.get("image_paths") or (
-            [task["image_path"]] if task.get("image_path") else []
-        )
+        images = task.get("image_paths") or []
         staged_images = []
         for raw in images:
             p = Path(raw)
@@ -111,7 +109,6 @@ def main() -> None:
                 staged_images.append(str(dest_dir / name))
         if staged_images:
             task["image_paths"] = staged_images
-            task.pop("image_path", None)
             n_img += 1
         if task.get("video_path"):
             p = Path(task["video_path"])

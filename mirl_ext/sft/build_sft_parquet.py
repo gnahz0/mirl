@@ -42,13 +42,20 @@ def sft_messages(row: dict) -> list[dict]:
 def accepted_traces(paths: list[Path]) -> dict[str, dict]:
     """uid -> last accepted record. Resume files may hold several records per
     uid (an error line later superseded); the LAST line per uid wins, and only
-    accepted ones build rows. Records without a status are legacy accepted."""
+    accepted ones build rows. Records without a status are legacy accepted.
+    Unparseable lines (kill-truncated tails) are skipped like read_status does."""
     last: dict[str, dict] = {}
+    skipped = 0
     for path in paths:
         for line in path.read_text().splitlines():
             if line.strip():
-                rec = json.loads(line)
-                last[rec["uid"]] = rec
+                try:
+                    rec = json.loads(line)
+                    last[rec["uid"]] = rec
+                except (json.JSONDecodeError, KeyError):
+                    skipped += 1
+    if skipped:
+        print(f"[warn] skipped {skipped} unparseable trace line(s)")
     return {
         uid: rec for uid, rec in last.items() if rec.get("status", "accepted") == "accepted"
     }
@@ -64,11 +71,7 @@ def build_record(row: dict, trace: dict) -> dict:
         "teacher_model": trace.get("model"),
         "mode": trace.get("mode"),
         "prompt_version": trace.get("prompt_version"),
-        "prompt_hash": trace.get("prompt_hash"),
         "accepted_attempt": trace.get("accepted_attempt"),
-        "answer_blind": trace.get("answer_blind", trace.get("mode") == "answer_blind_zero_shot"),
-        "few_shot": trace.get("few_shot", False),
-        "answer_conditioned": trace.get("answer_conditioned", False),
         "staging_version": trace.get("staging_version"),
     }
     return {
@@ -140,7 +143,7 @@ def main() -> None:
         print(f"\nwrote {total} rows -> {out_root / 'mirl_sft.parquet'}")
     else:
         print(f"\nwrote {total} rows across {len(by_family)} files -> {out_root}")
-    print("Smoke-test with smoke_sft_load.py before training.")
+    print("Smoke-test with a tiny trainer run (data.train_max_samples=16) before training.")
 
 
 if __name__ == "__main__":

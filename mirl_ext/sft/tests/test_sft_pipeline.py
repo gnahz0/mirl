@@ -1,6 +1,5 @@
 """Focused tests for the answer-blind SFT pipeline. Pure-python: runnable with
-pytest or directly (`python mirl_ext/sft/tests/test_sft_pipeline.py`); the
-cluster-only load/collate checks live in smoke_sft_load.py instead.
+pytest or directly (`python mirl_ext/sft/tests/test_sft_pipeline.py`).
 """
 
 from __future__ import annotations
@@ -51,12 +50,10 @@ def _task(**kw) -> TeacherTask:
         uid="climb_train#7",
         family="climb_train",
         data_source="ct",
-        question_type=None,
         prompt="<image>\nWhat is shown? Answer with one of the following:\nNo PE\nAcute PE",
         image_paths=(),
         frame_paths=(),
         label_space=(),
-        answer_style="closed",
         staging_version="v2",
     )
     base.update(kw)
@@ -162,8 +159,8 @@ def test_split_groups_disjoint_and_locked_first():
 
 # ---- validation ----
 
-def _v(text, gt="No PE", task=None, lo=40, hi=3000):
-    return validate(text, gt, task or _task(), lo, hi)
+def _v(text, gt="No PE", task=None):
+    return validate(text, gt, task or _task())
 
 
 def test_validate_accepts_well_formed_correct_trace():
@@ -180,8 +177,8 @@ def test_boxed_must_be_anchored_and_unique():
 
 
 def test_rationale_length_bounds():
-    assert _v("<think>too short</think> \\boxed{No PE}", lo=40)[1] == "think_too_short"
-    assert _v(f"<think>{'x' * 4000}</think> \\boxed{{No PE}}", hi=3000)[1] == "think_too_long"
+    assert _v("<think>too short</think> \\boxed{No PE}")[1] == "think_too_short"
+    assert _v(f"<think>{'x' * 4000}</think> \\boxed{{No PE}}")[1] == "think_too_long"
 
 
 def test_leakage_phrases_rejected():
@@ -197,6 +194,16 @@ def test_wrong_answers_are_wrong_not_repaired():
     assert (ok, predicted) == (False, "acute pe") and reason == "wrong"
     ok, reason, _ = _v(GOOD_THINK + " \\boxed{Banana}", task=_task(label_space=("No PE", "Acute PE")))
     assert reason == "wrong_out_of_space"
+
+
+def test_ecg_gate_requires_verbatim_category():
+    # rewards.ecg substring-matches category mentions ("Abnormal" contains
+    # "Normal"); the SFT keep-gate must demand the exact label instead.
+    t = _task(data_source="ecg")
+    assert not _v(GOOD_THINK + " \\boxed{Abnormal}", gt="Normal", task=t)[0]
+    assert not _v(GOOD_THINK + " \\boxed{no Myocardial Infarction}",
+                  gt="Myocardial Infarction", task=t)[0]
+    assert _v(GOOD_THINK + " \\boxed{Normal}", gt="Normal", task=t)[0]
 
 
 def test_multilabel_and_letter_set_semantics_follow_rl_rewards():
@@ -260,8 +267,7 @@ def _trace(**kw):
     base = {"uid": "tactile_train#0", "family": "tactile_train", "row_index": 0,
             "ground_truth": "A,B", "response": GOOD_THINK + " \\boxed{A, B}",
             "status": "accepted", "model": "m", "mode": "answer_blind_zero_shot",
-            "prompt_version": "abz-v1", "prompt_hash": "h", "accepted_attempt": 2,
-            "answer_blind": True, "few_shot": False, "answer_conditioned": False}
+            "prompt_version": "abz-v1", "accepted_attempt": 2}
     base.update(kw)
     return base
 
@@ -274,7 +280,7 @@ def test_join_preserves_media_and_merges_system_turn():
     assert record["messages"][-1]["content"].endswith("\\boxed{A, B}")
     info = json.loads(record["extra_info"])
     assert info["question_type"] == "initial_fingers"  # original extra_info kept
-    assert info["answer_blind"] is True and info["accepted_attempt"] == 2
+    assert info["mode"] == "answer_blind_zero_shot" and info["accepted_attempt"] == 2
     check_record(record, "tactile_train#0")
 
 
@@ -315,12 +321,6 @@ def test_smellnet_descriptions_are_the_canonical_50():
 
     desc = teacher_context.load_descriptions(path)
     assert set(desc) == set(CATEGORY) and len(desc) == 50
-
-
-def test_prompt_fingerprint_stable_and_version_sensitive():
-    a, b = teacher_context.prompt_fingerprint(None), teacher_context.prompt_fingerprint(None)
-    assert a == b and len(a) == 16
-    assert teacher_context.prompt_fingerprint({"allspice": "warm spice"}) != a
 
 
 if __name__ == "__main__":

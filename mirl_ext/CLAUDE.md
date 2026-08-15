@@ -271,7 +271,7 @@ a true `system` turn), documented in that function.
 ## SFT v1 protocol (2026-08-14): answer-blind zero-shot for every family
 
 `mirl_ext/sft/README.md` is authoritative. Teacher = question + label
-definitions + fixed family context (`teacher_context.py`, versioned+hashed) +
+definitions + fixed family context (`teacher_context.py`, versioned) +
 query media; never the answer, never demonstrations. 4 attempts, keep-first-
 correct under `rewards.combined` (the RL scorer), one status record per task
 (accepted/exhausted/error) so yield IS accuracy (`report_traces.py`).

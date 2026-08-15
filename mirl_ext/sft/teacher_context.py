@@ -3,14 +3,12 @@
 One fixed context string per family: what the recording physically is, which
 observable properties matter, and (smellnet only) the 50 upstream substance
 descriptions as weak class-level priors. Nothing here may depend on a query's
-ground truth. Bump PROMPT_VERSION when any string changes; prompt_fingerprint()
-is stored in every generation record so traces are attributable to the exact
-prompt that produced them.
+ground truth. Bump PROMPT_VERSION when any string changes -- it is stored in
+every generation record.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -109,13 +107,3 @@ def family_context(family: str, descriptions: dict[str, str] | None = None) -> s
             "not measured prototypes):\n" + "\n".join(lines)
         )
     return ctx
-
-
-def prompt_fingerprint(descriptions: dict[str, str] | None = None) -> str:
-    """Stable hash of everything that shapes the request text."""
-    h = hashlib.sha256()
-    h.update(PROMPT_VERSION.encode())
-    h.update(SYSTEM_PROMPT.encode())
-    for fam in sorted(_FAMILY_CONTEXT):
-        h.update(family_context(fam, descriptions).encode())
-    return h.hexdigest()[:16]

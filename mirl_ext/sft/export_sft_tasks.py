@@ -50,9 +50,6 @@ FAMILIES = [
     "tactile_train",
 ]
 
-# Raw-signal families whose rows carry a rendered plot PNG readable by GPT vision.
-TS_FAMILIES = ["smellnet_train", "ecg_train", "haptic_ts_train"]
-
 _CHOICE_HEAD_RE = re.compile(
     r"(answer with[^:\n]{0,80}following\s*:?|(?<![\w])options\s*:)", re.IGNORECASE
 )
@@ -188,16 +185,11 @@ def main() -> None:
         "--half",
         default="sft",
         choices=["sft", "rl"],
-        help="which split half to export. v1 answer-blind generation uses 'sft' "
-        "only; 'rl' exists for the (currently unused) episode generator's "
-        "support pool and never feeds trace generation.",
+        help="split half to export ('rl' only builds the episode-generator support pool)",
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--families", nargs="*", default=None, help="subset of families (default: all)"
-    )
-    ap.add_argument(
-        "--ts-only", action="store_true", help=f"shorthand for --families {' '.join(TS_FAMILIES)}"
     )
     args = ap.parse_args()
 
@@ -207,7 +199,7 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    wanted = (TS_FAMILIES if args.ts_only else None) or args.families or FAMILIES
+    wanted = args.families or FAMILIES
     total = 0
     with out_path.open("w") as fh:
         for family in wanted:
@@ -232,7 +224,6 @@ def main() -> None:
                 i, row = eligible[pos]
                 data_source = row.get("data_source")
                 gt = (row.get("reward_model") or {}).get("ground_truth")
-                ei = extra(row)
                 images, video_path, max_frames = media_refs(row)
                 style = styles.get(str(data_source), {"answer_style": "open", "label_space": None})
                 text = prompt_text(row)
@@ -241,9 +232,7 @@ def main() -> None:
                     "uid": f"{family}#{i}",
                     "family": family,
                     "row_index": i,
-                    "source_index": ei.get("index"),
                     "data_source": data_source,
-                    "question_type": ei.get("question_type"),
                     "prompt": text,
                     "ground_truth": gt,
                     "image_paths": images,

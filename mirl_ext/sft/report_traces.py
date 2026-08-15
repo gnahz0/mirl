@@ -20,12 +20,16 @@ from pathlib import Path
 
 
 def load_last_records(paths: list[Path]) -> list[dict]:
+    """Last record per uid; unparseable lines (kill-truncated tails) skipped."""
     last: dict[str, dict] = {}
     for path in paths:
         for line in path.read_text().splitlines():
             if line.strip():
-                rec = json.loads(line)
-                last[rec["uid"]] = rec
+                try:
+                    rec = json.loads(line)
+                    last[rec["uid"]] = rec
+                except (json.JSONDecodeError, KeyError):
+                    continue
     return list(last.values())
 
 
