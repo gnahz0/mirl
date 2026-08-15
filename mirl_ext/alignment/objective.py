@@ -163,6 +163,7 @@ def _compute_losses(
         media,
         family,
         int(cfg.data.max_image_tokens),
+        int(cfg.data.max_video_frames),
     )
 
     total = (log_logit_scale.float() + logit_bias.float()) * 0.0

@@ -44,10 +44,7 @@ def build_loaders(
     HomogeneousBatchSampler,
     DataLoader,
 ]:
-    train_ds = AlignmentDataset(
-        list(cfg.data.train_files),
-        max_video_frames=cfg.data.max_video_frames,
-    )
+    train_ds = AlignmentDataset(list(cfg.data.train_files))
 
     train_sampler = HomogeneousBatchSampler(
         train_ds,
@@ -67,10 +64,7 @@ def build_loaders(
         persistent_workers=bool(cfg.train.num_workers),
     )
 
-    val_ds = AlignmentDataset(
-        list(cfg.data.val_files),
-        max_video_frames=cfg.data.max_video_frames,
-    )
+    val_ds = AlignmentDataset(list(cfg.data.val_files))
     val_loader = DataLoader(
         val_ds,
         batch_sampler=HomogeneousBatchSampler(

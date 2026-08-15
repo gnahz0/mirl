@@ -201,45 +201,6 @@ def _load_signal_csv(path: str) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(data.T))
 
 
-def _factor_aligned_video_size(height: int, width: int, factor: int = 32) -> tuple[int, int]:
-    """Make an extreme video aspect ratio acceptable to Qwen without dropping it."""
-
-    def ceil_factor(value: int) -> int:
-        return ((value + factor - 1) // factor) * factor
-
-    target_height = ceil_factor(max(height, factor))
-    target_width = ceil_factor(max(width, factor))
-    # qwen-vl-utils rejects ratios above 200; use 199 to avoid a rounding edge.
-    if target_height > 199 * target_width:
-        target_width = ceil_factor((target_height + 198) // 199)
-    elif target_width > 199 * target_height:
-        target_height = ceil_factor((target_width + 198) // 199)
-    return target_height, target_width
-
-
-def _process_image_with_truncated_fallback(image: dict | str):
-    """Retry otherwise valid truncated images without hiding unrelated failures."""
-    from verl.utils.dataset.vision_utils import process_image
-
-    try:
-        return process_image(image)
-    except OSError as error:
-        message = str(error).casefold()
-        if "broken data stream" not in message and "image file is truncated" not in message:
-            raise
-
-    from PIL import ImageFile
-
-    path = image if isinstance(image, str) else image.get("image") or image.get("path")
-    logger.warning("loading truncated image %s", path)
-    previous = ImageFile.LOAD_TRUNCATED_IMAGES
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-    try:
-        return process_image(image)
-    finally:
-        ImageFile.LOAD_TRUNCATED_IMAGES = previous
-
-
 def _skipped_item(kind: str, entry: dict | str, source: str, error: Exception) -> dict:
     primary_key = {"image": "image", "video": "video", "signal": "signal"}[kind]
     path = entry if isinstance(entry, str) else str(entry.get(primary_key) or entry.get("path") or "<unknown>")
@@ -258,50 +219,13 @@ def _skipped_item(kind: str, entry: dict | str, source: str, error: Exception) -
     }
 
 
-def _process_video_with_extreme_aspect_fallback(video: dict, max_frames: int):
-    """Process a video, resizing only when Qwen rejects its raw aspect ratio."""
-    from verl.utils.dataset.vision_utils import process_video
-
-    kwargs = {
-        "image_patch_size": 16,
-        "return_video_metadata": True,
-        "nframes": max_frames,
-    }
-    try:
-        return process_video(video, **kwargs)
-    except ValueError as error:
-        if "absolute aspect ratio must be smaller" not in str(error):
-            raise
-
-    from torchcodec.decoders import VideoDecoder
-
-    path = video["video"]
-    frame = VideoDecoder(path, num_ffmpeg_threads=1)[0]
-    height, width = map(int, frame.shape[-2:])
-    resized_height, resized_width = _factor_aligned_video_size(height, width)
-    adjusted = dict(video)
-    adjusted.update(resized_height=resized_height, resized_width=resized_width)
-    logger.warning(
-        "resizing extreme-aspect video %s from %dx%d to %dx%d",
-        path,
-        height,
-        width,
-        resized_height,
-        resized_width,
-    )
-    return process_video(adjusted, **kwargs)
-
-
 class AlignmentDataset(Dataset):
     """Yield lazily loaded image, video, or native-signal samples."""
 
     def __init__(
         self,
         data_files: list[str],
-        max_video_frames: int = 8,
     ):
-        self.max_video_frames = max_video_frames
-
         rows: list[dict] = []
         for path in data_files:
             rows.extend(pq.read_table(path).to_pylist())
@@ -388,21 +312,13 @@ class AlignmentDataset(Dataset):
 
         images = sample.get("images") or []
         if images:
-            try:
-                media = _process_image_with_truncated_fallback(images[0])
-            except _SKIPPABLE_LOAD_ERRORS as error:
-                return _skipped_item("image", images[0], sample["data_source"], error)
-            return {"kind": "image", "media": media}
+            image = images[0]
+            path = image if isinstance(image, str) else image.get("image") or image.get("path")
+            return {"kind": "image", "media": str(path)}
 
         video = sample["videos"][0]
-        try:
-            media = _process_video_with_extreme_aspect_fallback(video, self.max_video_frames)
-        except _SKIPPABLE_LOAD_ERRORS as error:
-            return _skipped_item("video", video, sample["data_source"], error)
-        return {
-            "kind": "video",
-            "media": media,
-        }
+        path = video if isinstance(video, str) else video.get("video") or video.get("path")
+        return {"kind": "video", "media": str(path)}
 
 
 class HomogeneousBatchSampler(Sampler[list[int]]):
@@ -437,24 +353,6 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         self.num_batches = sum(
             count for group, count in batch_counts.items() if effective_sizes[group] >= self.world_size
         )
-        dropped = sum(batch_counts.values()) - self.num_batches
-        if dropped:
-            logger.warning(
-                "HomogeneousBatchSampler: dropped %d global batch(es) with fewer than "
-                "world_size=%d rows; a group that small cannot give every rank a row.",
-                dropped,
-                world_size,
-            )
-        if self.signal_repeat_factors:
-            logger.info(
-                "HomogeneousBatchSampler: signal repeat factors=%s; effective rows=%s",
-                self.signal_repeat_factors,
-                {
-                    f"{kind}/{source}": effective_sizes[(kind, source)]
-                    for kind, source in self.groups
-                    if kind == "signal"
-                },
-            )
 
     def _global_batches(self, pools: dict) -> list[list[int]]:
         """Build global batches that give every rank a sample."""

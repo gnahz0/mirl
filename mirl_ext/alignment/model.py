@@ -74,6 +74,7 @@ class MultimodalAlignmentModel(nn.Module):
         media: list,
         family: str | None,
         max_image_tokens: int,
+        max_video_frames: int,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -92,21 +93,18 @@ class MultimodalAlignmentModel(nn.Module):
         if kind == "image":
             token_pixels = (self.vit_patch_size * self.vit_merge_size) ** 2
             max_pixels = max_image_tokens * token_pixels
-            min_pixels = min(int(self.qwen_processor.image_processor.size["shortest_edge"]), max_pixels)
-            processed = self.qwen_processor.image_processor.preprocess(
+            processed = self.qwen_processor.image_processor(
                 media,
-                size={"shortest_edge": min_pixels, "longest_edge": max_pixels},
+                size={**self.qwen_processor.image_processor.size, "longest_edge": max_pixels},
                 return_tensors="pt",
             )
             pixel_key, grid_key = "pixel_values", "image_grid_thw"
         else:
-            tensors, metadata = zip(*media, strict=True)
-            processed = self.qwen_processor.video_processor.preprocess(
-                list(tensors),
-                video_metadata=list(metadata),
-                do_sample_frames=False,
-                return_tensors="pt",
-            )
+            video_processor = self.qwen_processor.video_processor
+            video_processor.fps = None
+            video_processor.min_frames = 1
+            video_processor.max_frames = max_video_frames
+            processed = video_processor(media, return_tensors="pt")
             pixel_key, grid_key = "pixel_values_videos", "video_grid_thw"
 
         pixels = processed[pixel_key].to(device=device)
