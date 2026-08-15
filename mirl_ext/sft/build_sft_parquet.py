@@ -19,7 +19,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_sft_tasks import DATA_ROOT, extra, prompt_messages  # noqa: E402
+from export_sft_tasks import DATA_ROOT, _config_path, extra, prompt_messages  # noqa: E402
+
+# One config knob controls both sides: the teacher staged this many frames, and
+# the student rows are rewritten to sample the same count. (The RL half keeps
+# its upstream per-row values -- tactile GRPO samples 12.)
+VIDEO_FRAMES = int(_config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
 
 
 def sft_messages(row: dict) -> list[dict]:
@@ -74,11 +79,15 @@ def build_record(row: dict, trace: dict) -> dict:
         "accepted_attempt": trace.get("accepted_attempt"),
         "staging_version": trace.get("staging_version"),
     }
+    videos = [
+        {**v, "max_frames": VIDEO_FRAMES} if isinstance(v, dict) else v
+        for v in row.get("videos") or []
+    ]
     return {
         "data_source": row.get("data_source"),
         "messages": sft_messages(row) + [{"role": "assistant", "content": trace["response"]}],
         "images": row.get("images") or [],
-        "videos": row.get("videos") or [],
+        "videos": videos,
         "extra_info": json.dumps({**extra(row), **provenance}),
     }
 

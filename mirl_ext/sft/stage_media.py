@@ -1,8 +1,9 @@
 """Stage task media for off-cluster trace generation. Teacher-only copies.
 
 Copies each task's images (all of them, original order) next to the task file
-and extracts evenly-spaced JPEG frames per video -- first and last frame always
-included, count from the row's own max_frames (fallback --frames). Filenames
+and extracts video_frames (config.json) evenly-spaced JPEG frames per video,
+first and last frame always included -- the same count build_sft_parquet writes
+into the student rows, so teacher and student see the same frames. Filenames
 are content-hashed from the source path, so staging is deterministic and
 label-free. Rewrites the task JSONL with image_paths/frame_paths pointing at
 the staged copies (resolvable on the laptop via --image-root) and stamps
@@ -17,9 +18,14 @@ import argparse
 import hashlib
 import json
 import shutil
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from export_sft_tasks import _config_path  # noqa: E402
+
 STAGING_VERSION = "v2-640px-q85"
+VIDEO_FRAMES = int(_config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
 
 
 def _stem(src: str) -> str:
@@ -85,8 +91,6 @@ def main() -> None:
     )
     ap.add_argument("--tasks", type=Path, required=True)
     ap.add_argument("--out-root", type=Path, required=True, help="media lands in <out-root>/<family>/")
-    ap.add_argument("--frames", type=int, default=8,
-                    help="frames per video when the row carries no max_frames")
     ap.add_argument("--max-side", type=int, default=0,
                     help="if >0, bound staged images to this long side (teacher copies "
                     "only; use when full-size images overflow the API payload limit)")
@@ -96,25 +100,19 @@ def main() -> None:
     tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
     n_img = n_vid = n_miss = 0
 
-    # Many rows share one recording: extract each unique (video, n_frames) once.
+    # Many rows share one recording: extract each unique video once.
     from concurrent.futures import ProcessPoolExecutor
 
-    jobs: dict[tuple[str, int], Path] = {}
-    for task in tasks:
-        if task.get("video_path"):
-            n = int(task.get("max_frames") or args.frames)
-            jobs[(task["video_path"], n)] = args.out_root / task["family"]
+    jobs = {t["video_path"]: args.out_root / t["family"] for t in tasks if t.get("video_path")}
     for dest in set(jobs.values()):
         dest.mkdir(parents=True, exist_ok=True)
-    frame_names: dict[tuple[str, int], list[str]] = {}
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futs = {
-            key: pool.submit(frames_from_video, Path(src), n, dest, _stem(src))
-            for (src, n), dest in jobs.items()
-            for key in [(src, n)]
+            src: pool.submit(frames_from_video, Path(src), VIDEO_FRAMES, dest, _stem(src))
+            for src, dest in jobs.items()
             if Path(src).is_file()
         }
-        frame_names = {key: fut.result() for key, fut in futs.items()}
+        frame_names = {src: fut.result() for src, fut in futs.items()}
 
     for task in tasks:
         dest_dir = args.out_root / task["family"]
@@ -132,8 +130,7 @@ def main() -> None:
             task["image_paths"] = staged_images
             n_img += 1
         if task.get("video_path"):
-            n = int(task.get("max_frames") or args.frames)
-            names = frame_names.get((task["video_path"], n)) or []
+            names = frame_names.get(task["video_path"]) or []
             if names:
                 task["frame_paths"] = [str(dest_dir / name) for name in names]
                 n_vid += 1

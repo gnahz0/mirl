@@ -240,7 +240,10 @@ def _trace(**kw):
 
 def test_join_preserves_media_and_merges_system_turn():
     record = build_record(_row(), _trace())
-    assert record["videos"] == _row()["videos"] and record["images"] == []
+    # Same video, but max_frames rewritten to the video_frames config value so
+    # the student samples exactly what the teacher saw.
+    assert record["videos"][0]["video"] == _row()["videos"][0]["video"]
+    assert record["videos"][0]["max_frames"] == 8 and record["images"] == []
     assert [m["role"] for m in record["messages"]] == ["user", "assistant"]
     assert record["messages"][0]["content"].startswith("SYS\n\n<video>")
     assert record["messages"][-1]["content"].endswith("\\boxed{A, B}")

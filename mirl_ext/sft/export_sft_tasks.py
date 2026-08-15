@@ -96,21 +96,18 @@ def keep_row(family: str, data_source: str | None) -> bool:
     return True
 
 
-def media_refs(row: dict) -> tuple[list[str], str, int | None]:
-    """(image paths in original order, video path, video max_frames)."""
+def media_refs(row: dict) -> tuple[list[str], str]:
+    """(image paths in original order, video path). Frame counts come from the
+    video_frames config, not the row."""
     images = []
     for entry in row.get("images") or []:
         images.append(entry.get("image", "") if isinstance(entry, dict) else str(entry))
-    video_path, max_frames = "", None
+    video_path = ""
     videos = row.get("videos") or []
     if videos:
         first = videos[0]
-        if isinstance(first, dict):
-            video_path = first.get("video") or ""
-            max_frames = first.get("max_frames")
-        else:
-            video_path = str(first)
-    return [p for p in images if p], video_path, max_frames
+        video_path = (first.get("video") or "") if isinstance(first, dict) else str(first)
+    return [p for p in images if p], video_path
 
 
 def main() -> None:
@@ -158,7 +155,7 @@ def main() -> None:
             for i, row in eligible:
                 data_source = row.get("data_source")
                 gt = (row.get("reward_model") or {}).get("ground_truth")
-                images, video_path, max_frames = media_refs(row)
+                images, video_path = media_refs(row)
                 style = "open" if str(data_source) in OPEN_SOURCES else "closed"
                 task = {
                     # build_sft_parquet joins completions back on uid.
@@ -170,7 +167,6 @@ def main() -> None:
                     "ground_truth": gt,
                     "image_paths": images,
                     "video_path": video_path,
-                    "max_frames": max_frames,
                     "answer_style": style,
                 }
                 fh.write(json.dumps(task) + "\n")
