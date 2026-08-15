@@ -19,16 +19,19 @@ from pathlib import Path
 _CONFIG = Path(__file__).with_name("config.json")
 
 
-def data_root() -> str:
-    """Cluster paths live in config.json (or $MIRL_DATA_ROOT), not in code."""
-    if os.environ.get("MIRL_DATA_ROOT"):
-        return os.environ["MIRL_DATA_ROOT"].rstrip("/")
+def _config_path(key: str, env: str, fallback: str) -> str:
+    """Cluster paths live in config.json (or env overrides), not in code."""
+    if os.environ.get(env):
+        return os.environ[env].rstrip("/")
     if _CONFIG.is_file():
-        return str(json.loads(_CONFIG.read_text())["cluster_data_root"]).rstrip("/")
-    return "data"  # fallback: relative, for laptop-local experiments
+        cfg = json.loads(_CONFIG.read_text())
+        if key in cfg:
+            return str(cfg[key]).rstrip("/")
+    return fallback
 
 
-DATA_ROOT = data_root()
+DATA_ROOT = _config_path("cluster_data_root", "MIRL_DATA_ROOT", "data")
+SCRATCH_ROOT = _config_path("cluster_scratch_root", "MIRL_SCRATCH_ROOT", "scratch")
 
 FAMILIES = [
     "smellnet_train",

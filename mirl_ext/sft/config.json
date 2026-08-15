@@ -1,3 +1,4 @@
 {
-  "cluster_data_root": "/work/mit/ppliang_mit/alecz/data"
+  "cluster_data_root": "/work/mit/ppliang_mit/alecz/data",
+  "cluster_scratch_root": "/scratch/dvdai_mit/alecz/data"
 }
