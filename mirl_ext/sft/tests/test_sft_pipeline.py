@@ -144,6 +144,19 @@ def test_stratified_sample_deterministic_and_water_filled():
     assert 100 in first, "water-fill must keep the single rare-class row"
 
 
+def test_stratified_sample_spreads_across_sources_under_small_cap():
+    # Regression: 3 sources whose labels are all unique (singleton buckets);
+    # a small cap must still cover every source, not drain into the
+    # alphabetically-first one.
+    rows = [{"data_source": src, "reward_model": {"ground_truth": f"{src}-{i}"}}
+            for src in ("aaa", "bbb", "ccc") for i in range(50)]
+    picked = stratified_sample(rows, 30, 7)
+    counts = {}
+    for i in picked:
+        counts[rows[i]["data_source"]] = counts.get(rows[i]["data_source"], 0) + 1
+    assert counts == {"aaa": 10, "bbb": 10, "ccc": 10}, counts
+
+
 # ---- split ----
 
 def test_split_groups_disjoint_and_locked_first():

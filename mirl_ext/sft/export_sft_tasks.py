@@ -150,27 +150,40 @@ def source_styles(rows: list[dict]) -> dict[str, dict]:
 
 
 def stratified_sample(rows: list[dict], n: int, seed: int) -> list[int]:
-    """~n row positions, water-filled over (data_source, label) so rare classes survive."""
-    buckets: dict[tuple, list[int]] = collections.defaultdict(list)
-    for i, r in enumerate(rows):
-        buckets[(r.get("data_source"), (r.get("reward_model") or {}).get("ground_truth"))].append(i)
+    """~n row positions: budget split across data_sources first (smallest source
+    first so leftovers redistribute), then round-robin over label buckets inside
+    each source. A cap far below the bucket count previously drained into one
+    alphabetically-first source's rare labels; this keeps every source and as
+    many classes as fit represented."""
     if n >= len(rows):
         return list(range(len(rows)))
 
     rng = random.Random(seed)
-    for idxs in buckets.values():
-        rng.shuffle(idxs)
+    by_source: dict[str, dict[str, list[int]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
+    for i, r in enumerate(rows):
+        gt = str((r.get("reward_model") or {}).get("ground_truth"))
+        by_source[str(r.get("data_source"))][gt].append(i)
+    for labels in by_source.values():
+        for idxs in labels.values():
+            rng.shuffle(idxs)
 
     chosen: list[int] = []
-    remaining = sorted(buckets, key=lambda k: (len(buckets[k]), str(k)))
+    sources = sorted(by_source, key=lambda s: (sum(map(len, by_source[s].values())), s))
     budget = n
-    for pos, key in enumerate(remaining):
-        quota = max(1, budget // max(1, len(remaining) - pos))
-        take = min(quota, len(buckets[key]))
-        chosen.extend(buckets[key][:take])
-        budget -= take
-        if budget <= 0:
-            break
+    for pos, src in enumerate(sources):
+        share = budget // (len(sources) - pos)
+        buckets = sorted(by_source[src].values(), key=len)
+        take = min(share, sum(map(len, buckets)))
+        picked = depth = 0
+        while picked < take:
+            for bucket in buckets:
+                if depth < len(bucket) and picked < take:
+                    chosen.append(bucket[depth])
+                    picked += 1
+            depth += 1
+        budget -= picked
     return sorted(chosen[:n])
 
 
