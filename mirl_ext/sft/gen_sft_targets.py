@@ -1,13 +1,22 @@
-"""Prediction-based SFT traces + the shared API-client helpers.
+"""Answer-blind zero-shot SFT trace generation (+ the shared API-client helpers).
 
-GPT answers each task from the question + attached media ALONE (never shown the
-answer) in `<think>…</think> \\boxed{answer}` form; a trace is kept iff the boxed
-answer matches ground truth. Yield therefore IS the teacher's accuracy, and every
-kept trace is earned. For classification/MCQ families (climb, tactile, ecg);
-smellnet needs support examples -> gen_sft_episodes. Resume-by-uid: reruns skip
-finished rows. gen_sft_episodes imports the client helpers from here.
+v1 teacher protocol (--mode answer_blind_zero_shot): for every exported task the
+teacher sees the fixed family context (teacher_context.py), the task's own label
+definitions, the original question, and the query media -- never the ground
+truth, labeled demonstrations, or a gold-derived shortlist. Up to --max-attempts
+independent completions are drawn; the first that passes deterministic
+validation (structure, leak phrases, rationale length, and answer == ground
+truth under the SAME scorer RL uses) is kept. Every attempted task writes
+exactly one record with status accepted/exhausted/error, so pass@1/pass@k and
+per-class acceptance are derivable from the output file alone (report_traces.py).
+Resume is by uid: accepted/exhausted skip, transport errors retry.
 
-    python mirl_ext/sft/gen_sft_targets.py --tasks tasks.jsonl --out traces.jsonl --grounded
+Open-response tasks (answer_style == "open": haptic_ts descriptions, tactile
+notes/captions, free-text QA) have no exact-match gate and are skipped unless
+--include-open. gen_sft_episodes imports the client helpers from here.
+
+    python mirl_ext/sft/gen_sft_targets.py --mode answer_blind_zero_shot \\
+        --tasks tasks.staged.jsonl --out traces.jsonl --image-root data/sft/media --dry-run
 """
 
 from __future__ import annotations
@@ -15,6 +24,8 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import dataclasses
+import datetime
 import functools
 import json
 import os
@@ -26,7 +37,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mirl_ext.rewards import combined  # noqa: E402
 from mirl_ext.rewards._common import extract_boxed_answer, format_reward  # noqa: E402
+from mirl_ext.sft import teacher_context  # noqa: E402
 
 BASE_URL = "http://point.dd.works:18890/v1"
 # TRAPI needs the full dated deployment id (bare "gpt-5.6-sol" 404s).
@@ -37,8 +50,7 @@ KEY_PATHS = [
     Path.home() / "mit/rlm-compaction/.env",
 ]
 
-# _LEAK_RE guards traces written with the answer visible; kept for import by
-# gen_sft_episodes (its prompts state rules that mention "the answer").
+# Oracle-phrase guard (also imported by gen_sft_episodes).
 _LEAK_RE = re.compile(
     r"\b(the (correct|given|provided|true|target) answer|we (are|were) told|"
     r"as (given|provided|stated above)|the label is|according to the (label|answer)|"
@@ -46,18 +58,12 @@ _LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 
-SYSTEM_PROMPT = (
-    "You are an expert at reading medical images, sensor recordings, and "
-    "interaction videos.\n"
-    "Answer the question from the attached media ALONE. You are NOT given the answer.\n\n"
-    "Rules:\n"
-    "1. Output EXACTLY this shape and nothing else:\n"
-    "   <think> reasoning </think> \\boxed{answer}\n"
-    "2. Base the reasoning on features you can actually see -- specific "
-    "channels/regions, where in time features occur, relative amplitudes.\n"
-    "3. If the question lists options, \\boxed{} MUST hold exactly one of them "
-    "verbatim (or comma-separated letters, in order, for select-all-that-apply).\n"
-    "4. Keep the reasoning to 2-4 sentences. Concise beats florid.\n"
+# Scaffolding/answer-conditioning phrases a self-contained zero-shot trace must
+# never contain (the student sees only its own query).
+_SCAFFOLD_LEAK_RE = re.compile(
+    r"\b(the correct answer is|the provided answer|given the answer|ground truth|"
+    r"i was told|support set|examples? above|the description says|the blue line)\b",
+    re.IGNORECASE,
 )
 
 
@@ -81,7 +87,7 @@ def load_api_key() -> str:
 
 
 def make_client(timeout: float):
-    """Explicit timeout, no SDK retries -- the caller's attempt loop owns retry policy."""
+    """Explicit timeout, no SDK retries -- the caller owns retry policy."""
     from openai import OpenAI
 
     return OpenAI(base_url=BASE_URL, api_key=load_api_key(), timeout=timeout, max_retries=0)
@@ -93,22 +99,28 @@ def backoff(attempt: int) -> None:
 
 
 def read_done_uids(path: Path) -> set[str]:
-    """Resume set: uids already in the output JSONL (tolerates a truncated tail)."""
-    done: set[str] = set()
+    """All uids present in the output JSONL (tolerates a truncated tail)."""
+    return set(read_status(path))
+
+
+def read_status(path: Path) -> dict[str, str]:
+    """uid -> last recorded status (records without one count as accepted)."""
+    status: dict[str, str] = {}
     if path.exists():
         for line in path.read_text().splitlines():
             if line.strip():
                 try:
-                    done.add(json.loads(line)["uid"])
+                    rec = json.loads(line)
+                    status[rec["uid"]] = rec.get("status", "accepted")
                 except (json.JSONDecodeError, KeyError):
                     continue
-    return done
+    return status
 
 
 def _resolve_image(raw, image_root):
     path = Path(raw)
     if image_root is not None:
-        cand = image_root / path.parent.name / path.name
+        cand = Path(image_root) / path.parent.name / path.name
         if cand.is_file():
             return cand
     return path if path.is_file() else None
@@ -125,153 +137,299 @@ def _img(path: str) -> dict:
 
 
 def _norm(s: str) -> str:
-    # Conservative equality gate -- stricter than or equal to every family reward.
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
-# ---- prediction-based generation ----
+# ---- answer-blind zero-shot generation ----
 
-def build_user_content(task: dict, image_root, grounded: bool):
-    """(content, used_image): the question, plus the media if grounded. No answer."""
-    question = task["prompt"].replace("<image>", "").replace("<video>", "").strip()
-    text = f"QUESTION:\n{question}\n\nAnswer from the attached media."
-    if not grounded:
-        return text, False
-    frames = task.get("frame_paths") or []
-    if frames:  # video task: staged frames, oldest -> newest (see stage_media.py)
-        resolved = [_resolve_image(f, image_root) for f in frames]
-        parts = [_img(str(r)) for r in resolved if r is not None]
-        if parts:
-            return parts + [{"type": "text", "text": text}], True
-        return text, False
-    if task.get("image_path"):
-        path = _resolve_image(task["image_path"], image_root)
-        if path is not None:
-            return [_img(str(path)), {"type": "text", "text": text}], True
-    return text, False
+@dataclasses.dataclass(frozen=True)
+class TeacherTask:
+    """Everything the request builder may see. Deliberately has NO ground-truth
+    field; the answer key lives in a separate uid-keyed dict."""
+
+    uid: str
+    family: str
+    data_source: str | None
+    question_type: str | None
+    prompt: str
+    image_paths: tuple[str, ...]
+    frame_paths: tuple[str, ...]
+    label_space: tuple[str, ...]
+    answer_style: str
+    staging_version: str | None
+
+    @classmethod
+    def from_row(cls, t: dict) -> "TeacherTask":
+        images = t.get("image_paths") or ([t["image_path"]] if t.get("image_path") else [])
+        return cls(
+            uid=t["uid"],
+            family=t["family"],
+            data_source=t.get("data_source"),
+            question_type=t.get("question_type"),
+            prompt=t["prompt"],
+            image_paths=tuple(images),
+            frame_paths=tuple(t.get("frame_paths") or []),
+            label_space=tuple(t.get("label_space") or []),
+            answer_style=t.get("answer_style", "closed"),
+            staging_version=t.get("staging_version"),
+        )
 
 
-def validate(text: str, ground_truth: str) -> tuple[bool, str, str | None]:
-    """(accepted, reason, predicted): reward-format gates + boxed == ground truth."""
+class MediaMissing(Exception):
+    pass
+
+
+def build_request(task: TeacherTask, image_root, descriptions) -> tuple[list[dict], int]:
+    """(chat messages, media count). Order: context, label set, question, media."""
+    blocks = [teacher_context.family_context(task.family, descriptions)]
+    if task.label_space:  # only exported when the prompt itself lists no options
+        blocks.append(
+            "Valid answers (copy one exactly):\n" + "\n".join(task.label_space)
+        )
+    question = re.sub(r"<(image|video|audio)>", "", task.prompt).strip()
+    blocks.append(f"QUESTION:\n{question}")
+    content: list[dict] = [{"type": "text", "text": "\n\n".join(blocks)}]
+
+    media = task.frame_paths or task.image_paths  # frames staged oldest -> newest
+    for raw in media:
+        resolved = _resolve_image(raw, image_root)
+        if resolved is None:
+            raise MediaMissing(raw)
+        content.append(_img(str(resolved)))
+    return (
+        [
+            {"role": "system", "content": teacher_context.SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        len(media),
+    )
+
+
+def validate(
+    text: str, ground_truth: str, task: TeacherTask, min_chars: int, max_chars: int
+) -> tuple[bool, str, str | None]:
+    """(accepted, reason, predicted). Deterministic; correctness is judged by the
+    SAME per-family scorer RL uses (rewards.combined), so multilabel set
+    semantics and label normalization match training exactly."""
     if not text:
         return False, "empty", None
-    if format_reward(text) != 1.0:
+    if text.count("<think>") != 1 or text.count("</think>") != 1:
         return False, "format", None
+    think = text.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+    if not think:
+        return False, "empty_think", None
+    if len(think) < min_chars:
+        return False, "think_too_short", None
+    if len(think) > max_chars:
+        return False, "think_too_long", None
+    if _LEAK_RE.search(text) or _SCAFFOLD_LEAK_RE.search(text):
+        return False, "leak", None
+    if text.count("\\boxed{") != 1:
+        return False, "no_boxed" if "\\boxed{" not in text else "multiple_boxed", None
     boxed = extract_boxed_answer(text)
     if boxed is None:
         return False, "no_boxed", None
-    if _norm(boxed) != _norm(ground_truth):
-        return False, "wrong", _norm(boxed)
-    return True, "ok", _norm(boxed)
+    close = text.rfind("\\boxed{") + len("\\boxed{") + len(boxed)
+    if text[close + 1 :].strip():
+        return False, "text_after_boxed", None
+    if format_reward(text) != 1.0:
+        return False, "format", None
+    predicted = _norm(boxed)
+    if combined.compute_score(task.data_source, text, ground_truth)["acc"] != 1.0:
+        space = {_norm(s) for s in task.label_space}
+        reason = "wrong" if not space or predicted in space else "wrong_out_of_space"
+        return False, reason, predicted
+    return True, "ok", predicted
 
 
-def generate_one(client, task: dict, args, stats) -> dict | None:
-    content, used_image = build_user_content(task, args.image_root, args.grounded)
-    last_reason = "unattempted"
-    wrong_guesses: list[str] = []
-    for attempt in range(args.max_attempts):
-        try:
-            resp = client.chat.completions.create(
-                model=args.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                # This endpoint rejects `max_tokens`.
-                max_completion_tokens=args.max_completion_tokens,
-            )
-            text = (resp.choices[0].message.content or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            last_reason = f"api:{type(exc).__name__}"
-            if attempt + 1 < args.max_attempts:
-                backoff(attempt)
-            continue
-        good, reason, predicted = validate(text, task["ground_truth"])
+def generate_one(client, task: TeacherTask, ground_truth: str, args, descriptions) -> dict:
+    """One record per task, whatever happens: accepted / exhausted / error."""
+    record = {
+        "uid": task.uid,
+        "family": task.family,
+        "row_index": int(task.uid.rsplit("#", 1)[1]) if "#" in task.uid else None,
+        "data_source": task.data_source,
+        "question_type": task.question_type,
+        "status": None,
+        "model": args.model,
+        "mode": "answer_blind_zero_shot",
+        "prompt_version": teacher_context.PROMPT_VERSION,
+        "prompt_hash": teacher_context.prompt_fingerprint(descriptions),
+        "answer_blind": True,
+        "few_shot": False,
+        "answer_conditioned": False,
+        "n_attempts": 0,
+        "accepted_attempt": None,
+        "response": None,
+        "parsed_answer": None,
+        "attempts": [],
+        "error": None,
+        "ground_truth": ground_truth,  # local audit only; never in the request
+        "grounded": False,
+        "media_count": 0,
+        "staging_version": task.staging_version,
+        "gen_params": {
+            "temperature": args.temperature,
+            "max_completion_tokens": args.max_completion_tokens,
+        },
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    try:
+        messages, n_media = build_request(task, args.image_root, descriptions)
+    except MediaMissing as exc:
+        record.update(status="error", error=f"media_missing:{exc}")
+        return record
+    record.update(grounded=n_media > 0, media_count=n_media)
+
+    kwargs = {"model": args.model, "max_completion_tokens": args.max_completion_tokens}
+    if args.temperature is not None:
+        kwargs["temperature"] = args.temperature
+
+    for attempt in range(1, args.max_attempts + 1):
+        text = None
+        for transport_try in range(args.transport_retries):  # transport != reasoning
+            try:
+                resp = client.chat.completions.create(messages=messages, **kwargs)
+                text = (resp.choices[0].message.content or "").strip()
+                break
+            except Exception as exc:  # noqa: BLE001
+                record["error"] = f"api:{type(exc).__name__}"
+                if transport_try + 1 < args.transport_retries:
+                    backoff(transport_try)
+        if text is None:
+            record.update(status="error", n_attempts=attempt)
+            return record
+        record["error"] = None
+        record["n_attempts"] = attempt
+        good, reason, predicted = validate(
+            text, ground_truth, task, args.min_rationale_chars, args.max_rationale_chars
+        )
         if good:
-            return {
-                "uid": task["uid"],
-                "family": task["family"],
-                "row_index": task["row_index"],
-                "data_source": task.get("data_source"),
-                "ground_truth": task["ground_truth"],
-                "model": args.model,
-                "attempts": attempt + 1,
-                "grounded": used_image,
-                "wrong_guesses": wrong_guesses,
-                "response": text,
-            }
-        last_reason = reason
-        if predicted is not None:
-            wrong_guesses.append(predicted)
-    stats[last_reason] += 1
-    return None
+            record.update(
+                status="accepted", accepted_attempt=attempt, response=text, parsed_answer=predicted
+            )
+            return record
+        record["attempts"].append({"attempt": attempt, "reason": reason, "predicted": predicted})
+    record["status"] = "exhausted"
+    return record
+
+
+def dry_run(tasks: list[TeacherTask], args, descriptions) -> None:
+    """Print one sanitized request per family. No API call, no ground truth."""
+    seen: set[str] = set()
+    for task in tasks:
+        if task.family in seen:
+            continue
+        seen.add(task.family)
+        try:
+            messages, n_media = build_request(task, args.image_root, descriptions)
+        except MediaMissing as exc:
+            print(f"\n=== {task.family} ({task.uid}): MEDIA MISSING: {exc} ===")
+            continue
+        for part in messages[1]["content"]:
+            if part.get("type") == "image_url":
+                url = part["image_url"]["url"]
+                part["image_url"]["url"] = f"<{len(url)} base64 chars redacted>"
+        print(f"\n=== {task.family} ({task.uid}, media={n_media}) ===")
+        print(json.dumps(messages, indent=2)[:6000])
+        has_gt = any(f.name == "ground_truth" for f in dataclasses.fields(task))
+        print(f"--- ground_truth field in request-visible task object: {has_gt}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    ap.add_argument("--mode", default="answer_blind_zero_shot", choices=["answer_blind_zero_shot"])
     ap.add_argument("--tasks", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--image-root", type=Path, default=None)
-    ap.add_argument("--grounded", action="store_true", help="attach the recording's media")
     ap.add_argument("--families", nargs="*", default=None)
     ap.add_argument(
-        "--skip-sources", nargs="*", default=["description"],
-        help="data_sources to exclude (default: tactile's open-response captions, "
-        "which exact-match can't score)",
+        "--include-open", action="store_true",
+        help="also attempt answer_style=open tasks (no exact-match gate exists; "
+        "they will almost never validate). Default: skip them.",
+    )
+    ap.add_argument(
+        "--skip-sources", nargs="*", default=["description", "haptic_tactile"],
+        help="data_sources to exclude on top of the open-style skip "
+        "(covers legacy task files that predate answer_style)",
+    )
+    ap.add_argument(
+        "--descriptions", type=Path, default=Path("data/sft/meta/text_description.json"),
+        help="the 50 upstream SmellNet substance descriptions",
     )
     ap.add_argument("--limit", type=int, default=0, help="0 = all remaining")
     ap.add_argument("--concurrency", type=int, default=8)
-    ap.add_argument("--max-attempts", type=int, default=3)
+    ap.add_argument("--max-attempts", type=int, default=4, help="independent reasoning attempts")
+    ap.add_argument("--transport-retries", type=int, default=3, help="network retries per attempt")
+    ap.add_argument("--temperature", type=float, default=None, help="omit = endpoint default (1.0)")
     ap.add_argument("--max-completion-tokens", type=int, default=2048)
+    ap.add_argument("--min-rationale-chars", type=int, default=60)
+    ap.add_argument("--max-rationale-chars", type=int, default=3000)
     ap.add_argument("--request-timeout", type=float, default=180.0)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--dry-run", action="store_true", help="one call, print result, exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print one sanitized request per family; no API call")
     args = ap.parse_args()
 
-    tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
+    rows = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
     if args.families:
-        tasks = [t for t in tasks if t["family"] in args.families]
-    if args.skip_sources:
-        tasks = [t for t in tasks if t.get("data_source") not in set(args.skip_sources)]
-    done = read_done_uids(args.out)
-    todo = [t for t in tasks if t["uid"] not in done]
-    # Shuffle so --limit samples all families; resume is keyed on uid, not position.
-    random.Random(args.seed).shuffle(todo)
+        rows = [t for t in rows if t["family"] in args.families]
+    n_open = sum(1 for t in rows if t.get("answer_style") == "open")
+    if not args.include_open:
+        rows = [t for t in rows if t.get("answer_style", "closed") != "open"]
+        rows = [t for t in rows if t.get("data_source") not in set(args.skip_sources or [])]
+    answers = {t["uid"]: t["ground_truth"] for t in rows}
+    tasks = [TeacherTask.from_row(t) for t in rows]
+
+    descriptions = (
+        teacher_context.load_descriptions(args.descriptions)
+        if args.descriptions.is_file() and any(t.family == "smellnet_train" for t in tasks)
+        else None
+    )
+
+    status = read_status(args.out)
+    todo = [t for t in tasks if status.get(t.uid) in (None, "error")]
+    random.Random(args.seed).shuffle(todo)  # --limit then samples across families
     if args.limit:
         todo = todo[: args.limit]
-    print(f"tasks={len(tasks)} already_done={len(done)} to_generate={len(todo)}")
+    print(
+        f"tasks={len(tasks)} skipped_open={n_open} done={sum(1 for s in status.values() if s != 'error')} "
+        f"retry_errors={sum(1 for s in status.values() if s == 'error')} to_generate={len(todo)}"
+    )
+    if args.dry_run:
+        dry_run(todo or tasks, args, descriptions)
+        return
     if not todo:
         return
 
     client = make_client(args.request_timeout)
     stats: collections.Counter = collections.Counter()
-
-    if args.dry_run:
-        rec = generate_one(client, todo[0], args, stats)
-        print(json.dumps(rec, indent=2) if rec else f"FAILED: {dict(stats)}")
-        return
-
-    kept, t0 = 0, time.time()
+    t0 = time.time()
     # Append+flush per record (a kill must not lose paid work); as_completed so a
     # slow call never stalls the resume checkpoint.
     with args.out.open("a") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        for fut in as_completed([pool.submit(generate_one, client, t, args, stats) for t in todo]):
+        futs = [
+            pool.submit(generate_one, client, t, answers[t.uid], args, descriptions) for t in todo
+        ]
+        for done, fut in enumerate(as_completed(futs), 1):
             rec = fut.result()
-            if rec is None:
-                continue
             fh.write(json.dumps(rec) + "\n")
             fh.flush()
-            kept += 1
-            if kept % 25 == 0:
-                print(f"  kept={kept} dropped={sum(stats.values())} {kept / (time.time() - t0):.1f}/s")
+            stats[(rec["family"], rec["status"])] += 1
+            if done % 25 == 0:
+                acc = sum(v for (_, s), v in stats.items() if s == "accepted")
+                print(f"  {done}/{len(todo)} accepted={acc} {done / (time.time() - t0):.1f}/s")
 
-    print(f"\nkept={kept} dropped={sum(stats.values())} ({kept / max(1, len(todo)):.1%} yield)")
-    if stats:
-        print(f"drop reasons: {dict(stats.most_common())}")
-    print(f"-> {args.out}")
+    print(f"\n{'family':24s} {'accepted':>8s} {'exhausted':>9s} {'error':>6s}")
+    for fam in sorted({f for f, _ in stats}):
+        print(
+            f"{fam:24s} {stats[(fam, 'accepted')]:8d} {stats[(fam, 'exhausted')]:9d} "
+            f"{stats[(fam, 'error')]:6d}"
+        )
+    print(f"-> {args.out}  (run report_traces.py for pass@1/pass@k and per-class yield)")
 
 
 if __name__ == "__main__":

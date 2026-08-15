@@ -1,0 +1,339 @@
+"""Focused tests for the answer-blind SFT pipeline. Pure-python: runnable with
+pytest or directly (`python mirl_ext/sft/tests/test_sft_pipeline.py`); the
+cluster-only load/collate checks live in smoke_sft_load.py instead.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from mirl_ext.rewards import combined  # noqa: E402
+from mirl_ext.sft import teacher_context  # noqa: E402
+from mirl_ext.sft.build_sft_parquet import (  # noqa: E402
+    accepted_traces,
+    build_record,
+    check_record,
+    sft_messages,
+)
+from mirl_ext.sft.export_sft_tasks import (  # noqa: E402
+    extract_choices,
+    keep_row,
+    prompt_messages,
+    prompt_text,
+    source_styles,
+    stratified_sample,
+)
+from mirl_ext.sft.gen_sft_targets import (  # noqa: E402
+    TeacherTask,
+    build_request,
+    read_status,
+    validate,
+)
+from mirl_ext.sft.split_sft_rl import assign_groups  # noqa: E402
+from mirl_ext.sft.stage_media import _stem  # noqa: E402
+
+GOOD_THINK = (
+    "<think>The upper zones show patchy consolidation with air bronchograms and "
+    "the costophrenic angle is blunted, which favors effusion over simple "
+    "atelectasis; cardiac silhouette is enlarged.</think>"
+)
+
+
+def _task(**kw) -> TeacherTask:
+    base = dict(
+        uid="climb_train#7",
+        family="climb_train",
+        data_source="ct",
+        question_type=None,
+        prompt="<image>\nWhat is shown? Answer with one of the following:\nNo PE\nAcute PE",
+        image_paths=(),
+        frame_paths=(),
+        label_space=(),
+        answer_style="closed",
+        staging_version="v2",
+    )
+    base.update(kw)
+    return TeacherTask(**base)
+
+
+# ---- request construction stays answer-blind ----
+
+def test_teacher_task_has_no_ground_truth_field():
+    assert "ground_truth" not in {f.name for f in dataclasses.fields(TeacherTask)}
+    assert "ground_truth" not in TeacherTask.from_row(
+        {"uid": "x#1", "family": "climb_train", "prompt": "q", "ground_truth": "SECRET"}
+    ).__dict__
+
+
+def test_answer_key_sentinel_never_reaches_request():
+    sentinel = "XKCD_SENTINEL_9d41f"
+    task = TeacherTask.from_row(
+        {"uid": "x#1", "family": "climb_train", "prompt": "Describe.", "ground_truth": sentinel}
+    )
+    messages, n_media = build_request(task, None, None)
+    assert sentinel not in json.dumps(messages) and n_media == 0
+
+
+def test_request_contains_no_demonstrations():
+    messages, _ = build_request(_task(), None, None)
+    assert [m["role"] for m in messages] == ["system", "user"]
+    parts = messages[1]["content"]
+    assert len(parts) == 1 and parts[0]["type"] == "text"  # context + question only
+    assert messages[0]["content"] == teacher_context.SYSTEM_PROMPT
+
+
+def test_label_space_block_only_when_prompt_has_no_options():
+    with_space, _ = build_request(_task(label_space=("ptsd", "no ptsd")), None, None)
+    without, _ = build_request(_task(), None, None)
+    assert "Valid answers (copy one exactly)" in with_space[1]["content"][0]["text"]
+    assert "Valid answers" not in without[1]["content"][0]["text"]
+
+
+# ---- export helpers ----
+
+def test_prompt_flattening_keeps_all_turns():
+    row = {"prompt": [{"role": "system", "content": "SYS"},
+                      {"role": "user", "content": "<image>\nQ?"}]}
+    assert [m["role"] for m in prompt_messages(row)] == ["system", "user"]
+    assert prompt_text(row) == "SYS\n\n<image>\nQ?"
+
+
+def test_smellnet_mixture_and_gcms_rows_excluded():
+    assert keep_row("smellnet_train", "smellnet_base")
+    assert not keep_row("smellnet_train", "smellnet_mixture")
+    assert not keep_row("smellnet_train", "smellnet_gcms")
+    assert keep_row("climb_train", "ct")
+
+
+def test_extract_choices_formats():
+    assert extract_choices("Q? Answer with one of the following:\nNormal\nOther") == [
+        "Normal", "Other"]
+    assert extract_choices("Answer with one word from the following: a, b, c") == ["a", "b", "c"]
+    assert extract_choices("Pick.\nOptions:\nA. Thumb\nB. Palm") == ["A. Thumb", "B. Palm"]
+    assert extract_choices("Answer with one or more of the following:\nEdema\nAtelectasis") == [
+        "Edema", "Atelectasis"]
+    assert extract_choices("Describe the video in a few sentences.") == []
+
+
+def test_source_styles_closed_open_and_label_space():
+    rows = (
+        [{"data_source": "mcq", "prompt": [{"role": "user", "content": "Options:\nA. x\nB. y"}],
+          "reward_model": {"ground_truth": "A"}}]
+        + [{"data_source": "smallset", "prompt": [{"role": "user", "content": "Feeling?"}],
+            "reward_model": {"ground_truth": gt}} for gt in ("happy", "sad")]
+        + [{"data_source": "freetext", "prompt": [{"role": "user", "content": "Describe."}],
+            "reward_model": {"ground_truth": f"A long unique open answer number {i} " * 3}}
+           for i in range(80)]
+    )
+    styles = source_styles(rows)
+    assert styles["mcq"] == {"answer_style": "closed", "label_space": None}
+    assert styles["smallset"] == {"answer_style": "closed", "label_space": ["happy", "sad"]}
+    assert styles["freetext"]["answer_style"] == "open"
+
+
+def test_stratified_sample_deterministic_and_water_filled():
+    rows = [{"data_source": "a", "reward_model": {"ground_truth": f"c{i % 10}"}}
+            for i in range(100)] + [
+        {"data_source": "b", "reward_model": {"ground_truth": "rare"}}]
+    first, second = stratified_sample(rows, 20, 7), stratified_sample(rows, 20, 7)
+    assert first == second and len(first) == 20
+    assert 100 in first, "water-fill must keep the single rare-class row"
+
+
+# ---- split ----
+
+def test_split_groups_disjoint_and_locked_first():
+    groups = {f"g{i}": list(range(i * 3, i * 3 + 3)) for i in range(8)}
+    strata = {gid: "s" for gid in groups}
+    assignment = assign_groups(groups, strata, seed=1)
+    assert set(assignment) == set(groups)
+    assert all(side in ("sft", "rl") for side in assignment.values())
+    locked = {"g0": "rl", "g1": "rl"}
+    relocked = assign_groups(groups, strata, seed=1, locked=locked)
+    assert relocked["g0"] == relocked["g1"] == "rl"
+
+
+# ---- validation ----
+
+def _v(text, gt="No PE", task=None, lo=40, hi=3000):
+    return validate(text, gt, task or _task(), lo, hi)
+
+
+def test_validate_accepts_well_formed_correct_trace():
+    ok, reason, predicted = _v(GOOD_THINK + " \\boxed{No PE}")
+    assert (ok, reason, predicted) == (True, "ok", "no pe")
+
+
+def test_boxed_must_be_anchored_and_unique():
+    assert _v(GOOD_THINK + " \\boxed{No PE} trailing words")[1] == "text_after_boxed"
+    assert _v(GOOD_THINK + " \\boxed{No PE} \\boxed{No PE}")[1] == "multiple_boxed"
+    assert _v(GOOD_THINK + " the answer is No PE")[1] == "no_boxed"
+    assert _v("no think tags at all \\boxed{No PE}")[1] == "format"
+    assert _v("<think>  </think> \\boxed{No PE}")[1] == "empty_think"
+
+
+def test_rationale_length_bounds():
+    assert _v("<think>too short</think> \\boxed{No PE}", lo=40)[1] == "think_too_short"
+    assert _v(f"<think>{'x' * 4000}</think> \\boxed{{No PE}}", hi=3000)[1] == "think_too_long"
+
+
+def test_leakage_phrases_rejected():
+    for phrase in ("the correct answer is", "the provided answer", "given the answer",
+                   "ground truth", "I was told", "support set", "examples above",
+                   "the description says", "the blue line"):
+        text = f"<think>Reasoning mentioning {phrase} somewhere in the rationale, at length.</think> \\boxed{{No PE}}"
+        assert _v(text)[1] == "leak", phrase
+
+
+def test_wrong_answers_are_wrong_not_repaired():
+    ok, reason, predicted = _v(GOOD_THINK + " \\boxed{Acute PE}")
+    assert (ok, predicted) == (False, "acute pe") and reason == "wrong"
+    ok, reason, _ = _v(GOOD_THINK + " \\boxed{Banana}", task=_task(label_space=("No PE", "Acute PE")))
+    assert reason == "wrong_out_of_space"
+
+
+def test_multilabel_and_letter_set_semantics_follow_rl_rewards():
+    med = GOOD_THINK + " \\boxed{Support Devices, Pleural Effusion}"
+    assert _v(med, gt="Pleural Effusion, Support Devices")[0]  # order-invariant set
+    tac = GOOD_THINK + " \\boxed{B, A}"
+    assert _v(tac, gt="A,B", task=_task(data_source="initial_fingers"))[0]
+    smell = GOOD_THINK + " \\boxed{brazil nut}"
+    assert _v(smell, gt="brazil_nut", task=_task(data_source="smellnet_base"))[0]
+    hb = GOOD_THINK + " \\boxed{no ptsd}"
+    assert _v(hb, gt="No PTSD", task=_task(data_source="ptsd_in_the_wild"))[0]
+    assert combined.compute_score("ecg", GOOD_THINK + " \\boxed{Normal}", "Normal")["acc"] == 1.0
+
+
+# ---- resume + parquet build ----
+
+def _write_jsonl(records) -> Path:
+    tmp = Path(tempfile.mkstemp(suffix=".jsonl")[1])
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in records))
+    return tmp
+
+
+def test_resume_skips_accepted_and_exhausted_retries_errors():
+    tmp = _write_jsonl([
+        {"uid": "a#1", "status": "accepted"},
+        {"uid": "a#2", "status": "exhausted"},
+        {"uid": "a#3", "status": "error"},
+        {"uid": "a#3", "status": "accepted"},  # retried later and accepted
+        {"uid": "a#4"},  # legacy record, no status
+    ])
+    status = read_status(tmp)
+    todo = [uid for uid in ("a#1", "a#2", "a#3", "a#4", "a#5")
+            if status.get(uid) in (None, "error")]
+    assert todo == ["a#5"]
+
+
+def test_accepted_traces_dedupe_and_filter():
+    tmp = _write_jsonl([
+        {"uid": "f#1", "status": "accepted", "response": "old"},
+        {"uid": "f#1", "status": "accepted", "response": "new"},
+        {"uid": "f#2", "status": "exhausted"},
+        {"uid": "f#3", "status": "error"},
+    ])
+    traces = accepted_traces([tmp])
+    assert set(traces) == {"f#1"} and traces["f#1"]["response"] == "new"
+
+
+def _row():
+    return {
+        "data_source": "initial_fingers",
+        "prompt": [{"role": "system", "content": "SYS"},
+                   {"role": "user", "content": "<video>\nWhich fingers?"}],
+        "images": [],
+        "videos": [{"video": "/data/v1.mp4", "min_frames": None, "max_frames": 12}],
+        "reward_model": {"style": "rule", "ground_truth": "A,B"},
+        "extra_info": json.dumps({"question_type": "initial_fingers", "index": 3}),
+    }
+
+
+def _trace(**kw):
+    base = {"uid": "tactile_train#0", "family": "tactile_train", "row_index": 0,
+            "ground_truth": "A,B", "response": GOOD_THINK + " \\boxed{A, B}",
+            "status": "accepted", "model": "m", "mode": "answer_blind_zero_shot",
+            "prompt_version": "abz-v1", "prompt_hash": "h", "accepted_attempt": 2,
+            "answer_blind": True, "few_shot": False, "answer_conditioned": False}
+    base.update(kw)
+    return base
+
+
+def test_join_preserves_media_and_merges_system_turn():
+    record = build_record(_row(), _trace())
+    assert record["videos"] == _row()["videos"] and record["images"] == []
+    assert [m["role"] for m in record["messages"]] == ["user", "assistant"]
+    assert record["messages"][0]["content"].startswith("SYS\n\n<video>")
+    assert record["messages"][-1]["content"].endswith("\\boxed{A, B}")
+    info = json.loads(record["extra_info"])
+    assert info["question_type"] == "initial_fingers"  # original extra_info kept
+    assert info["answer_blind"] is True and info["accepted_attempt"] == 2
+    check_record(record, "tactile_train#0")
+
+
+def test_join_refuses_ground_truth_mismatch():
+    try:
+        build_record(_row(), _trace(ground_truth="C"))
+        raise RuntimeError("should have refused")
+    except AssertionError:
+        pass
+
+
+def test_placeholder_media_count_check():
+    record = build_record(_row(), _trace())
+    record["videos"] = []
+    try:
+        check_record(record, "tactile_train#0")
+        raise RuntimeError("should have failed")
+    except AssertionError:
+        pass
+
+
+def test_sft_messages_without_system_is_untouched():
+    row = {"prompt": [{"role": "user", "content": "<image>\nQ"}]}
+    assert sft_messages(row) == [{"role": "user", "content": "<image>\nQ"}]
+
+
+# ---- misc invariants ----
+
+def test_staging_stems_deterministic():
+    assert _stem("/a/b.mp4") == _stem("/a/b.mp4") != _stem("/a/c.mp4")
+
+
+def test_smellnet_descriptions_are_the_canonical_50():
+    path = ROOT / "data/sft/meta/text_description.json"
+    if not path.is_file():
+        return  # descriptions live with the (unsynced) data dir; skip elsewhere
+    from mirl_ext.sft.gen_sft_episodes import CATEGORY
+
+    desc = teacher_context.load_descriptions(path)
+    assert set(desc) == set(CATEGORY) and len(desc) == 50
+
+
+def test_prompt_fingerprint_stable_and_version_sensitive():
+    a, b = teacher_context.prompt_fingerprint(None), teacher_context.prompt_fingerprint(None)
+    assert a == b and len(a) == 16
+    assert teacher_context.prompt_fingerprint({"allspice": "warm spice"}) != a
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                import traceback
+
+                print(f"FAIL {name}: {exc}")
+                traceback.print_exc()
+    sys.exit(1 if failures else 0)

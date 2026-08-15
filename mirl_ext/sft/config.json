@@ -1,4 +1,5 @@
 {
   "cluster_data_root": "/work/mit/ppliang_mit/alecz/data",
-  "cluster_scratch_root": "/scratch/dvdai_mit/alecz/data"
+  "cluster_scratch_root": "/scratch/dvdai_mit/alecz/data",
+  "cluster_qwen35_path": "/work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
 }

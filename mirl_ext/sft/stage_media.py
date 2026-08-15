@@ -1,12 +1,14 @@
-"""Stage task media for off-cluster trace generation.
+"""Stage task media for off-cluster trace generation. Teacher-only copies.
 
-Copies each task's image next to the task file and extracts N evenly-spaced
-JPEG frames per video (teacher endpoints take images, not mp4s; shipping frames
-is ~100x lighter than shipping videos). Rewrites the task JSONL with
-`image_path`/`frame_paths` pointing at the staged copies, resolvable on the
-laptop via --image-root.
+Copies each task's images (all of them, original order) next to the task file
+and extracts evenly-spaced JPEG frames per video -- first and last frame always
+included, count from the row's own max_frames (fallback --frames). Filenames
+are content-hashed from the source path, so staging is deterministic and
+label-free. Rewrites the task JSONL with image_paths/frame_paths pointing at
+the staged copies (resolvable on the laptop via --image-root) and stamps
+staging_version into every task. Student parquets are never touched.
 
-    python mirl_ext/sft/stage_media.py --tasks iv_tasks.jsonl --out-root data/sft/media
+    python mirl_ext/sft/stage_media.py --tasks sft_tasks.jsonl --out-root data/sft/media
 """
 
 from __future__ import annotations
@@ -17,6 +19,12 @@ import json
 import shutil
 from pathlib import Path
 
+STAGING_VERSION = "v2-640px-q85"
+
+
+def _stem(src: str) -> str:
+    return hashlib.sha1(src.encode()).hexdigest()[:20]
+
 
 def frames_from_video(src: Path, n: int, dest_dir: Path, stem: str) -> list[str]:
     import cv2
@@ -26,6 +34,7 @@ def frames_from_video(src: Path, n: int, dest_dir: Path, stem: str) -> list[str]
     if total <= 0:
         cap.release()
         return []
+    # Evenly spaced over [0, total-1]: first and last frames always included.
     picks = sorted({int(round(i * (total - 1) / max(1, n - 1))) for i in range(n)})
     out = []
     for k, idx in enumerate(picks):
@@ -45,13 +54,42 @@ def frames_from_video(src: Path, n: int, dest_dir: Path, stem: str) -> list[str]
     return out
 
 
+def stage_image(src: Path, dest_dir: Path, max_side: int) -> str | None:
+    """Copy (or, with --max-side, bound) one image; returns the staged name."""
+    name = f"{_stem(str(src))}{src.suffix.lower()}"
+    dest = dest_dir / name
+    if dest.exists():
+        return name
+    if not max_side:
+        shutil.copy(src, dest)
+        return name
+    import cv2
+
+    img = cv2.imread(str(src))
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    scale = max_side / max(h, w)
+    if scale < 1:
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        name = f"{_stem(str(src))}.jpg"
+        cv2.imwrite(str(dest_dir / name), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    else:
+        shutil.copy(src, dest)
+    return name
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--tasks", type=Path, required=True)
     ap.add_argument("--out-root", type=Path, required=True, help="media lands in <out-root>/<family>/")
-    ap.add_argument("--frames", type=int, default=8, help="frames sampled per video")
+    ap.add_argument("--frames", type=int, default=8,
+                    help="frames per video when the row carries no max_frames")
+    ap.add_argument("--max-side", type=int, default=0,
+                    help="if >0, bound staged images to this long side (teacher copies "
+                    "only; use when full-size images overflow the API payload limit)")
     args = ap.parse_args()
 
     tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
@@ -59,35 +97,39 @@ def main() -> None:
     for task in tasks:
         dest_dir = args.out_root / task["family"]
         dest_dir.mkdir(parents=True, exist_ok=True)
-        # Content-addressed stem: stable across runs, no collisions across sources.
-        src = task.get("image_path") or task.get("video_path") or ""
-        stem = hashlib.sha1(src.encode()).hexdigest()[:20]
-        if task.get("image_path"):
-            p = Path(task["image_path"])
+        images = task.get("image_paths") or (
+            [task["image_path"]] if task.get("image_path") else []
+        )
+        staged_images = []
+        for raw in images:
+            p = Path(raw)
             if not p.is_file():
                 n_miss += 1
                 continue
-            name = f"{stem}{p.suffix.lower()}"
-            if not (dest_dir / name).exists():
-                shutil.copy(p, dest_dir / name)
-            task["image_path"] = str(dest_dir / name)
+            name = stage_image(p, dest_dir, args.max_side)
+            if name:
+                staged_images.append(str(dest_dir / name))
+        if staged_images:
+            task["image_paths"] = staged_images
+            task.pop("image_path", None)
             n_img += 1
-        elif task.get("video_path"):
+        if task.get("video_path"):
             p = Path(task["video_path"])
             if not p.is_file():
                 n_miss += 1
-                continue
-            names = frames_from_video(p, args.frames, dest_dir, stem)
-            if not names:
-                n_miss += 1
-                continue
-            task["frame_paths"] = [str(dest_dir / n) for n in names]
-            n_vid += 1
-
+            else:
+                n = int(task.get("max_frames") or args.frames)
+                names = frames_from_video(p, n, dest_dir, _stem(str(p)))
+                if names:
+                    task["frame_paths"] = [str(dest_dir / n) for n in names]
+                    n_vid += 1
+                else:
+                    n_miss += 1
+        task["staging_version"] = STAGING_VERSION
     staged = args.tasks.with_suffix(".staged.jsonl")
     staged.write_text("".join(json.dumps(t) + "\n" for t in tasks))
     size = sum(f.stat().st_size for f in args.out_root.rglob("*") if f.is_file())
-    print(f"images={n_img} videos={n_vid} missing={n_miss} media={size/1e6:.0f}MB")
+    print(f"images={n_img} videos={n_vid} missing={n_miss} media={size / 1e6:.0f}MB")
     print(f"-> {staged} (copy it + {args.out_root}/ to the laptop)")
 
 

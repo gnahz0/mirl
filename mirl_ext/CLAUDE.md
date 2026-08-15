@@ -268,6 +268,21 @@ explicit system turn cannot survive the SFT path -- `build_sft_parquet.sft_messa
 merges it into the user turn. That leaves a real train/serve difference (GRPO renders
 a true `system` turn), documented in that function.
 
+## SFT v1 protocol (2026-08-14): answer-blind zero-shot for every family
+
+`mirl_ext/sft/README.md` is authoritative. Teacher = question + label
+definitions + fixed family context (`teacher_context.py`, versioned+hashed) +
+query media; never the answer, never demonstrations. 4 attempts, keep-first-
+correct under `rewards.combined` (the RL scorer), one status record per task
+(accepted/exhausted/error) so yield IS accuracy (`report_traces.py`).
+Open-response sources (haptic_ts, tactile notes, free-text HB QA) are skipped —
+no exact-match gate exists. Few-shot episodes (`gen_sft_episodes.py`) are
+explicitly NOT v1; revisit only if smellnet pass@4 comes back poor.
+⚠️ Native-signal student path is NOT integrated: `split_grpo` ts rows are
+rendered plots (`signals` column dropped at rewrite; recoverable via
+`ts_images/<ds>_map.json`). Missing pieces are listed in the README — do not
+silently treat plot-trained SFT as "native signals".
+
 ## Upstream references — check these BEFORE inventing a representation
 
 Every family here has a published upstream recipe, and each one contradicts some
