@@ -14,22 +14,19 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from mirl_ext.rewards import combined  # noqa: E402
-from mirl_ext.sft import teacher_context  # noqa: E402
+from mirl_ext.schema import OPEN_SOURCES, prompt_messages, prompt_text  # noqa: E402
 from mirl_ext.sft.build_sft_parquet import (  # noqa: E402
     accepted_traces,
     build_record,
     check_record,
     sft_messages,
 )
-from mirl_ext.sft.export_sft_tasks import (  # noqa: E402
-    OPEN_SOURCES,
-    keep_row,
-    prompt_messages,
-    prompt_text,
-)
+from mirl_ext.sft.export_sft_tasks import keep_row  # noqa: E402
 from mirl_ext.sft.gen_sft_targets import (  # noqa: E402
+    SYSTEM_PROMPT,
     TeacherTask,
     build_request,
+    load_descriptions,
     read_status,
     validate,
 )
@@ -80,7 +77,7 @@ def test_request_contains_no_demonstrations():
     assert [m["role"] for m in messages] == ["system", "user"]
     parts = messages[1]["content"]
     assert len(parts) == 1 and parts[0]["type"] == "text"  # context + question only
-    assert messages[0]["content"] == teacher_context.SYSTEM_PROMPT
+    assert messages[0]["content"] == SYSTEM_PROMPT
 
 
 # ---- export helpers ----
@@ -241,15 +238,17 @@ def _trace(**kw):
 def test_join_preserves_media_and_merges_system_turn():
     record = build_record(_row(), _trace())
     # Same video, but max_frames rewritten to the video_frames config value so
-    # the student samples exactly what the teacher saw.
+    # the student samples exactly what the teacher saw, and None-valued keys
+    # dropped (an explicit min_frames=None crashes qwen_vl_utils frame sampling).
     assert record["videos"][0]["video"] == _row()["videos"][0]["video"]
     assert record["videos"][0]["max_frames"] == 8 and record["images"] == []
+    assert "min_frames" not in record["videos"][0]
     assert [m["role"] for m in record["messages"]] == ["user", "assistant"]
     assert record["messages"][0]["content"].startswith("SYS\n\n<video>")
     assert record["messages"][-1]["content"].endswith("\\boxed{A, B}")
     info = json.loads(record["extra_info"])
     assert info["question_type"] == "initial_fingers"  # original extra_info kept
-    assert info["mode"] == "answer_blind_zero_shot" and info["accepted_attempt"] == 2
+    assert info["uid"] == "tactile_train#0" and info["accepted_attempt"] == 2
     check_record(record, "tactile_train#0")
 
 
@@ -271,12 +270,61 @@ def test_placeholder_media_count_check():
         pass
 
 
+def test_open_gt_rows_train_on_ground_truth_text():
+    row = {
+        "data_source": "haptic_tactile",
+        "prompt": [{"role": "user", "content": "<image>\nDescribe the recording."}],
+        "images": [{"image": "/x/plot.png"}],
+        "videos": [],
+        "reward_model": {"style": "open", "ground_truth": "A gloved hand squeezes a soft ball."},
+        "extra_info": "{}",
+    }
+    gt = row["reward_model"]["ground_truth"]
+    record = build_record(row, {"uid": "haptic_ts_train#0", "ground_truth": gt, "response": gt})
+    check_record(record, "haptic_ts_train#0")
+    assert record["messages"][-1] == {"role": "assistant", "content": gt}
+
+
+def test_minted_haptic_mcq_row():
+    from mirl_ext.sft.make_haptic_mcq import mint_row
+
+    tactile_row = {
+        "data_source": "initial_fingers",
+        "prompt": [{"role": "system", "content": "You are an expert in videos."},
+                   {"role": "user", "content": "<video>\nWhich fingers touch first?\nOptions:\nA. Thumb\nB. Palm"}],
+        "reward_model": {"style": "rule", "ground_truth": "A,B"},
+        "extra_info": json.dumps({"video_path": "reencoded/visual-tactile/rec_idx0.mp4"}),
+    }
+    row = mint_row(tactile_row, "/scratch/x/plot.png")
+    assert row["prompt"][1]["content"].startswith("<image>\nWhich fingers touch first?")
+    assert "<video>" not in row["prompt"][1]["content"]
+    assert row["images"] == [{"image": "/scratch/x/plot.png"}] and row["videos"] == []
+    assert row["reward_model"]["ground_truth"] == "A,B"
+    assert json.loads(row["extra_info"])["stem"] == "rec_idx0"
+    # Minted rows must survive the standard build path.
+    record = build_record(row, {"uid": "haptic_mcq_train#0", "ground_truth": "A,B",
+                                "response": GOOD_THINK + " \\boxed{A, B}"})
+    check_record(record, "haptic_mcq_train#0")
+
+
 def test_sft_messages_without_system_is_untouched():
     row = {"prompt": [{"role": "user", "content": "<image>\nQ"}]}
     assert sft_messages(row) == [{"role": "user", "content": "<image>\nQ"}]
 
 
 # ---- misc invariants ----
+
+def test_position_video_grid_expansion():
+    try:
+        import torch
+    except ImportError:
+        return  # cluster-only dependency
+    from mirl_ext.sft.sft_dataset import position_video_grid
+
+    grid = torch.tensor([[4, 16, 16], [1, 8, 8]])
+    out = position_video_grid(grid)
+    assert out.tolist() == [[1, 16, 16]] * 4 + [[1, 8, 8]]
+
 
 def test_staging_stems_deterministic():
     assert _stem("/a/b.mp4") == _stem("/a/b.mp4") != _stem("/a/c.mp4")
@@ -288,7 +336,7 @@ def test_smellnet_descriptions_are_the_canonical_50():
         return  # descriptions live with the (unsynced) data dir; skip elsewhere
     from mirl_ext.sft.gen_sft_episodes import CATEGORY
 
-    desc = teacher_context.load_descriptions(path)
+    desc = load_descriptions(path)
     assert set(desc) == set(CATEGORY) and len(desc) == 50
 
 

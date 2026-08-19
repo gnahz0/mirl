@@ -38,6 +38,11 @@ loss:
 
 train:
   seed: 42
+  # Exact file paths, no directory resolution. init_checkpoint points at an
+  # alignment_state.pt (e.g. /scratch/dvdai_mit/alecz/checkpoints/<run>/best/alignment_state.pt)
+  # and warm-starts weights on a fresh schedule. resume_checkpoint points at the
+  # matching last/trainer_state.pt and requires init_checkpoint to be set to the
+  # sibling last/alignment_state.pt.
   init_checkpoint: null
   resume_checkpoint: null
   # Repeat complete shuffled passes over low-resource signal sources. Values are
@@ -57,7 +62,6 @@ train:
   num_train_epochs: 3
   warmup_ratio: 0.03
   grad_clip: 1.0
-  amp_dtype: bf16
   val_every: 200
   val_batch_size: 256
   best_metric: val-core/map/overall

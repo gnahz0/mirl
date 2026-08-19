@@ -36,7 +36,6 @@ def _signal_batch(size: int) -> dict:
         "kind": "signal",
         "media": [0] * size,
         "family": "smellnet",
-        "skipped": {"image": 0, "video": 0, "signal": 1},
     }
 
 
@@ -489,8 +488,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
             "n/img_image": 2,
             "n/img_video": 1,
             "n/ts_smellnet": 8,
-            "n/skipped_image": 1,
-            "n/skipped_video": 2,
         }
     )
 
@@ -509,11 +506,6 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     assert grouped["train-aux/prediction_coverage/tactile"] == 0.4
     assert grouped["train-aux/prediction_coverage/overall"] == 0.3
     assert grouped["train-aux/n/img"] == 3.0
-    assert grouped["train-aux/n/skipped/image"] == 1.0
-    assert grouped["train-aux/n/skipped/video"] == 2.0
-    assert grouped["train-aux/n/skipped/signal"] == 0.0
-    assert grouped["train-aux/n/skipped/total"] == 3.0
-    assert grouped["train-aux/skipped_fraction"] == 3 / 14
     assert grouped["train-core/loss/aggregate"] == 1.25
     assert grouped["train-core/loss/smellnet"] == 0.7
     assert grouped["train-core/loss/ecg"] == 0.8
@@ -525,7 +517,7 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
 
 
 def test_loss_registration_and_batch_counts_fail_closed():
-    from mirl_ext.alignment.trainer import AccumulationWindow
+    from mirl_ext.alignment.train import AccumulationWindow
 
     window = AccumulationWindow(torch.device("cpu"))
     with pytest.raises(RuntimeError, match="_REDUCED_METRIC_KEYS"):
@@ -535,12 +527,11 @@ def test_loss_registration_and_batch_counts_fail_closed():
     window.add(_signal_batch(3), {}, (None, [], [], None, None))
     _, counts, _ = window.flush()
     assert counts["n/ts_smellnet"] == 3
-    assert counts["n/skipped_signal"] == 1
     assert counts["n/ts_signal"] == 3  # derived from the per-family totals
 
 
 def test_window_averages_only_over_microbatches_that_produced_a_loss():
-    from mirl_ext.alignment.trainer import AccumulationWindow
+    from mirl_ext.alignment.train import AccumulationWindow
 
     window = AccumulationWindow(torch.device("cpu"))
     for index in range(4):

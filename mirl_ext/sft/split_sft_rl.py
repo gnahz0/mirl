@@ -19,16 +19,14 @@ import argparse
 import collections
 import json
 import random
-import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_sft_tasks import DATA_ROOT, _config_path  # noqa: E402
-from export_sft_tasks import extra as _extra  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mirl_ext.schema import DATA_ROOT, config_path, first_media_path, recording_stem  # noqa: E402
 
 # Target SFT share of rows; lives in config.json ("sft_frac") like the paths.
-SFT_FRAC = float(_config_path("sft_frac", "MIRL_SFT_FRAC", "0.2"))
+SFT_FRAC = float(config_path("sft_frac", "MIRL_SFT_FRAC", "0.2"))
 
 # Group-id mode per family: "path" = media path, "stem" = shared 3DHaptic clip
 # stem. Split the data/ veRL indexes (rendered plots) -- NOT trainedve_raw/*,
@@ -45,38 +43,17 @@ FAMILIES: dict[str, str] = {
 # Mostly-unique free-text labels: stratify on data_source alone.
 LABEL_STRATIFY_EXCLUDE = {"haptic_ts_train", "human_behaviour_train", "tactile_train"}
 
-_IDX_SUFFIX = re.compile(r"_idx\d+$")
-
-
-def _media_path(row: dict) -> str:
-    for key in ("signals", "images", "videos"):
-        entries = row.get(key)
-        if entries:
-            entry = entries[0]
-            if isinstance(entry, dict):
-                for field in ("signal", "image", "video", "path"):
-                    if entry.get(field):
-                        return str(entry[field])
-                return json.dumps(entry, sort_keys=True)
-            return str(entry)
-    return ""
-
-
 def _clip_stem(row: dict) -> str:
     """Normalized 3DHaptic recording id, shared between tactile and haptic_ts
     so one physical recording cannot straddle the split."""
-    ei = _extra(row)
-    stem = ei.get("stem")
-    if not stem:
-        vp = ei.get("video_path") or _media_path(row)
-        stem = Path(str(vp)).stem
+    stem = recording_stem(row) or Path(first_media_path(row)).stem
     return f"3dhaptic::{stem}"
 
 
 def group_id(row: dict, mode: str) -> str:
     if mode == "stem":
         return _clip_stem(row)
-    path = _media_path(row)
+    path = first_media_path(row)
     return f"path::{path}" if path else f"row::{id(row)}"
 
 

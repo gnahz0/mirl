@@ -193,7 +193,7 @@ The runnable Qwen3.5 port now lives below `mirl_ext.alignment`; the old
 | `verl/trainer/alignment/config/stage1_smoke.yaml` | Removed; only the production config remains. |
 | `verl/trainer/alignment/data.py` | `mirl_ext.alignment.data`. |
 | `verl/trainer/alignment/model.py` | `mirl_ext.alignment.model`. |
-| `verl/trainer/alignment/trainer.py` | `mirl_ext.alignment.trainer`. |
+| `verl/trainer/alignment/trainer.py` | `mirl_ext.alignment.train`. |
 | `verl/trainer/alignment/ts_renderer.py` | Shared raw-signal preprocessing under `mirl_ext`. |
 
 Before any Stage-1 export, every required vision-tower key and shape must match

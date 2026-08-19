@@ -5,53 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from mirl_ext.rewards import ecg, haptic_ts, human_behaviour, medical, smellnet, tactile
-
-
-TACTILE_SOURCES = {
-    "verify",
-    "initial_fingers",
-    "highest_pressure",
-    "more_deformable",
-    "deformation_type",
-    "deformation_note",
-    "objA_texture",
-    "objB_texture",
-    "objA_notes",
-    "objB_notes",
-    "grasp_location",
-    "contact_feature",
-    "local_shape",
-    "grip_stability",
-    "future_stability",
-    "force_level",
-    "shear_direction",
-    "object_motion",
-    "fail_reason",
-    "fail_improvement",
-    "description",
-    "mat_description",
-    "part_notes",
-    "tactile_description",
-}
-HUMAN_BEHAVIOUR_SOURCES = {
-    "cremad",
-    "chsimsv2",
-    "daicwoz",
-    "intentqa",
-    "meld_emotion",
-    "meld_senti",
-    "mimeqa",
-    "mmpsy_anxiety",
-    "mmpsy_depression",
-    "mmsd",
-    "mosei_emotion",
-    "mosei_senti",
-    "ptsd_in_the_wild",
-    "siq2",
-    "tess",
-    "urfunny",
-}
-MEDICAL_SOURCES = {"chest_xray", "ct", "derm", "fundus", "mammo", "mri", "pathology", "ultrasound"}
+from mirl_ext.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, TACTILE_SOURCES
 
 
 def _restore_qwen35_think_prefix(solution: str) -> str:

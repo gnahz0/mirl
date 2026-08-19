@@ -35,7 +35,7 @@ from gen_sft_targets import (  # noqa: E402
     _resolve_image,
     backoff,
     make_client,
-    read_done_uids,
+    read_status,
 )
 
 DATA_SOURCE = "smellnet_base"
@@ -451,7 +451,7 @@ def main() -> None:
 
     episodes = plan_episodes(queries, args)
 
-    done = read_done_uids(args.out)
+    done = set(read_status(args.out))
     todo = [e for e in episodes if e["task"]["uid"] not in done]
     # Shuffle so --limit samples classes evenly (uid order groups classes);
     # resume is unaffected -- skipping is keyed on uid, not position.

@@ -59,7 +59,7 @@ Design:
 
 Reuse `tests/special_e2e/sft/run_sft_engine.sh` / `examples/sft/*` (FSDP, sequence packing, Liger `USE_LIGER=1`, optional LoRA):
 - base = the Qwen3.5-9B path (same as GRPO's `MODEL_PATH`); multimodal image inputs.
-- new launcher `examples/mirl/slurm/run_sft_b200.sbatch` (clone of the GRPO sbatch's env/cache block).
+- launcher `mirl_ext/sft/run_sft_b200.sbatch`.
 - output → `/scratch/dvdai_mit/alecz/checkpoints/sft_qwen35_v1`.
 - Short: 1–3 epochs, low LR (~1e-5), cosine, bf16 — standard cold-start.
 
@@ -76,7 +76,7 @@ Point `examples/mirl/multiverse/run_qwen35_grpo.sh` `MODEL_PATH` at the SFT chec
 | `mirl_ext/sft/split_sft_rl.py` | stratified 50:50 split + manifest |
 | `mirl_ext/sft/gen_sft_targets.py` | GPT-5.x CoT generation (key from file, fallback ladder, resume) |
 | `mirl_ext/sft/build_sft_parquet.py` | validated completions → veRL SFT parquet |
-| `examples/mirl/slurm/run_sft_b200.sbatch` | SFT launcher |
+| `mirl_ext/sft/run_sft_b200.sbatch` | SFT launcher |
 | `docs/mirl/sft-plan.md` | this file |
 
 ## Open decisions (need your call)

@@ -112,9 +112,9 @@ rows still map to zero.
 # single GPU through the same torchrun path
 NUM_GPUS=1 bash examples/alignment/run_stage1_qwen35_siglip2.sh
 # multi-GPU
-torchrun --standalone --nproc_per_node=4 -m mirl_ext.alignment.trainer --config <same>
+torchrun --standalone --nproc_per_node=4 -m mirl_ext.alignment.train --config <same>
 # cluster
-sbatch examples/mirl/slurm/run_stage1_b200.sbatch
+sbatch mirl_ext/alignment/run_stage1_b200.sbatch
 ```
 
 Config keys are OmegaConf-overridable on the CLI (`train.num_train_epochs=2`).
@@ -124,8 +124,11 @@ accumulation window. `val_every` is an optimizer-step interval; warmup is
 configured as a fraction of the complete run with `warmup_ratio`. Validation
 saves the best encoder and a resumable `last/` checkpoint containing optimizer
 and scheduler state; the run also saves one lightweight final encoder.
-`train.init_checkpoint` is a weights-only continuation with a fresh schedule.
-`train.resume_checkpoint` requires the same sampler geometry and planned total
+Checkpoint config keys are exact file paths, never directories:
+`train.init_checkpoint` takes an `alignment_state.pt` path and is a weights-only
+continuation with a fresh schedule. `train.resume_checkpoint` takes the matching
+`last/trainer_state.pt` path (with `init_checkpoint` set to the sibling
+`alignment_state.pt`) and requires the same sampler geometry and planned total
 schedule as the saved `last/` state.
 
 ## When changing the objective
@@ -276,7 +279,7 @@ a true `system` turn), documented in that function.
 ## SFT v1 protocol (2026-08-14): answer-blind zero-shot for every family
 
 `mirl_ext/sft/README.md` is authoritative. Teacher = question + label
-definitions + fixed family context (`teacher_context.py`, versioned) +
+definitions + fixed family context (versioned prompt block in `gen_sft_targets.py`) +
 query media; never the answer, never demonstrations. 4 attempts, keep-first-
 correct under `rewards.combined` (the RL scorer), one status record per task
 (accepted/exhausted/error) so yield IS accuracy (`report_traces.py`).

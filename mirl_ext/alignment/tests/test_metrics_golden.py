@@ -166,9 +166,6 @@ def test_metric_groups_surface_unchanged(golden):
             "n/ts_smellnet": 3,
             "n/ts_ecg": 3,
             "n/ts_tactile": 3,
-            "n/skipped_image": 1,
-            "n/skipped_video": 0,
-            "n/skipped_signal": 0,
         },
         golden["golden"]["mixed"],
     )

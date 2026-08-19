@@ -33,9 +33,11 @@ loss:
 
 train:
   seed: 42
-  # init_checkpoint loads encoder/scalar weights into a fresh optimizer and
-  # schedule. resume_checkpoint instead restores the matching `last/` trainer
-  # state and must use the same planned schedule and sampler geometry.
+  # Exact file paths, no directory resolution. init_checkpoint points at an
+  # alignment_state.pt and loads encoder/scalar weights into a fresh optimizer
+  # and schedule. resume_checkpoint points at the matching last/trainer_state.pt
+  # (with init_checkpoint set to the sibling last/alignment_state.pt) and must
+  # use the same planned schedule and sampler geometry.
   init_checkpoint: null
   resume_checkpoint: null
   # Approximate square-root sampling across the signal sources.
@@ -52,7 +54,6 @@ train:
   num_train_epochs: 3
   warmup_ratio: 0.03
   grad_clip: 1.0
-  amp_dtype: bf16
   val_every: 200
   val_batch_size: 128
   best_metric: val-core/map/overall

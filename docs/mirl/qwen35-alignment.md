@@ -181,11 +181,13 @@ produces 2,303 tokens.
 - The production schedule is one sampler epoch. Validation runs every 200 steps
   over the complete one-pass sensor validation sampler, visiting every SmellNet,
   ECG, and tactile validation recording once.
-- `train.init_checkpoint` warm-starts the encoder and learned temperature with a
-  fresh optimizer and schedule. `train.resume_checkpoint` additionally restores
-  optimizer and scheduler state from a matching `last/` checkpoint. Validation
-  overwrites `last/` at optimizer-step boundaries while `best/` and `final/`
-  remain lightweight model exports.
+- `train.init_checkpoint` names an `alignment_state.pt` file and warm-starts the
+  encoder and learned temperature with a fresh optimizer and schedule.
+  `train.resume_checkpoint` names the matching `last/trainer_state.pt` file and
+  additionally restores optimizer and scheduler state; it requires
+  `train.init_checkpoint` to point at the sibling `last/alignment_state.pt`.
+  Validation overwrites `last/` at optimizer-step boundaries while `best/` and
+  `final/` remain lightweight model exports.
 - Every signal family logs accuracy, macro-F1, Recall@1, Recall@5, and mAP.
   Accuracy is an any-positive top-1 hit; Recall@k is the fraction of a sample's
   positive labels recovered in the top k. They coincide at k=1 for single-label

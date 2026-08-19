@@ -1,0 +1,196 @@
+"""Single home for MIRL row/domain facts shared across alignment, SFT, and RL.
+
+Everything here is a constant or a tiny stdlib-only helper: how a row is shaped
+(prompt is a MESSAGE LIST, extra_info is a JSON STRING, media entries are
+dicts), which data sources belong to which task family, and the recording-stem
+join key. Stages keep their own datasets and pipelines; only the facts live
+here, so they can never drift apart again.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+_CONFIG = Path(__file__).parent / "sft" / "config.json"
+
+
+def config_path(key: str, env: str, fallback: str) -> str:
+    """Cluster paths live in sft/config.json (or env overrides), never in code."""
+    if os.environ.get(env):
+        return os.environ[env].rstrip("/")
+    if _CONFIG.is_file():
+        cfg = json.loads(_CONFIG.read_text())
+        if key in cfg:
+            return str(cfg[key]).rstrip("/")
+    return fallback
+
+
+DATA_ROOT = config_path("cluster_data_root", "MIRL_DATA_ROOT", "data")
+SCRATCH_ROOT = config_path("cluster_scratch_root", "MIRL_SCRATCH_ROOT", "scratch")
+
+FAMILIES = [
+    "smellnet_train",
+    "ecg_train",
+    "haptic_ts_train",
+    "haptic_mcq_train",  # minted by sft/make_haptic_mcq.py; absent until it runs
+    "climb_train",
+    "human_behaviour_train",
+    "tactile_train",
+]
+
+SMELLNET_BASE = "smellnet_base"
+SMELLNET_MIXTURE = "smellnet_mixture"
+
+# Free-text sources (checked once against the data): captions/notes and open QA
+# whose answers can't be exact-match graded. Everything else is closed.
+OPEN_SOURCES = {
+    "haptic_tactile",                                         # haptic_ts descriptions
+    "description", "tactile_description", "mat_description",  # tactile captions/notes
+    "part_notes", "objA_notes", "objB_notes", "deformation_note",
+    "intentqa", "siq2", "mimeqa",                             # free-text video QA
+}
+
+# The six closed tactile QA tasks with their verbalized label banks (Stage-1
+# aligns against these; SFT grades their letters; make_haptic_mcq mints from them).
+TACTILE_TASK_LABELS: dict[str, tuple[str, ...]] = {
+    "initial_fingers": (
+        "initial contact: thumb",
+        "initial contact: index finger",
+        "initial contact: middle finger",
+        "initial contact: ring finger",
+        "initial contact: pinky finger",
+        "initial contact: palm",
+    ),
+    "highest_pressure": (
+        "highest pressure: thumb",
+        "highest pressure: index finger",
+        "highest pressure: middle finger",
+        "highest pressure: ring finger",
+        "highest pressure: pinky finger",
+        "highest pressure: palm",
+    ),
+    "force_level": (
+        "force level: light, under 5 newtons",
+        "force level: moderate, 5 to 10 newtons",
+        "force level: firm, 10 to 20 newtons",
+        "force level: strong, over 20 newtons",
+    ),
+    "grip_stability": (
+        "grip stability: stable",
+        "grip stability: unstable",
+    ),
+    "contact_feature": (
+        "contact geometry: edge",
+        "contact geometry: flat surface",
+        "contact geometry: curved surface",
+        "contact geometry: corner",
+        "contact geometry: multiple edges",
+        "contact geometry: edge and surface",
+        "contact geometry: transitioning from edge to surface",
+        "contact geometry: complex geometry with multiple features",
+    ),
+    "local_shape": (
+        "local surface shape: flat",
+        "local surface shape: convex",
+        "local surface shape: concave",
+        "local surface shape: edge",
+    ),
+}
+MULTILABEL_TASKS = frozenset(("initial_fingers", "highest_pressure"))
+TACTILE_MCQ_SOURCES = tuple(TACTILE_TASK_LABELS)
+
+# Reward-routing source sets (rewards/combined.py dispatches on these).
+TACTILE_SOURCES = {
+    "verify", "initial_fingers", "highest_pressure", "more_deformable",
+    "deformation_type", "deformation_note", "objA_texture", "objB_texture",
+    "objA_notes", "objB_notes", "grasp_location", "contact_feature",
+    "local_shape", "grip_stability", "future_stability", "force_level",
+    "shear_direction", "object_motion", "fail_reason", "fail_improvement",
+    "description", "mat_description", "part_notes", "tactile_description",
+}
+HUMAN_BEHAVIOUR_SOURCES = {
+    "cremad", "chsimsv2", "daicwoz", "intentqa", "meld_emotion", "meld_senti",
+    "mimeqa", "mmpsy_anxiety", "mmpsy_depression", "mmsd", "mosei_emotion",
+    "mosei_senti", "ptsd_in_the_wild", "siq2", "tess", "urfunny",
+}
+MEDICAL_SOURCES = {"chest_xray", "ct", "derm", "fundus", "mammo", "mri", "pathology", "ultrasound"}
+
+# The taxonomies above describe one reality; drift between them was a real bug class.
+assert set(TACTILE_TASK_LABELS) <= TACTILE_SOURCES
+assert not (OPEN_SOURCES & set(TACTILE_TASK_LABELS))
+
+
+def prompt_messages(row: dict) -> list[dict]:
+    """The row's FULL prompt message list -- NOT prompt[0]: smellnet/climb/tactile
+    carry system + user turns, and dropping the user turn loses the question and
+    the <image>/<video> placeholder (this bug shipped once)."""
+    p = row.get("prompt")
+    if isinstance(p, list):
+        out = []
+        for m in p:
+            if isinstance(m, dict):
+                out.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+            else:
+                out.append({"role": "user", "content": str(m)})
+        return out
+    return [{"role": "user", "content": str(p or "")}]
+
+
+def prompt_text(row: dict) -> str:
+    """All message contents joined -- what a text-only API call should receive."""
+    return "\n\n".join(m["content"] for m in prompt_messages(row) if m["content"])
+
+
+def extra_info(row: dict) -> dict:
+    """extra_info is stored as a JSON STRING in every MIRL parquet."""
+    ei = row.get("extra_info")
+    if isinstance(ei, str):
+        try:
+            ei = json.loads(ei)
+        except json.JSONDecodeError:
+            return {}
+    return ei if isinstance(ei, dict) else {}
+
+
+def media_refs(row: dict) -> tuple[list[str], str]:
+    """(image paths in original order, video path)."""
+    images = []
+    for entry in row.get("images") or []:
+        images.append(entry.get("image", "") if isinstance(entry, dict) else str(entry))
+    video_path = ""
+    videos = row.get("videos") or []
+    if videos:
+        first = videos[0]
+        video_path = (first.get("video") or "") if isinstance(first, dict) else str(first)
+    return [p for p in images if p], video_path
+
+
+def first_media_path(row: dict) -> str:
+    """First media reference of any kind (the split's group key for path-mode)."""
+    for key in ("signals", "images", "videos"):
+        entries = row.get(key)
+        if entries:
+            entry = entries[0]
+            if isinstance(entry, dict):
+                for field in ("signal", "image", "video", "path"):
+                    if entry.get(field):
+                        return str(entry[field])
+                return json.dumps(entry, sort_keys=True)
+            return str(entry)
+    return ""
+
+
+def recording_stem(row: dict) -> str | None:
+    """The shared 3DHaptic recording id: extra_info.stem, else the video-path
+    stem. One recording appears as tactile-video rows AND a haptic time-series
+    row; this key is what keeps them on the same side of every split."""
+    ei = extra_info(row)
+    stem = ei.get("stem")
+    if stem:
+        return str(stem)
+    video_path = ei.get("video_path")
+    if video_path:
+        return Path(str(video_path)).stem
+    return None

@@ -18,13 +18,13 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_sft_tasks import DATA_ROOT, _config_path, extra, prompt_messages  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mirl_ext.schema import DATA_ROOT, config_path, extra_info, prompt_messages  # noqa: E402
 
 # One config knob controls both sides: the teacher staged this many frames, and
 # the student rows are rewritten to sample the same count. (The RL half keeps
 # its upstream per-row values -- tactile GRPO samples 12.)
-VIDEO_FRAMES = int(_config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
+VIDEO_FRAMES = int(config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
 
 
 def sft_messages(row: dict) -> list[dict]:
@@ -69,18 +69,19 @@ def accepted_traces(paths: list[Path]) -> dict[str, dict]:
 def build_record(row: dict, trace: dict) -> dict:
     gt = (row.get("reward_model") or {}).get("ground_truth")
     assert gt == trace["ground_truth"], f"{trace['uid']}: join mismatch, refusing to write"
+    # Minimal audit keys: join back to the trace file (which holds model,
+    # prompt version, wrong guesses, ...) via uid when more detail is needed.
     provenance = {
         "uid": trace["uid"],
-        "family": trace["family"],
         "ground_truth": gt,
-        "teacher_model": trace.get("model"),
-        "mode": trace.get("mode"),
-        "prompt_version": trace.get("prompt_version"),
         "accepted_attempt": trace.get("accepted_attempt"),
-        "staging_version": trace.get("staging_version"),
     }
+    # Set the config frame count and drop None-valued keys: qwen_vl_utils does
+    # ele.get("min_frames", DEFAULT), and an explicit None defeats the default
+    # and crashes frame sampling.
     videos = [
-        {**v, "max_frames": VIDEO_FRAMES} if isinstance(v, dict) else v
+        {k: val for k, val in {**v, "max_frames": VIDEO_FRAMES}.items() if val is not None}
+        if isinstance(v, dict) else v
         for v in row.get("videos") or []
     ]
     return {
@@ -88,7 +89,7 @@ def build_record(row: dict, trace: dict) -> dict:
         "messages": sft_messages(row) + [{"role": "assistant", "content": trace["response"]}],
         "images": row.get("images") or [],
         "videos": videos,
-        "extra_info": json.dumps({**extra(row), **provenance}),
+        "extra_info": json.dumps({**extra_info(row), **provenance}),
     }
 
 
@@ -105,15 +106,23 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--traces", nargs="+", required=True)
+    ap.add_argument("--traces", nargs="*", default=[])
     ap.add_argument("--split-root", default=f"{DATA_ROOT}/split_grpo")
     ap.add_argument("--out", default=f"{DATA_ROOT}/split_grpo/sft_parquet")
+    ap.add_argument(
+        "--open-gt",
+        action="store_true",
+        help="also emit <family>_open_sft.parquet where open-response rows train "
+        "directly on their ground-truth text (captions/answers; no teacher)",
+    )
     ap.add_argument(
         "--single-file",
         action="store_true",
         help="write one combined parquet instead of one per family",
     )
     args = ap.parse_args()
+    if not args.traces and not args.open_gt:
+        ap.error("nothing to build: pass --traces and/or --open-gt")
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -152,6 +161,32 @@ def main() -> None:
         print(f"\nwrote {total} rows -> {out_root / 'mirl_sft.parquet'}")
     else:
         print(f"\nwrote {total} rows across {len(by_family)} files -> {out_root}")
+
+    if args.open_gt:
+        from mirl_ext.schema import FAMILIES, OPEN_SOURCES
+
+        for family in FAMILIES:
+            src = Path(args.split_root) / "sft" / f"{family}.parquet"
+            if not src.exists():
+                continue
+            records = []
+            for i, row in enumerate(pq.read_table(src).to_pylist()):
+                gt = str((row.get("reward_model") or {}).get("ground_truth") or "")
+                if str(row.get("data_source")) not in OPEN_SOURCES or not gt.strip():
+                    continue
+                # The ground-truth text IS the target; reuse the trace path with
+                # the caption standing in as the "response".
+                record = build_record(
+                    row, {"uid": f"{family}#{i}", "ground_truth": gt, "response": gt}
+                )
+                check_record(record, f"{family}#{i}")
+                records.append(record)
+            if records:
+                pq.write_table(
+                    pa.Table.from_pylist(records), out_root / f"{family}_open_sft.parquet"
+                )
+                print(f"{family:22s} open-gt rows={len(records):6d} -> {family}_open_sft.parquet")
+
     print("Smoke-test with a tiny trainer run (data.train_max_samples=16) before training.")
 
 

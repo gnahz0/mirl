@@ -19,7 +19,7 @@ All temporary files and runtime caches go below
 Stage-1 alignment uses the production launcher:
 
 ```bash
-sbatch examples/mirl/slurm/run_stage1_b200.sbatch
+sbatch mirl_ext/alignment/run_stage1_b200.sbatch
 ```
 
 The production launcher reads all experiment settings from

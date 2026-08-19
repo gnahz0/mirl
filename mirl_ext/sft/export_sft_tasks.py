@@ -6,8 +6,8 @@ row gets a teacher trace, so there is no sampling here -- the 20:80 split is the
 sampling. Each task carries the FULL original prompt (all system+user turns
 flattened), every media reference in original order, its ground truth (for
 laptop-side validation only -- the generator strips it before building
-requests), and answer_style: sources in OPEN_SOURCES are free text with no
-exact-match gate, everything else is gradable. SmellNet exports the 50-class
+requests), and answer_style: sources in schema.OPEN_SOURCES are free text with
+no exact-match gate, everything else is gradable. SmellNet exports the 50-class
 single-substance task only; mixture and GC-MS rows are excluded and asserted
 absent.
 
@@ -19,95 +19,25 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import os
+import sys
 from pathlib import Path
 
-_CONFIG = Path(__file__).with_name("config.json")
-
-
-def _config_path(key: str, env: str, fallback: str) -> str:
-    """Cluster paths live in config.json (or env overrides), not in code."""
-    if os.environ.get(env):
-        return os.environ[env].rstrip("/")
-    if _CONFIG.is_file():
-        cfg = json.loads(_CONFIG.read_text())
-        if key in cfg:
-            return str(cfg[key]).rstrip("/")
-    return fallback
-
-
-DATA_ROOT = _config_path("cluster_data_root", "MIRL_DATA_ROOT", "data")
-SCRATCH_ROOT = _config_path("cluster_scratch_root", "MIRL_SCRATCH_ROOT", "scratch")
-
-FAMILIES = [
-    "smellnet_train",
-    "ecg_train",
-    "haptic_ts_train",
-    "climb_train",
-    "human_behaviour_train",
-    "tactile_train",
-]
-
-# Free-text sources (checked once against the data): captions/notes and open QA
-# whose answers can't be exact-match validated. Everything else is closed.
-OPEN_SOURCES = {
-    "haptic_tactile",                                       # haptic_ts descriptions
-    "description", "tactile_description", "mat_description",  # tactile captions/notes
-    "part_notes", "objA_notes", "objB_notes", "deformation_note",
-    "intentqa", "siq2", "mimeqa",                           # free-text video QA
-}
-
-
-def prompt_messages(row: dict) -> list[dict]:
-    """The row's FULL prompt message list -- NOT prompt[0]: smellnet/climb/tactile
-    carry system + user turns, and dropping the user turn loses the question and
-    the <image>/<video> placeholder (this bug shipped once)."""
-    p = row.get("prompt")
-    if isinstance(p, list):
-        out = []
-        for m in p:
-            if isinstance(m, dict):
-                out.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-            else:
-                out.append({"role": "user", "content": str(m)})
-        return out
-    return [{"role": "user", "content": str(p or "")}]
-
-
-def prompt_text(row: dict) -> str:
-    """All message contents joined -- what a text-only API call should receive."""
-    return "\n\n".join(m["content"] for m in prompt_messages(row) if m["content"])
-
-
-def extra(row: dict) -> dict:
-    ei = row.get("extra_info")
-    if isinstance(ei, str):
-        try:
-            ei = json.loads(ei)
-        except json.JSONDecodeError:
-            return {}
-    return ei if isinstance(ei, dict) else {}
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mirl_ext.schema import (  # noqa: E402
+    DATA_ROOT,
+    FAMILIES,
+    OPEN_SOURCES,
+    SMELLNET_BASE,
+    media_refs,
+    prompt_text,
+)
 
 
 def keep_row(family: str, data_source: str | None) -> bool:
     """SmellNet keeps only the 50-class single-substance task."""
     if family == "smellnet_train":
-        return data_source == "smellnet_base"
+        return data_source == SMELLNET_BASE
     return True
-
-
-def media_refs(row: dict) -> tuple[list[str], str]:
-    """(image paths in original order, video path). Frame counts come from the
-    video_frames config, not the row."""
-    images = []
-    for entry in row.get("images") or []:
-        images.append(entry.get("image", "") if isinstance(entry, dict) else str(entry))
-    video_path = ""
-    videos = row.get("videos") or []
-    if videos:
-        first = videos[0]
-        video_path = (first.get("video") or "") if isinstance(first, dict) else str(first)
-    return [p for p in images if p], video_path
 
 
 def main() -> None:
@@ -178,7 +108,7 @@ def main() -> None:
             if family == "smellnet_train":
                 bad = [s for s in exported_sources if "mixture" in s or "gc" in s.lower()]
                 assert not bad, f"smellnet export leaked excluded sources: {bad}"
-                assert set(exported_sources) <= {"smellnet_base"}, dict(exported_sources)
+                assert set(exported_sources) <= {SMELLNET_BASE}, dict(exported_sources)
             print(
                 f"{family:22s} half_rows={len(rows):6d} exported={len(eligible):6d} "
                 f"labels={len(labels):5d} with_media={n_media} open={n_open}"

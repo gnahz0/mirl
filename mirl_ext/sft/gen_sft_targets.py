@@ -1,7 +1,7 @@
 """Answer-blind zero-shot SFT trace generation (+ the shared API-client helpers).
 
 For every exported task the teacher sees the fixed family context
-(teacher_context.py), the task's own label definitions, the original question,
+(the versioned prompt block below), the task's own label definitions, the original question,
 and the query media -- never the ground truth, labeled demonstrations, or a
 gold-derived shortlist. Up to --max-attempts independent completions are drawn;
 the first that passes deterministic validation (structure, leak phrases,
@@ -38,7 +38,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mirl_ext.rewards import combined  # noqa: E402
 from mirl_ext.rewards._common import extract_boxed_answer, format_reward  # noqa: E402
-from mirl_ext.sft import teacher_context  # noqa: E402
 
 BASE_URL = "http://point.dd.works:18890/v1"
 # TRAPI needs the full dated deployment id (bare "gpt-5.6-sol" 404s).
@@ -70,6 +69,103 @@ _SCAFFOLD_LEAK_RE = re.compile(
 )
 
 
+# ---- teacher prompts (versioned answer-blind context; bump PROMPT_VERSION on
+# any wording change -- it is stamped into every generation record) ----
+
+PROMPT_VERSION = "abz-v2"
+
+SYSTEM_PROMPT = """\
+You are an expert at reading medical images, sensor recordings, and
+interaction videos. Answer the question from the attached media alone; you
+are not given the answer.
+
+Rules:
+1. Output EXACTLY this shape, with nothing after the boxed answer:
+   <think> reasoning </think> \\boxed{answer}
+2. Ground the reasoning in what is actually observable in THIS recording --
+   specific channels, regions, time points, relative amplitudes. Do not
+   invent measurements. Briefly rule out the closest alternative when the
+   evidence supports it.
+3. If the question lists options, \\boxed{} must copy one option verbatim
+   (or the correct letters, comma-separated, for select-all questions).
+4. Keep the reasoning to 2-5 sentences and self-contained: never mention
+   these instructions, any reference text, or image formatting."""
+
+# Only facts verified against the data/renderer: smellnet channel names are the
+# CSV headers, ECG is 8 leads x 10 s @ 250 Hz drawn one panel per lead, tactile
+# frames come from the visual-tactile glove videos, human_behaviour attaches
+# frames plus the in-prompt transcript (its <audio> tag has no attached audio).
+_FAMILY_CONTEXT = {
+    "smellnet_train": (
+        "The query is a multichannel MOX e-nose recording of one substance, shown "
+        "as one panel per sensor channel (NO2, C2H5OH, VOC, CO, Alcohol, LPG) over "
+        "time. Judge it by relative channel activation, onset and peak timing, "
+        "plateau vs. decay shape, stability, and cross-channel relationships -- "
+        "not absolute values."
+    ),
+    "ecg_train": (
+        "The query is a resting ECG recording (8 leads, 10 seconds at 250 Hz), "
+        "shown as one panel per lead. Judge rhythm regularity and rate, P/QRS/T "
+        "presence and morphology, conduction intervals, ST-segment and T-wave "
+        "changes, and which leads show them."
+    ),
+    "climb_train": (
+        "The query is a medical imaging study; the question states the modality "
+        "and the exact answer choices. When several images are attached they are "
+        "views or slices of the same case, in order; video queries are frames "
+        "sampled evenly in time from one scan or clip."
+    ),
+    "human_behaviour_train": (
+        "The query is a human-interaction video, attached as frames sampled evenly "
+        "in time (first to last). The spoken content appears as a transcript inside "
+        "the question text; audio itself is not attached, and any <audio> tag in "
+        "the question is formatting to ignore. Judge facial expression, gesture, "
+        "posture, scene context, and the transcript's wording and tone."
+    ),
+    "tactile_train": (
+        "The query is an interaction video from a sensorized-glove recording, "
+        "attached as frames sampled evenly in time (first and last included). "
+        "Frames may show the hand-object interaction and tactile pressure "
+        "visualization. Judge contact timing, which fingers or palm engage, "
+        "relative pressure and its stability, contact geometry, and object "
+        "deformation. For select-all-that-apply questions answer with every "
+        "correct option letter, comma-separated."
+    ),
+    "haptic_ts_train": (
+        "The query is a tactile recording from a sensorized glove, shown as a "
+        "taxel-activation heatmap over time plus a total-force trace. Judge when "
+        "contact starts and ends, how pressure is distributed and evolves, and "
+        "force stability."
+    ),
+    "haptic_mcq_train": (
+        "The query is a tactile recording from a sensorized glove, shown as a "
+        "taxel-activation heatmap over time plus a total-force trace. Judge when "
+        "contact starts and ends, how pressure is distributed and evolves, and "
+        "force stability. For select-all-that-apply questions answer with every "
+        "correct option letter, comma-separated."
+    ),
+}
+
+
+def load_descriptions(path: str | Path) -> dict[str, str]:
+    """The 50 upstream SmellNet substance descriptions (weak priors)."""
+    desc = json.loads(Path(path).read_text())
+    if len(desc) != 50:
+        raise SystemExit(f"{path}: expected 50 substance descriptions, got {len(desc)}")
+    return desc
+
+
+def family_context(family: str, descriptions: dict[str, str] | None = None) -> str:
+    ctx = _FAMILY_CONTEXT[family]
+    if family == "smellnet_train" and descriptions:
+        lines = [f"- {name}: {descriptions[name]}" for name in sorted(descriptions)]
+        ctx += (
+            "\n\nReference substance descriptions (uncertain class-level priors, "
+            "not measured prototypes):\n" + "\n".join(lines)
+        )
+    return ctx
+
+
 # ---- shared helpers (imported by gen_sft_episodes) ----
 
 def load_api_key() -> str:
@@ -99,11 +195,6 @@ def make_client(timeout: float):
 def backoff(attempt: int) -> None:
     """Exponential + jitter. Callers skip it after the final attempt."""
     time.sleep(min(30.0, 2.0**attempt) * (0.5 + random.random()))
-
-
-def read_done_uids(path: Path) -> set[str]:
-    """All uids present in the output JSONL (tolerates a truncated tail)."""
-    return set(read_status(path))
 
 
 def read_status(path: Path) -> dict[str, str]:
@@ -180,7 +271,7 @@ def build_request(task: TeacherTask, image_root, descriptions) -> tuple[list[dic
     question = re.sub(r"<(image|video|audio)>", "", task.prompt).strip()
     content: list[dict] = [{
         "type": "text",
-        "text": f"{teacher_context.family_context(task.family, descriptions)}"
+        "text": f"{family_context(task.family, descriptions)}"
         f"\n\nQUESTION:\n{question}",
     }]
 
@@ -192,7 +283,7 @@ def build_request(task: TeacherTask, image_root, descriptions) -> tuple[list[dic
         content.append(_img(str(resolved)))
     return (
         [
-            {"role": "system", "content": teacher_context.SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ],
         len(media),
@@ -248,7 +339,7 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
         "status": None,
         "model": args.model,
         "mode": MODE,
-        "prompt_version": teacher_context.PROMPT_VERSION,
+        "prompt_version": PROMPT_VERSION,
         "n_attempts": 0,
         "accepted_attempt": None,
         "response": None,
@@ -365,7 +456,7 @@ def main() -> None:
     tasks = [TeacherTask.from_row(t) for t in rows]
 
     descriptions = (
-        teacher_context.load_descriptions(args.descriptions)
+        load_descriptions(args.descriptions)
         if args.descriptions.is_file() and any(t.family == "smellnet_train" for t in tasks)
         else None
     )

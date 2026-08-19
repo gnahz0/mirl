@@ -43,7 +43,6 @@ def _build_text_label_bank(
             for start in range(0, len(labels), batch_size)
         ]
         bank[family] = (labels, torch.cat(chunks, dim=0).detach())
-        logger.info("text label bank: family=%s labels=%d", family, len(labels))
     return bank
 
 
@@ -68,7 +67,22 @@ def _label_siglip_loss(
     logit_bias: torch.Tensor,
     world_size: int = 1,
 ) -> torch.Tensor:
-    """Compute class-balanced SigLIP against one complete text-label bank."""
+    """Compute class-balanced SigLIP against one complete text-label bank.
+
+    Args:
+        z_ts: (N, D) L2-normalized signal embeddings for the rank-local rows.
+        labels: Ground-truth label per row; each must be in ``candidate_labels``.
+        candidate_labels: The family's complete label vocabulary.
+        text_embeddings: (K, D) bank embeddings aligned with ``candidate_labels``.
+        log_logit_scale: Learned SigLIP temperature (log space).
+        logit_bias: Learned SigLIP bias.
+        world_size: DDP world size; class counts reduce globally.
+
+    Returns:
+        Scalar loss: candidate-pair BCE summed per anchor, then a class-balanced
+        anchor mean, pre-scaled by ``world_size`` so DDP's gradient averaging
+        yields the exact global supported-class mean.
+    """
     num_labels = len(candidate_labels)
     label_to_id = {label: idx for idx, label in enumerate(candidate_labels)}
     targets = torch.tensor(
@@ -105,8 +119,24 @@ def _tactile_siglip_loss(
     world_size: int = 1,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Score all six tactile tasks in one masked pass over the shared 30-label bank.
+
     ``mask`` marks known (row, label) pairs; only a zero weight stops an unannotated
-    row's all-zero target from reading as "every finger is absent"."""
+    row's all-zero target from reading as "every finger is absent".
+
+    Args:
+        z_ts: (N, D) L2-normalized tactile embeddings for the rank-local rows.
+        targets: (N, 30) multi-hot targets over the concatenated task spans.
+        mask: (N, 30) 1.0 where the row's task is annotated, 0.0 elsewhere.
+        text_embeddings: (30, D) bank from ``_build_tactile_bank``.
+        log_logit_scale: Learned SigLIP temperature (log space).
+        logit_bias: Learned SigLIP bias.
+        world_size: DDP world size; per-task observed counts reduce globally.
+
+    Returns:
+        (loss, per_task): the equal-weight mean over globally observed task
+        losses (``None`` when no task is observed on any rank), and detached
+        ``loss/task/<name>`` diagnostics for the observed tasks.
+    """
     device = z_ts.device
     target = targets.to(device)
     weight = mask.to(device)
@@ -131,8 +161,7 @@ def _tactile_siglip_loss(
     present = task_observed > 0
     if not bool(present.any()):
         return None, {}
-    # Per-task mean over its own known pairs, then an equal mean across present tasks.
-    # DDP averages rank gradients, so the local sum is rescaled by world_size / global pair count.
+
     task_losses = per_task_sum[present] * world_size / task_observed[present]
     per_task = {
         f"loss/task/{task}": float(task_sums[index] / task_observed[index])
@@ -151,7 +180,23 @@ def _compute_losses(
     tactile_bank: tuple[tuple[str, ...], torch.Tensor],
     world_size: int = 1,
 ) -> tuple[torch.Tensor, dict, TSEval]:
-    """Compute family label-bank SigLIP and frozen-Qwen preservation losses."""
+    """Compute family label-bank SigLIP and frozen-Qwen preservation losses.
+
+    Args:
+        model: Alignment model; its forward encodes the batch's media.
+        batch: One source-homogeneous batch from ``collate_alignment``.
+        cfg: Run config; reads ``loss.siglip_weight``, ``loss.distill_weight``,
+            and ``data.max_image_tokens``.
+        label_bank: Family -> (labels, embeddings) from ``_build_text_label_bank``.
+        tactile_bank: (labels, embeddings) from ``_build_tactile_bank``.
+        world_size: DDP world size for the global loss reductions.
+
+    Returns:
+        (total, metrics, ts_eval): the weighted scalar training loss, detached
+        scalar metrics keyed for W&B, and the ``TSEval`` tuple consumed by
+        ``update_stats`` — (embeddings, labels, families, tactile targets,
+        tactile masks), empty/None for visual batches.
+    """
     metrics: dict[str, float] = {}
 
     kind = batch["kind"]
@@ -210,7 +255,6 @@ def _compute_losses(
             feat_img.float(),
             feat_ref_img.detach().float(),
             dim=-1,
-            eps=1e-6,
         )
         visual_sample_loss = torch.segment_reduce(
             token_loss,
@@ -236,7 +280,5 @@ def _compute_losses(
         metrics,
         (
             (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
-            if z_ts is not None
-            else (None, [], [], None, None)
         ),
     )

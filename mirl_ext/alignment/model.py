@@ -10,18 +10,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mirl_ext import signals as _signals
+
 
 class MultimodalAlignmentModel(nn.Module):
     """Trainable Qwen vision tower, frozen image anchor, and SigLIP2 text tower."""
 
     def __init__(
         self,
+        max_video_frames: int,
         qwen35_path: str = "Qwen/Qwen3.5-9B",
         siglip2_text_path: str = "google/siglip2-so400m-patch16-naflex",
-        max_video_frames: int = 8,
     ):
-        from transformers import AutoProcessor, AutoTokenizer, Siglip2TextModel
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+        from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, Siglip2TextModel
 
         super().__init__()
 
@@ -32,13 +33,15 @@ class MultimodalAlignmentModel(nn.Module):
             min_frames=1,
             max_frames=max_video_frames,
         )
-        self.trainable_visual = Qwen3_5VisionModel.from_pretrained(
+        full_model = AutoModelForImageTextToText.from_pretrained(
             qwen35_path,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             attn_implementation="sdpa",
             local_files_only=True,
-            key_mapping={r"^model\.visual\.": ""},
         )
+        # Keep only the vision tower; the language stack is freed with full_model.
+        self.trainable_visual = full_model.model.visual
+        del full_model
 
         self.frozen_visual = copy.deepcopy(self.trainable_visual)
         self.frozen_visual.requires_grad_(False).eval()
@@ -49,9 +52,7 @@ class MultimodalAlignmentModel(nn.Module):
         self.vit_merge_size = int(vcfg.spatial_merge_size)
 
         self.label_tokenizer = AutoTokenizer.from_pretrained(siglip2_text_path, local_files_only=True)
-        self.label_text_model = Siglip2TextModel.from_pretrained(siglip2_text_path, local_files_only=True).to(
-            dtype=torch.bfloat16
-        )
+        self.label_text_model = Siglip2TextModel.from_pretrained(siglip2_text_path, local_files_only=True).to(dtype=torch.bfloat16)
         self.label_text_model.requires_grad_(False).eval()
 
         self.log_logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
@@ -115,46 +116,18 @@ class MultimodalAlignmentModel(nn.Module):
         features = self.encode_visual(pixels, grid, pool=False)
         references = self.encode_visual(pixels, grid, frozen=True, pool=False)
         return features, references, token_counts, None, logit_scale, logit_bias
-
+    
+    # Rendering lives in mirl_ext.signals (shared with the future native-signal
+    # student path); these delegates keep the model's call surface unchanged.
     @staticmethod
-    def _robust_normalize_rows(x: torch.Tensor) -> torch.Tensor:
-        """Normalize each row with a robust scale and a std fallback."""
-        x = torch.nan_to_num(x.float())
-        median = x.median(dim=-1, keepdim=True).values
-        centered = x - median
-        mad = centered.abs().median(dim=-1, keepdim=True).values / 0.6745
-        std = x.std(dim=-1, keepdim=True, unbiased=False)
-        mad_blend, tanh_gain = 0.7, 2.0
-        blended = mad_blend * mad + (1.0 - mad_blend) * std
-        # Quantized/sparse traces can have MAD=0 despite variation: use full std, not the 0.3-shrunk blend.
-        # Constant rows still map exactly to 0.
-        scale = torch.where(mad > 1e-6, blended, std).clamp_min(1e-6)
-        return torch.tanh(centered / (tanh_gain * scale))
+    def _normalize(x: torch.Tensor) -> torch.Tensor:
+        return _signals.normalize(x)
 
-    def _timeseries_frames(self, signal: torch.Tensor, prestandardized: bool = False) -> torch.Tensor:
-        """Pack consecutive merger-cell-width signal blocks as video frames."""
-        cell = self.vit_patch_size * self.vit_merge_size
-        finite = torch.isfinite(signal)
-        raw = signal.float()
-        value = torch.nan_to_num(raw).clamp(-4.0, 4.0) / 4.0 if prestandardized else self._robust_normalize_rows(raw)
-        value = value.masked_fill(~finite, -1.0)
-
-        channels, steps = value.shape
-        frame_count = math.ceil(steps / cell)
-        padded = F.pad(value, (0, frame_count * cell - steps), value=-1.0)
-        tiles = padded.reshape(channels, frame_count, cell).permute(1, 0, 2)
-        tiles = tiles.repeat_interleave(cell, dim=1)
-        return tiles.unsqueeze(1).expand(-1, 3, -1, -1)
+    def _timeseries_frames(self, signal: torch.Tensor) -> torch.Tensor:
+        return _signals.timeseries_frames(signal, self.vit_patch_size * self.vit_merge_size)
 
     def _tactile_frames(self, tactile: torch.Tensor) -> torch.Tensor:
-        """Normalize each taxel over time and resize each map to one merger cell."""
-        side = self.vit_patch_size * self.vit_merge_size
-        finite = torch.isfinite(tactile)
-        taxels = tactile.float().flatten(1).t()
-        value = self._robust_normalize_rows(taxels).t().reshape_as(tactile)
-        value = value.masked_fill(~finite, -1.0)
-        value = F.interpolate(value.unsqueeze(1), size=(side, side), mode="nearest")
-        return value.expand(-1, 3, -1, -1)
+        return _signals.tactile_frames(tactile, self.vit_patch_size * self.vit_merge_size)
 
     def encode_ts_trainable(
         self,
@@ -166,9 +139,8 @@ class MultimodalAlignmentModel(nn.Module):
         if family == "tactile":
             videos = [self._tactile_frames(signal.to(device)) for signal in signals]
         else:
-            videos = [self._timeseries_frames(signal.to(device), prestandardized=family == "ecg") for signal in signals]
+            videos = [self._timeseries_frames(signal.to(device)) for signal in signals]
 
-        # Sensor frames are already normalized and merger-aligned.
         processed = self.qwen_processor.video_processor(
             videos,
             do_convert_rgb=False,
@@ -194,8 +166,8 @@ class MultimodalAlignmentModel(nn.Module):
             texts,
             padding="max_length",
             truncation=True,
-            max_length=int(self.label_text_model.config.max_position_embeddings),
+            max_length=self.label_text_model.config.max_position_embeddings,
             return_tensors="pt",
         )
-        embeddings = self.label_text_model(**tokens.to(device)).pooler_output.float()
-        return F.normalize(embeddings, dim=-1, eps=1e-6)
+        text_embeds = self.label_text_model(**tokens.to(device)).pooler_output.float()
+        return F.normalize(text_embeds, dim=-1)

@@ -3,7 +3,7 @@
 The split (`split_sft_rl.py`; ratio from `sft_frac` in config.json, group-level,
 stratified by (data_source, label)) puts 20% of each family in SFT and 80% in RL. Every SFT
 row gets a teacher trace: the teacher sees the family context
-(`teacher_context.py`), the original question (options and all), and the query
+(the versioned prompt block in `gen_sft_targets.py`), the original question (options and all), and the query
 media — never the answer or demonstrations. Up to 4 attempts; the first
 completion that passes validation (structure, leak phrases, rationale length,
 answer == ground truth under the same `mirl_ext.rewards.combined` scorer RL
@@ -52,7 +52,6 @@ chokes, split them into two files.
 
 Native signals remain unintegrated: `split_grpo` time-series rows are rendered
 plots (`signals` dropped at rewrite; refs recoverable via
-`ts_images/<ds>_map.json`). Missing: an alignment-tower → full-HF-checkpoint
-exporter and a signals → pseudo-video dataset mapping (recipe:
-`alignment/model.py::_timeseries_frames`). Until then ts-family SFT trains the
-plot baseline, same as GRPO.
+`ts_images/<ds>_map.json`). Build the aligned-Qwen checkpoint with
+`mirl_ext/alignment/export_stage1_vision.py`; a signals → pseudo-video SFT mapping is still
+missing, so ts-family SFT trains the plot baseline, same as GRPO.

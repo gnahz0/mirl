@@ -1,7 +1,7 @@
 #!/bin/bash
 # Production Stage-1 Qwen3.5 vision-encoder alignment.
 # Submit from the synced cluster checkout:
-#   sbatch examples/mirl/slurm/run_stage1_b200.sbatch
+#   sbatch mirl_ext/alignment/run_stage1_b200.sbatch
 #
 # The YAML is the experiment definition; this file only supplies cluster paths,
 # credentials, caches, and four-GPU launch settings.

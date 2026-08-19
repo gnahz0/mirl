@@ -5,15 +5,20 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-from collections import Counter
+import sys
+import wandb
+import transformers
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import torch
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 
+from .data import AlignmentDataset, HomogeneousBatchSampler, collate_alignment
 from .metrics import (
     _COUNT_KEYS,
     _REDUCED_METRIC_KEYS,
@@ -31,16 +36,116 @@ from .objective import (
     _build_text_label_bank,
     _compute_losses,
 )
-from .runtime import (
-    build_loaders,
-    build_optimizer,
-    load_checkpoint,
-    load_training_state,
-    save_checkpoint,
-    setup_logging,
-)
-
 logger = logging.getLogger("alignment.trainer")
+
+
+def setup_logging(level_name: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level_name.upper()),
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        stream=sys.stdout,
+    )
+    for name in ("qwen_vl_utils", "qwen_vl_utils.vision_process", "torchcodec"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+
+def build_loaders(
+    cfg: DictConfig,
+    rank: int,
+    world_size: int,
+    seed: int,
+) -> tuple[
+    AlignmentDataset,
+    AlignmentDataset,
+    DataLoader,
+    HomogeneousBatchSampler,
+    DataLoader,
+]:
+    train_ds = AlignmentDataset(list(cfg.data.train_files))
+
+    train_sampler = HomogeneousBatchSampler(
+        train_ds,
+        batch_size=cfg.train.batch_size,
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
+        signal_repeat_factors=dict(cfg.train.signal_repeat_factors),
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        num_workers=cfg.train.num_workers,
+        collate_fn=collate_alignment,
+        pin_memory=True,
+        multiprocessing_context="spawn" if cfg.train.num_workers else None,
+        persistent_workers=bool(cfg.train.num_workers),
+    )
+
+    val_ds = AlignmentDataset(list(cfg.data.val_files))
+    val_loader = DataLoader(
+        val_ds,
+        batch_sampler=HomogeneousBatchSampler(
+            val_ds,
+            batch_size=cfg.train.val_batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=seed + 1,
+        ),
+        num_workers=0,
+        collate_fn=collate_alignment,
+        pin_memory=True,
+    )
+
+    return train_ds, val_ds, train_loader, train_sampler, val_loader
+
+
+def load_checkpoint(model: MultimodalAlignmentModel, path: str) -> None:
+    """Warm-start trainable model weights from an alignment_state.pt file."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    model.trainable_visual.load_state_dict(state["trainable_visual"], strict=True)
+    with torch.no_grad():
+        model.log_logit_scale.copy_(state["log_logit_scale"])
+        model.logit_bias.copy_(state["logit_bias"])
+
+
+def load_training_state(path: str, optimizer, scheduler) -> dict[str, Any]:
+    """Restore optimizer/scheduler state from a trainer_state.pt file."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    optimizer.load_state_dict(state.pop("optimizer"))
+    scheduler.load_state_dict(state.pop("scheduler"))
+    return state
+
+
+def save_checkpoint(
+    model: MultimodalAlignmentModel,
+    path: Path,
+    cfg: DictConfig,
+    step: int,
+    *,
+    optimizer=None,
+    scheduler=None,
+    progress: dict[str, Any] | None = None,
+) -> None:
+    """Save model weights and, when supplied, resumable trainer state."""
+    path.mkdir(parents=True, exist_ok=True)
+    state = {
+        "trainable_visual": model.trainable_visual.state_dict(),
+        "log_logit_scale": model.log_logit_scale.detach().cpu(),
+        "logit_bias": model.logit_bias.detach().cpu(),
+        "step": step,
+    }
+    torch.save(state, path / "alignment_state.pt")
+    if optimizer is not None:
+        trainer_state = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step": step,
+            **(progress or {}),
+        }
+        torch.save(trainer_state, path / "trainer_state.pt")
+    OmegaConf.save(cfg, path / "config.yaml")
 
 
 @dataclass
@@ -66,8 +171,6 @@ class AccumulationWindow:
         self.counts = dict.fromkeys(_COUNT_KEYS, 0)
 
     def add(self, batch: dict, metrics: dict, ts_eval: tuple) -> None:
-        for kind, value in batch.get("skipped", {}).items():
-            self.counts[f"n/skipped_{kind}"] += int(value)
         size = len(batch["media"])
         if batch["kind"] == "signal":
             self.counts[f"n/ts_{batch['family']}"] += size
@@ -78,8 +181,6 @@ class AccumulationWindow:
             if key in self.loss_sums:
                 self.loss_sums[key] += float(value)
                 self.loss_counts[key] += 1
-            elif key.startswith("loss/"):
-                raise RuntimeError(f"metric absent from _REDUCED_METRIC_KEYS: {key}")
             else:
                 # Gradient norm and SigLIP calibration are rank-local diagnostics.
                 self.local_values.setdefault(key, []).append(float(value))
@@ -153,44 +254,34 @@ def _run_validation(model, val_loader, cfg, accelerator, label_bank, tactile_ban
 
 def train(cfg: DictConfig) -> None:
     setup_logging(cfg.log_level)
-    accelerator = Accelerator(mixed_precision=str(cfg.train.amp_dtype))
+    accelerator = Accelerator(mixed_precision="bf16")
     rank = accelerator.process_index
     world_size = accelerator.num_processes
     is_main = accelerator.is_main_process
     seed = int(cfg.train.seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    if not is_main:
-        logging.getLogger().setLevel(logging.WARNING)
 
     device = accelerator.device
     out_dir = Path(cfg.train.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(
-        "Stage 1 on rank %d/%d, %s (%.1f GiB), output=%s",
-        rank,
-        world_size,
-        torch.cuda.get_device_name(device),
-        torch.cuda.get_device_properties(device).total_memory / (1024**3),
-        out_dir,
-    )
 
     init_checkpoint = cfg.train.init_checkpoint
     resume_checkpoint = cfg.train.resume_checkpoint
 
     train_ds, val_ds, train_loader, train_sampler, val_loader = build_loaders(cfg, rank, world_size, seed)
+
     model = MultimodalAlignmentModel(
-        qwen35_path=str(cfg.model.qwen35_path),
-        siglip2_text_path=str(cfg.model.siglip2_text_path),
-        max_video_frames=int(cfg.data.max_video_frames),
+        qwen35_path=cfg.model.qwen35_path,
+        siglip2_text_path=cfg.model.siglip2_text_path,
+        max_video_frames=cfg.data.max_video_frames,
     ).to(device)
+
     if cfg.train.gradient_checkpointing:
         model.trainable_visual.gradient_checkpointing_enable()
-    trainable = [param for param in model.parameters() if param.requires_grad]
-    for param in trainable:
-        param.data = param.data.float()
-    if init_checkpoint or resume_checkpoint:
-        load_checkpoint(model, str(init_checkpoint or resume_checkpoint))
+    
+    if init_checkpoint:
+        load_checkpoint(model, str(init_checkpoint))
 
     # Encode each split's complete label banks once.
     train_label_bank = _build_text_label_bank(model, train_ds.ts_label_vocabs, device)
@@ -199,19 +290,27 @@ def train(cfg: DictConfig) -> None:
     # One scoring-unit list per split for the whole run; every window reuses it.
     train_specs = build_bank_specs(train_label_bank, tactile_bank)
     val_specs = build_bank_specs(val_label_bank, tactile_bank)
-    free, total = torch.cuda.mem_get_info()
-    logger.info(
-        "GPU memory after load: %.2f / %.2f GiB",
-        (total - free) / (1024**3),
-        total / (1024**3),
-    )
 
-    grad_accum = int(cfg.train.grad_accum_steps)
-    num_epochs = int(cfg.train.num_train_epochs)
+    grad_accum = cfg.train.grad_accum_steps
+    num_epochs = cfg.train.num_train_epochs
     micro_batches_per_epoch = len(train_loader)
     steps_per_epoch = math.ceil(micro_batches_per_epoch / grad_accum)
     total_steps = num_epochs * steps_per_epoch
-    optimizer, scheduler = build_optimizer(model, cfg, total_steps)
+
+    trainable = [param for param in model.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for p in trainable if p.ndim > 1], "weight_decay": cfg.train.weight_decay},
+            {"params": [p for p in trainable if p.ndim <= 1], "weight_decay": 0.0},
+        ],
+        lr=cfg.train.lr,
+    )
+    scheduler = transformers.get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=math.ceil(total_steps * cfg.train.warmup_ratio),
+        num_training_steps=total_steps,
+    )
+    
     model, optimizer = accelerator.prepare(model, optimizer)
     base_model = accelerator.unwrap_model(model)
     resume_progress = None
@@ -226,37 +325,20 @@ def train(cfg: DictConfig) -> None:
                 f"total_steps {saved_total_steps} != {total_steps}; use "
                 "train.init_checkpoint for a weights-only continuation"
             )
+    
     if is_main:
-        import wandb
-
         wandb_run = wandb.init(
-            project=str(cfg.wandb.project),
-            name=str(cfg.wandb.name),
+            project=cfg.wandb.project,
+            name=cfg.wandb.name,
             config=OmegaConf.to_container(cfg, resolve=True),
             settings=wandb.Settings(console="off"),
         )
-        logger.info("W&B run initialized: %s", wandb_run.url)
-    else:
-        wandb_run = None
+
     model.train()
     base_model.frozen_visual.eval()
     base_model.label_text_model.eval()
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed_all(seed + rank)
-
-    effective_batch = cfg.train.batch_size * world_size * grad_accum
-    logger.info(
-        "training %d epoch(s), %d microbatches/epoch, %d optimizer steps/epoch "
-        "(%d total); batch/rank=%d, GPUs=%d, accumulation=%d, effective batch=%d",
-        num_epochs,
-        micro_batches_per_epoch,
-        steps_per_epoch,
-        total_steps,
-        cfg.train.batch_size,
-        world_size,
-        grad_accum,
-        effective_batch,
-    )
 
     window_args = (
         device,
@@ -265,25 +347,11 @@ def train(cfg: DictConfig) -> None:
         base_model.logit_bias,
     )
     window = AccumulationWindow(*window_args)
-    cumulative_counts: Counter[str] = Counter()
     opt_step = int(resume_progress["step"]) if resume_progress else 0
     best_value = float(resume_progress["best_value"]) if resume_progress else float("-inf")
     start_epoch = int(resume_progress["next_epoch"]) if resume_progress else 0
     start_batch_index = int(resume_progress["next_batch_index"]) if resume_progress else 0
-    if start_batch_index % grad_accum:
-        raise ValueError("resume checkpoint is not at an optimizer-step boundary")
-    if start_epoch >= num_epochs:
-        raise ValueError(
-            f"resume checkpoint already completed epoch {start_epoch} of {num_epochs}; "
-            "use train.init_checkpoint to start a new schedule"
-        )
-    if resume_progress:
-        logger.info(
-            "resuming at optimizer step %d, epoch %d, microbatch %d",
-            opt_step,
-            start_epoch,
-            start_batch_index,
-        )
+
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, num_epochs):
@@ -313,7 +381,7 @@ def train(cfg: DictConfig) -> None:
                 continue
 
             window.local_values.setdefault("grad_norm", []).append(
-                float(accelerator.clip_grad_norm_(trainable, cfg.train.grad_clip))
+                float(accelerator.clip_grad_norm_(model.parameters(), cfg.train.grad_clip))
             )
             metrics, counts, window_metrics = window.flush(world_size)
             optimizer.step()
@@ -322,23 +390,9 @@ def train(cfg: DictConfig) -> None:
             optimizer.zero_grad(set_to_none=True)
             opt_step += 1
 
-            cumulative_counts.update(counts)
             validate_now = opt_step % cfg.train.val_every == 0 or end_of_epoch
             if is_main:
                 payload = _metric_groups("train", metrics, counts, window_metrics)
-                skipped_total = sum(cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal"))
-                valid_total = (
-                    cumulative_counts["n/img_image"]
-                    + cumulative_counts["n/img_video"]
-                    + cumulative_counts["n/ts_signal"]
-                )
-                for kind in ("image", "video", "signal"):
-                    payload[f"train-aux/n/skipped_cumulative/{kind}"] = float(cumulative_counts[f"n/skipped_{kind}"])
-                payload["train-aux/n/skipped_cumulative/total"] = float(skipped_total)
-                payload["train-aux/skipped_fraction_cumulative"] = skipped_total / max(
-                    valid_total + skipped_total,
-                    1,
-                )
                 wandb_run.log(
                     {
                         **payload,
@@ -418,13 +472,7 @@ def train(cfg: DictConfig) -> None:
     if is_main:
         save_checkpoint(base_model, out_dir / "final", cfg, opt_step)
         wandb_run.finish()
-        logger.info(
-            "training complete: best %s=%.4f; skipped=%s; final=%s",
-            cfg.train.best_metric,
-            best_value,
-            {kind: cumulative_counts[f"n/skipped_{kind}"] for kind in ("image", "video", "signal")},
-            out_dir / "final",
-        )
+
     accelerator.wait_for_everyone()
     accelerator.end_training()
 

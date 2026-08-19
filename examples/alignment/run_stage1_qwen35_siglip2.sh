@@ -38,6 +38,6 @@ mkdir -p "${WANDB_DIR}"
 echo "Launching ${NUM_GPUS} GPU(s) via torchrun (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 set -x
 torchrun --standalone --nnodes=1 --nproc_per_node="${NUM_GPUS}" \
-    -m mirl_ext.alignment.trainer \
+    -m mirl_ext.alignment.train \
     --config "${CONFIG}" \
     "$@"

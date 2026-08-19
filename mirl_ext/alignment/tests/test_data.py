@@ -3,7 +3,6 @@ import json
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 import torch
 
 from mirl_ext.alignment.data import (
@@ -112,11 +111,6 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     assert sample["targets"]["initial_fingers"] == (0, 1, 5)
     assert sample["targets"]["force_level"] == (1,)
     assert dataset.ts_label_vocabs == {"smellnet": ("apple",)}
-    assert set(dataset.sampling_groups) == {
-        ("signal", "haptic_tactile"),
-        ("signal", "smellnet_base"),
-        ("video", "initial_fingers"),
-    }
 
     batch = collate_alignment([sample])
     # One (1, 30) target/mask pair over the concatenated vocabularies; each answer lands in its task's span.
@@ -143,105 +137,6 @@ def test_structured_tactile_join_masks_conflicting_answers():
     assert _annotation_targets(rows, {"recording"})["recording"] == {}
 
 
-def test_visual_annotations_are_deduplicated_by_media_path(tmp_path):
-    rows = [
-        {
-            "data_source": "tactile",
-            "images": None,
-            "videos": [{"video": "/data/shared.mp4"}],
-            "reward_model": {"ground_truth": answer},
-        }
-        for answer in ("A", "B", "C")
-    ]
-    rows += [
-        {
-            "data_source": "climb",
-            "images": [{"image": "/data/shared.png"}],
-            "videos": None,
-            "reward_model": {"ground_truth": answer},
-        }
-        for answer in ("normal", "abnormal")
-    ]
-
-    dataset = _dataset(tmp_path, "visual", rows)
-
-    assert len(dataset) == 2
-    assert len(dataset.sampling_groups[("image", "climb")]) == 1
-    assert len(dataset.sampling_groups[("video", "tactile")]) == 1
-    assert all("reward_model" not in row and "data_source" in row for row in dataset.rows)
-
-
-def test_multi_media_rows_expand_every_unique_path(tmp_path):
-    rows = [
-        {
-            "data_source": "climb",
-            "images": [{"image": f"/data/image-{index}.png"} for index in range(4)],
-            "videos": None,
-            "reward_model": {"ground_truth": "first annotation"},
-        },
-        {
-            "data_source": "climb",
-            "images": [
-                {"image": "/data/image-0.png"},
-                {"image": "/data/image-4.png"},
-            ],
-            "videos": None,
-            "reward_model": {"ground_truth": "repeated annotation"},
-        },
-        {
-            "data_source": "tactile",
-            "images": None,
-            "videos": [
-                {"video": "/data/video-0.mp4"},
-                {"video": "/data/video-1.mp4"},
-            ],
-            "reward_model": {"ground_truth": "video annotation"},
-        },
-    ]
-
-    dataset = _dataset(tmp_path, "multi-visual", rows)
-
-    assert len(dataset) == 7
-    assert len(dataset.sampling_groups[("image", "climb")]) == 5
-    assert len(dataset.sampling_groups[("video", "tactile")]) == 2
-    assert all(len(row.get("images") or []) + len(row.get("videos") or []) == 1 for row in dataset.rows)
-    assert {entry[0]["image"] for row in dataset.rows if (entry := row.get("images"))} == {
-        f"/data/image-{index}.png" for index in range(5)
-    }
-    assert {entry[0]["video"] for row in dataset.rows if (entry := row.get("videos"))} == {
-        "/data/video-0.mp4",
-        "/data/video-1.mp4",
-    }
-
-    rank0 = list(HomogeneousBatchSampler(dataset, 4, rank=0, world_size=2, seed=5))
-    rank1 = list(HomogeneousBatchSampler(dataset, 4, rank=1, world_size=2, seed=5))
-    visited = [index for batches in zip(rank0, rank1, strict=True) for batch in batches for index in batch]
-    assert len(visited) == len(set(visited)) == len(dataset)
-
-
-def test_collate_filters_failed_items_and_counts_them():
-    batch = collate_alignment(
-        [
-            {"kind": "image", "media": "valid-a"},
-            {"kind": "skipped", "failed_kind": "image", "path": "/bad-a.jpg"},
-            {"kind": "image", "media": "valid-b"},
-        ]
-    )
-
-    assert batch == {
-        "kind": "image",
-        "media": ["valid-a", "valid-b"],
-        "family": None,
-        "text": [],
-        "skipped": {"image": 1, "video": 0, "signal": 0},
-    }
-
-
-def test_collate_rejects_an_entirely_unreadable_local_batch():
-    with pytest.raises(RuntimeError, match="refusing an empty DDP batch"):
-        collate_alignment([{"kind": "skipped", "failed_kind": "video", "path": "/bad.mp4"}])
-
-
 def test_collate_keeps_complete_source_homogeneous_signals():
     signals = [
         torch.arange(12, dtype=torch.float32).reshape(2, 6),
@@ -263,7 +158,6 @@ def test_collate_keeps_complete_source_homogeneous_signals():
     assert batch["family"] == "smellnet"
     assert all(actual is expected for actual, expected in zip(batch["media"], signals, strict=True))
     assert batch["text"] == ["apple", "pear"]
-    assert batch["skipped"] == {"image": 0, "video": 0, "signal": 0}
 
 
 class _GroupedDataset:

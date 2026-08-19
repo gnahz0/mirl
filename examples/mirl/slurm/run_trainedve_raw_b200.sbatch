@@ -84,7 +84,7 @@ cd /work/mit/ppliang_mit/alecz/mirl-trainedve
 # baseline-ve-main history (which caused wandb "step < current step, ignored" drops).
 RUN_VARIANT="trainedve"
 STOCK_VE=/work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
-ALIGNMENT_BEST=/scratch/dvdai_mit/alecz/checkpoints/alignment_stage1_v2/best
+ALIGNMENT_BEST=/scratch/dvdai_mit/alecz/checkpoints/alignment_stage1_v2/best/alignment_state.pt
 TRAINED_VE=/scratch/dvdai_mit/alecz/models/qwen3vl-8b-trained-ve-correct-v2
 case "$RUN_VARIANT" in
   baseline)
