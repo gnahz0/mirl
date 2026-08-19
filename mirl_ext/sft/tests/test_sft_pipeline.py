@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from mirl_ext.rewards import combined  # noqa: E402
-from mirl_ext.schema import OPEN_SOURCES, prompt_messages, prompt_text  # noqa: E402
+from mirl_ext.data.schema import OPEN_SOURCES, prompt_messages, prompt_text  # noqa: E402
 from mirl_ext.sft.build_sft_parquet import (  # noqa: E402
     accepted_traces,
     build_record,

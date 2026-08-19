@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mirl_ext import signals as _signals
+from mirl_ext.data import signals as _signals
 
 
 class MultimodalAlignmentModel(nn.Module):

@@ -9,9 +9,9 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from mirl_ext.schema import MULTILABEL_TASKS, SMELLNET_MIXTURE, recording_stem
-from mirl_ext.schema import TACTILE_TASK_LABELS as TASK_LABELS
-from mirl_ext.signals import load_signal, signal_family as _signal_family
+from mirl_ext.data.schema import MULTILABEL_TASKS, SMELLNET_MIXTURE, recording_stem
+from mirl_ext.data.schema import TACTILE_TASK_LABELS as TASK_LABELS
+from mirl_ext.data.signals import load_signal, signal_family as _signal_family
 
 # Metric reduction order must be identical on every rank, so this tuple is the one
 # definition of it; tactile aligns against TASK_LABELS and never has a vocabulary.

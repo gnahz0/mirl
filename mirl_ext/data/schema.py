@@ -13,7 +13,7 @@ import json
 import os
 from pathlib import Path
 
-_CONFIG = Path(__file__).parent / "sft" / "config.json"
+_CONFIG = Path(__file__).parents[1] / "sft" / "config.json"
 
 
 def config_path(key: str, env: str, fallback: str) -> str:

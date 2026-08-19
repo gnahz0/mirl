@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mirl_ext.schema import DATA_ROOT, config_path, first_media_path, recording_stem  # noqa: E402
+from mirl_ext.data.schema import DATA_ROOT, config_path, first_media_path, recording_stem  # noqa: E402
 
 # Target SFT share of rows; lives in config.json ("sft_frac") like the paths.
 SFT_FRAC = float(config_path("sft_frac", "MIRL_SFT_FRAC", "0.2"))

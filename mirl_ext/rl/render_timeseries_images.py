@@ -32,7 +32,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from mirl_ext.schema import DATA_ROOT, SCRATCH_ROOT  # noqa: E402
+from mirl_ext.data.schema import DATA_ROOT, SCRATCH_ROOT  # noqa: E402
 
 DATA = DATA_ROOT
 IMG_ROOT = os.path.join(SCRATCH_ROOT, "ts_images")

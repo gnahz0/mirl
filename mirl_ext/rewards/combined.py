@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from mirl_ext.rewards import ecg, haptic_ts, human_behaviour, medical, smellnet, tactile
-from mirl_ext.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, TACTILE_SOURCES
+from mirl_ext.data.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, TACTILE_SOURCES
 
 
 def _restore_qwen35_think_prefix(solution: str) -> str:

@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mirl_ext.schema import DATA_ROOT, config_path, extra_info, prompt_messages  # noqa: E402
+from mirl_ext.data.schema import DATA_ROOT, config_path, extra_info, prompt_messages  # noqa: E402
 
 # One config knob controls both sides: the teacher staged this many frames, and
 # the student rows are rewritten to sample the same count. (The RL half keeps
@@ -163,7 +163,7 @@ def main() -> None:
         print(f"\nwrote {total} rows across {len(by_family)} files -> {out_root}")
 
     if args.open_gt:
-        from mirl_ext.schema import FAMILIES, OPEN_SOURCES
+        from mirl_ext.data.schema import FAMILIES, OPEN_SOURCES
 
         for family in FAMILIES:
             src = Path(args.split_root) / "sft" / f"{family}.parquet"

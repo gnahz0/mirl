@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mirl_ext.schema import config_path  # noqa: E402
+from mirl_ext.data.schema import config_path  # noqa: E402
 
 STAGING_VERSION = "v2-640px-q85"
 VIDEO_FRAMES = int(config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
