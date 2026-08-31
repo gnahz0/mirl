@@ -5,54 +5,57 @@ import pytest
 import torch
 
 from mirl_ext.alignment.model import MultimodalAlignmentModel
+from mirl_ext.data.signals import normalize, tactile_frames, timeseries_frames
 
 
 def _renderer() -> MultimodalAlignmentModel:
     model = MultimodalAlignmentModel.__new__(MultimodalAlignmentModel)
     torch.nn.Module.__init__(model)
-    model.vit_patch_size = 16
-    model.vit_merge_size = 2
     return model
 
 
 def test_scalar_rendering_preserves_values_geometry_and_missing_masks():
-    model = _renderer()
     smell = torch.arange(40, dtype=torch.float32).unsqueeze(0)
-    video = model._timeseries_frames(smell)
-    expected = model._normalize(smell)[0]
+    video = timeseries_frames(smell, 32)
+    expected = normalize(smell)[0]
     assert torch.equal(video[0, 0, 0], expected[:32])
     assert torch.equal(video[1, 0, 0, :8], expected[32:])
     assert torch.equal(video[:, 0], video[:, 1])
 
-    model = _renderer()
     ecg = torch.randn(8, 2500)
-    frames = model._timeseries_frames(ecg)
+    frames = timeseries_frames(ecg, 32)
     assert frames.shape == (79, 3, 256, 32)
     assert torch.isfinite(frames).all() and frames.min() >= -1 and frames.max() <= 1
 
     values = torch.tensor([[-8.0, -4.0, -2.0, 0.0, 2.0, 4.0, 8.0]])
-    expected = torch.tensor([[-0.5, -0.25, -0.125, 0.0, 0.125, 0.25, 0.5]])
-    frames = model._timeseries_frames(values)
-    assert torch.equal(frames[0, 0, 0, :7], expected[0])
+    expected = (values / values.std(dim=-1, keepdim=True, unbiased=False)).clamp(-4.0, 4.0) / 4.0
+    frames = timeseries_frames(values, 32)
+    torch.testing.assert_close(frames[0, 0, 0, :7], expected[0])
 
 
-def test_normalization_scales_by_global_range_and_zeroes_constant():
-    sparse = torch.tensor([[0.0, 0.0, 0.0, 10.0], [2.0, 4.0, 6.0, 8.0]])
-    torch.testing.assert_close(MultimodalAlignmentModel._normalize(sparse), sparse / 10.0)
+def test_normalization_zscores_rows_and_zeroes_constant():
+    sparse = torch.tensor([[0.0, 0.0, 0.0, 10.0]])
+    constant = torch.full((1, 4), 5.0)
+    values = torch.cat((sparse, constant))
 
-    constant = torch.full((2, 4), 5.0)
-    assert torch.equal(MultimodalAlignmentModel._normalize(constant), torch.zeros_like(constant))
+    normalized = normalize(values)
+    mean = sparse.mean(dim=-1, keepdim=True)
+    std = sparse.std(dim=-1, keepdim=True, unbiased=False)
+    expected_sparse = ((sparse - mean) / std).clamp(-4.0, 4.0) / 4.0
+
+    torch.testing.assert_close(normalized[0], expected_sparse[0])
+    assert torch.equal(normalized[1], torch.zeros_like(normalized[1]))
+    assert normalized.min() >= -1 and normalized.max() <= 1
 
 
 def test_normalization_rejects_non_finite_rows():
     with pytest.raises(ValueError, match="non-finite"):
-        MultimodalAlignmentModel._normalize(torch.tensor([[1.0, float("nan"), 3.0]]))
+        normalize(torch.tensor([[1.0, float("nan"), 3.0]]))
 
 
 def test_tactile_rendering_uses_one_rgb_cell_per_full_frame():
-    model = _renderer()
     tactile = torch.randn(47, 16, 16)
-    frames = model._tactile_frames(tactile)
+    frames = tactile_frames(tactile, 32)
 
     assert frames.shape == (47, 3, 32, 32)
     assert torch.equal(frames[:, 0], frames[:, 1])

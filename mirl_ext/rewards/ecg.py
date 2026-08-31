@@ -10,7 +10,7 @@ answer, and identical rollouts zero GRPO's within-group std and hence the gradie
 
 import re
 
-from ._common import extract_boxed_answer, format_reward, jaccard, set_prf1
+from ._common import extract_boxed_answer, format_reward, jaccard, score_dict, set_prf1
 
 CATEGORIES = [
     "Normal",
@@ -64,13 +64,7 @@ def compute_score(
 
     score = acc_weight * acc + sim_weight * jacc + format_weight * fmt
 
-    return {
-        "score": score,
-        "acc": acc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall,
-        "jaccard": jacc,
-        "similarity": jacc,
-        "format": fmt,
-    }
+    return score_dict(
+        score=score, acc=acc, precision=precision, recall=recall,
+        f1=f1, jacc=jacc, similarity=jacc, fmt=fmt,
+    )

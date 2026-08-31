@@ -2,8 +2,17 @@
 
 Last updated: 2026-07-21
 
+> **FROZEN SNAPSHOT (2026-07-21) — superseded.** Current state, invariants,
+> and launch paths live in `mirl_ext/CLAUDE.md`. Since this handoff: Stage-1
+> alignment became the production pipeline (`mirl_ext/alignment/`, launcher
+> `mirl_ext/alignment/run_stage1_b200.sbatch`), the SFT toolchain landed
+> (`mirl_ext/sft/`), production `SMOKE=0` GRPO runs happened, a native
+> time-series RL path exists (`TS_NATIVE=1`, `mirl_ext/rl/`), and the test
+> suite grew past the counts quoted below. The deferred-work list and Slurm
+> launcher census in this file no longer hold.
+
 This is the operational handoff for the next agent working in
-`/work/mit/ppliang_mit/alecz/mirl-qwen35`. Read it together with the repository
+`$MIRL_CLUSTER_ROOT/mirl-qwen35`. Read it together with the repository
 `AGENTS.md` instructions and `docs/mirl/README.md` before changing anything.
 
 ## Current outcome
@@ -18,16 +27,16 @@ smoke launcher was verified by Slurm job `172783` on two NVIDIA B200 GPUs:
 - `perf/total_num_tokens:25232`; prompt lengths ranged from 521 to 3,080.
 - The B200 preflight passed FlashAttention, causal-conv1d, and FLA gated-delta
   CUDA kernels before the trainer started.
-- The log is `/work/mit/ppliang_mit/alecz/logs/mirl_qwen35_172783.out`.
+- The log is `$MIRL_CLUSTER_ROOT/logs/mirl_qwen35_172783.out`.
 
 The current worktree changes are intentionally uncommitted. Do not discard or
 reset them. Begin with `git status --short` and preserve unrelated user work.
 
 ## Session-start requirements
 
-1. Read `/work/mit/ppliang_mit/alecz/AGENTS.md` if present and the instructions
-   supplied for `/work/mit/ppliang_mit/alecz`.
-2. Read `/work/mit/ppliang_mit/alecz/data/SCRATCH_DATA.md`. Check its newest
+1. Read `$MIRL_CLUSTER_ROOT/AGENTS.md` if present and the instructions
+   supplied for `$MIRL_CLUSTER_ROOT`.
+2. Read `$MIRL_DATA_ROOT/SCRATCH_DATA.md`. Check its newest
    keep-alive date; run and record the touch pass only when it is more than 20
    days old. It was `2026-07-10` when this handoff was written, so no touch was
    required on 2026-07-21.
@@ -35,7 +44,7 @@ reset them. Begin with `git status --short` and preserve unrelated user work.
    on `/scratch`. Do not use `/tmp`. Parquet/JSON indexes and source stay on
    `/work`, and media paths in those indexes point directly to `/scratch`.
 4. Also read `data/TIMESERIES.md`, `data/TIME_SERIES_TOKENS.md`, and
-   `/work/mit/ppliang_mit/alecz/mirl/examples/multiverse_trainer/SESSION_NOTES.md`
+   `$MIRL_CLUSTER_ROOT/mirl/examples/multiverse_trainer/SESSION_NOTES.md`
    for data provenance and historical Qwen3-VL behavior.
 
 ## Implemented files
@@ -45,7 +54,7 @@ reset them. Begin with `git status --short` and preserve unrelated user work.
   `<audio>` markers, handles nullable video dictionaries, enforces bounded
   image/video sizes, and decodes video asynchronously through TorchCodec.
 - `mirl_ext/data/build_smoke.py`: builds a deterministic eight-row fixture at
-  `/work/mit/ppliang_mit/alecz/data/qwen35_smoke.parquet` from existing real
+  `$MIRL_DATA_ROOT/qwen35_smoke.parquet` from existing real
   MIRL data. Families are SmellNet, ECG, haptic time series, medical/CLIMB,
   human behaviour, and tactile.
 - `mirl_ext/rewards/`: ports the six historical reward families. The combined
@@ -61,10 +70,11 @@ reset them. Begin with `git status --short` and preserve unrelated user work.
   launcher. `SMOKE=1` is bounded to eight rows, two rollouts, 128 response
   tokens, and one optimizer step.
 - `examples/mirl/slurm/run_combined_b200.sbatch`: runnable two-B200 smoke job.
-  The other two Slurm files are historical provenance snapshots and must not be
-  submitted yet.
+  (Since this snapshot the directory changed: `run_trainedve_raw_b200.sbatch`
+  remains a historical Qwen3-VL provenance snapshot — do not submit — and the
+  SFT launcher shim execs `mirl_ext/sft/`; see `examples/mirl/slurm/README.md`.)
 - `environments/mirl-qwen35/`: builder, verifier, human specification, and
-  exact Conda/Pip locks for `alec-mv`.
+  exact Conda/Pip locks for `mirl-b200`.
 - `docs/mirl/qwen35-migration-ledger.md`: historical file-by-file disposition
   and the boundary between completed and deferred migration stages.
 
@@ -73,7 +83,7 @@ reset them. Begin with `git status --short` and preserve unrelated user work.
 Active prefix:
 
 ```text
-/work/mit/ppliang_mit/alecz/envs/alec-mv
+$MIRL_PYENV
 ```
 
 Important verified pins:
@@ -108,37 +118,37 @@ then directly verifies the actual Qwen3.5 and vLLM imports.
 Run unit tests from the Qwen3.5 worktree:
 
 ```bash
-cd /work/mit/ppliang_mit/alecz/mirl-qwen35
+cd $MIRL_CLUSTER_ROOT/mirl-qwen35
 export PYTHONNOUSERSITE=1
-export TMPDIR=/scratch/dvdai_mit/alecz/tmp-qwen35/manual
-/work/mit/ppliang_mit/alecz/envs/alec-mv/bin/python -m pytest -q tests/mirl
+export TMPDIR=$MIRL_SCRATCH_ROOT/tmp-qwen35/manual
+"$MIRL_PYENV"/bin/python -m pytest -q tests/mirl
 ```
 
 Run the CPU/import/model-snapshot verifier:
 
 ```bash
-export PIP_CACHE_DIR=/scratch/dvdai_mit/alecz/pip-cache-qwen35
-export XDG_CACHE_HOME=/scratch/dvdai_mit/alecz/cache-qwen35/xdg
-export TRITON_CACHE_DIR=/scratch/dvdai_mit/alecz/cache-qwen35/triton
-export TORCHINDUCTOR_CACHE_DIR=/scratch/dvdai_mit/alecz/cache-qwen35/inductor
-export VLLM_CACHE_ROOT=/scratch/dvdai_mit/alecz/cache-qwen35/vllm
-export FLASHINFER_WORKSPACE_BASE=/scratch/dvdai_mit/alecz/cache-qwen35/flashinfer
+export PIP_CACHE_DIR=$MIRL_SCRATCH_ROOT/pip-cache-qwen35
+export XDG_CACHE_HOME=$MIRL_SCRATCH_ROOT/cache-qwen35/xdg
+export TRITON_CACHE_DIR=$MIRL_SCRATCH_ROOT/cache-qwen35/triton
+export TORCHINDUCTOR_CACHE_DIR=$MIRL_SCRATCH_ROOT/cache-qwen35/inductor
+export VLLM_CACHE_ROOT=$MIRL_SCRATCH_ROOT/cache-qwen35/vllm
+export FLASHINFER_WORKSPACE_BASE=$MIRL_SCRATCH_ROOT/cache-qwen35/flashinfer
 
-/work/mit/ppliang_mit/alecz/envs/alec-mv/bin/python \
+"$MIRL_PYENV"/bin/python \
   environments/mirl-qwen35/verify_environment.py \
   --model-snapshot \
-  /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  $MIRL_CLUSTER_ROOT/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
 ```
 
 Submit the full GPU preflight plus one-step smoke:
 
 ```bash
-cd /work/mit/ppliang_mit/alecz/mirl-qwen35
+cd $MIRL_CLUSTER_ROOT/mirl-qwen35
 sbatch examples/mirl/slurm/run_combined_b200.sbatch
 ```
 
 The job writes `logs/mirl_qwen35_<job-id>.out` under
-`/work/mit/ppliang_mit/alecz`. Success requires all of the following, not just
+`$MIRL_CLUSTER_ROOT`. Success requires all of the following, not just
 a zero exit code:
 
 ```text
@@ -200,8 +210,10 @@ The safest next validation is a short 2-3-step combined run using the same
 image/video representation and B200 stack. Keep `use_remove_padding=False` and
 Ulysses sequence parallel size `1`: Qwen3.5-9B interleaves Gated Delta Net and
 full-attention layers, and the packed-sequence GDN path has not been validated.
-Do not submit `run_trainedve_raw_b200.sbatch` or `run_stage1_b200.sbatch`; they
-are historical Qwen3-VL snapshots only.
+Do not submit `examples/mirl/slurm/run_trainedve_raw_b200.sbatch`; it is a
+historical Qwen3-VL provenance snapshot. (The old Stage-1 snapshot of the same
+name was removed; Stage-1 now submits the production launcher
+`mirl_ext/alignment/run_stage1_b200.sbatch` — see `mirl_ext/CLAUDE.md`.)
 
 Before committing, rerun the tests, environment verifier, `bash -n` on the
 three runnable shell files, and `git diff --check`. No commit has been requested

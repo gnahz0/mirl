@@ -11,14 +11,12 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mirl_ext.data.schema import DATA_ROOT  # noqa: E402  (cluster paths live in sft/config.json)
+from mirl_ext.data.schema import DATA_ROOT  # noqa: E402
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
-_TIME_COL_HINTS = ("timestamp", "time_ms", "time")
+from mirl_ext.data.signals import load_signal_csv
 
 
 def canonical_label(value: object) -> str:
@@ -30,26 +28,10 @@ def canonical_label(value: object) -> str:
 
 def numerical_fingerprint(path: Path) -> str:
     """Hash float32 sensor values while deliberately excluding timestamp columns."""
-    with path.open() as handle:
-        header = [part.strip() for part in handle.readline().strip().split(",")]
-    keep = [
-        index
-        for index, name in enumerate(header)
-        if not any(hint in name.lower() for hint in _TIME_COL_HINTS)
-    ]
-    values = np.genfromtxt(
-        path,
-        delimiter=",",
-        skip_header=1,
-        usecols=keep,
-        dtype=np.float32,
-    )
-    if values.ndim == 1:
-        values = values[:, None] if len(keep) == 1 else values[None, :]
-    values = np.ascontiguousarray(values, dtype=np.float32)
+    tensor = load_signal_csv(str(path))
     digest = hashlib.sha256()
-    digest.update(str(values.shape).encode())
-    digest.update(values.tobytes())
+    digest.update(str(tuple(tensor.shape)).encode())
+    digest.update(tensor.numpy().tobytes())
     return digest.hexdigest()
 
 

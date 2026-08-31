@@ -3,10 +3,10 @@
 set -euo pipefail
 
 MIRL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-MIRL_ENV_PREFIX="${MIRL_ENV_PREFIX:-/work/mit/ppliang_mit/alecz/envs/alec-mv}"
+MIRL_ENV_PREFIX="${MIRL_ENV_PREFIX:-$MIRL_PYENV}"
 PYTHON="${PYTHON:-${MIRL_ENV_PREFIX}/bin/python}"
-DATA_ROOT="${DATA_ROOT:-/work/mit/ppliang_mit/alecz/data}"
-MODEL_PATH="${MODEL_PATH:-/work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
+DATA_ROOT="${DATA_ROOT:-$MIRL_DATA_ROOT}"
+MODEL_PATH="${MODEL_PATH:-$MIRL_CLUSTER_ROOT/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
 SMOKE="${SMOKE:-0}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 NNODES="${NNODES:-1}"
@@ -19,19 +19,19 @@ SP_SIZE="${SP_SIZE:-1}"
 
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${MIRL_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-export HF_HOME="${HF_HOME:-/work/mit/ppliang_mit/alecz/hf_cache}"
+export HF_HOME="${HF_HOME:-$MIRL_CLUSTER_ROOT/hf_cache}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export FORCE_QWENVL_VIDEO_READER="${FORCE_QWENVL_VIDEO_READER:-torchcodec}"
 export DECORD_EOF_RETRY_MAX="${DECORD_EOF_RETRY_MAX:-50}"
-export TMPDIR="${TMPDIR:-/scratch/dvdai_mit/alecz/tmp-qwen35/${SLURM_JOB_ID:-manual}}"
-export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/scratch/dvdai_mit/alecz/pip-cache-qwen35}"
-export RAY_TMPDIR="${RAY_TMPDIR:-/scratch/dvdai_mit/r35/${SLURM_JOB_ID:-manual}}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/scratch/dvdai_mit/alecz/cache-qwen35/xdg}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/scratch/dvdai_mit/alecz/cache-qwen35/triton}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/scratch/dvdai_mit/alecz/cache-qwen35/inductor}"
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/scratch/dvdai_mit/alecz/cache-qwen35/vllm}"
-export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-/scratch/dvdai_mit/alecz/cache-qwen35/flashinfer}"
+export TMPDIR="${TMPDIR:-$MIRL_SCRATCH_ROOT/tmp-qwen35/${SLURM_JOB_ID:-manual}}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$MIRL_SCRATCH_ROOT/pip-cache-qwen35}"
+export RAY_TMPDIR="${RAY_TMPDIR:-$MIRL_SCRATCH_ROOT/ray_tmp/${SLURM_JOB_ID:-manual}}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$MIRL_SCRATCH_ROOT/cache-qwen35/xdg}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$MIRL_SCRATCH_ROOT/cache-qwen35/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$MIRL_SCRATCH_ROOT/cache-qwen35/inductor}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$MIRL_SCRATCH_ROOT/cache-qwen35/vllm}"
+export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$MIRL_SCRATCH_ROOT/cache-qwen35/flashinfer}"
 export CUDA_HOME="${CUDA_HOME:-${MIRL_ENV_PREFIX}}"
 export CPATH="${MIRL_ENV_PREFIX}/targets/x86_64-linux/include${CPATH:+:${CPATH}}"
 export CPLUS_INCLUDE_PATH="${MIRL_ENV_PREFIX}/targets/x86_64-linux/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
@@ -50,14 +50,38 @@ join_files() {
     printf '[%s]' "${output}"
 }
 
-if [[ "${TS_TOKENS:-0}" == "1" ]]; then
-    train_files="$(join_files _tstok smellnet_train ecg_train haptic_ts_train),$(join_files '' climb_train human_behaviour_train tactile_train)"
-    train_files="[${train_files:1:${#train_files}-2}]"
-    val_files="$(join_files _tstok smellnet_valid ecg_valid haptic_ts_valid),$(join_files '' climb_valid human_behaviour_valid_fast tactile_valid_fast)"
-    val_files="[${val_files:1:${#val_files}-2}]"
+# Training reads the RL HALF of the 50:50 group split (split_sft_rl.py); the
+# root-level <fam>_train.parquet files are the UNSPLIT corpora and overlap the
+# SFT half. Validation files live at the root and were never split.
+TRAIN_ROOT="${TRAIN_ROOT:-${DATA_ROOT}/split_grpo/rl}"
+join_train() {
+    local suffix="$1"
+    shift
+    local output="" name
+    for name in "$@"; do
+        [[ -n "${output}" ]] && output+=","
+        output+="\"${TRAIN_ROOT}/${name}${suffix}.parquet\""
+    done
+    printf '[%s]' "${output}"
+}
+
+if [[ "${TS_NATIVE:-0}" == "1" ]]; then
+    # Stage-1 pseudo-video strips for the ts families (mirl_ext/rl/ts_native_DESIGN.md).
+    # haptic_ts is 100% open free-text (haptic_tactile) — ungradable, excluded from RL.
+    train_files="$(join_train _tsnative smellnet_train_base ecg_train),$(join_train '' climb_train human_behaviour_train_closed tactile_train_closed)"
+    train_files="${train_files//],[/,}"  # merge into ONE list: `[a],[b]` is a Hydra choice sweep and errors in run mode
+    val_files="$(join_files _tsnative smellnet_valid_base ecg_valid),$(join_files '' climb_valid human_behaviour_valid_fast_closed tactile_valid_fast_closed)"
+    val_files="${val_files//],[/,}"
+elif [[ "${TS_TOKENS:-0}" == "1" ]]; then
+    # Historical raw-numeric-text A/B; its _tstok parquets predate the RL-half
+    # split and no builder exists in this repo (mirl_ext/rl/ts_native_DESIGN.md).
+    echo "TS_TOKENS=1 is historical (no _tstok parquets in split_grpo/rl); use TS_NATIVE=1" >&2
+    exit 2
 else
-    train_files="$(join_files '' smellnet_train ecg_train haptic_ts_train climb_train human_behaviour_train tactile_train)"
-    val_files="$(join_files '' smellnet_valid ecg_valid haptic_ts_valid climb_valid human_behaviour_valid_fast tactile_valid_fast)"
+    # haptic_ts excluded: 100% open free-text, ungradable for RL; closed variants
+    # strip the open sources from tactile/human_behaviour (28% of each).
+    train_files="$(join_train '' smellnet_train_base ecg_train climb_train human_behaviour_train_closed tactile_train_closed)"
+    val_files="$(join_files '' smellnet_valid_base ecg_valid climb_valid human_behaviour_valid_fast_closed tactile_valid_fast_closed)"
 fi
 
 PROJECT_NAME="${PROJECT_NAME:-multiverse-qwen35}"
@@ -104,13 +128,31 @@ if [[ "${SMOKE}" == "1" ]]; then
     SP_SIZE="${SMOKE_SP_SIZE:-1}"
 fi
 
-CKPT_DIR="${CKPT_DIR:-/scratch/dvdai_mit/alecz/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
-LOG_DIR="${LOG_DIR:-/work/mit/ppliang_mit/alecz/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+# Force OUR wandb identity: the shared account's ~/.netrc holds a colleague's
+# login, and Ray workers resolved to it once (run landed in the wrong entity).
+# Env key + entity beat the netrc (verified); fail loudly if the key is absent.
+if [[ "${SMOKE}" != "1" ]]; then
+    WANDB_KEY_FILE="$MIRL_CLUSTER_ROOT/.wandb_key"
+    if [[ ! -r "${WANDB_KEY_FILE}" ]]; then
+        echo "missing W&B key: ${WANDB_KEY_FILE}" >&2
+        exit 1
+    fi
+    export WANDB_API_KEY="$(<"${WANDB_KEY_FILE}")"
+    export WANDB_ENTITY="${MIRL_WANDB_ENTITY:?source mirl.env first}"
+    echo "wandb: forcing entity=${WANDB_ENTITY} (key file: ${WANDB_KEY_FILE})"
+fi
+
+CKPT_DIR="${CKPT_DIR:-$MIRL_SCRATCH_ROOT/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+LOG_DIR="${LOG_DIR:-$MIRL_CLUSTER_ROOT/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}" "${LOG_DIR}"
 
 args=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
+    # Ray dashboard is unused overhead and its MetricsHead subprocess
+    # intermittently fails to start on shared nodes, killing the whole run
+    # (job 630990: "EOF from pipe" after 1h18m of startup retries).
+    +ray_kwargs.ray_init.include_dashboard=False
     "data.train_files=${train_files}"
     "data.val_files=${val_files}"
     "data.train_batch_size=${TRAIN_BATCH_SIZE}"

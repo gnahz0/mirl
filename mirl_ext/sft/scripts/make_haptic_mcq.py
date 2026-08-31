@@ -10,7 +10,7 @@ then flows through the normal export -> stage -> generate -> build pipeline.
 Stem-locking in the split keeps this leak-free (a recording's video and ts
 rows are always on the same side).
 
-    srun -p cpu -c 4 --mem=32G <env>/bin/python mirl_ext/sft/make_haptic_mcq.py
+    srun -p cpu -c 4 --mem=32G <env>/bin/python mirl_ext/sft/scripts/make_haptic_mcq.py
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from mirl_ext.data.schema import (  # noqa: E402
     DATA_ROOT,
     TACTILE_MCQ_SOURCES as MCQ_SOURCES,
@@ -69,6 +69,15 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--split-root", default=f"{DATA_ROOT}/split_grpo")
+    ap.add_argument("--tactile", type=Path, default=None,
+                    help="tactile rows parquet (default <split-root>/sft/tactile_train.parquet)")
+    ap.add_argument("--haptic", type=Path, default=None,
+                    help="haptic_ts plot rows parquet (default <split-root>/sft/haptic_ts_train.parquet)")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="output parquet (default <split-root>/sft/haptic_mcq_train.parquet); "
+                    "e.g. mint the eval set from the never-split valid files: "
+                    "--tactile .../tactile_valid_fast.parquet --haptic .../haptic_ts_valid.parquet "
+                    "--out .../haptic_mcq_valid.parquet")
     args = ap.parse_args()
 
     import pyarrow as pa
@@ -76,21 +85,21 @@ def main() -> None:
 
     sft = Path(args.split_root) / "sft"
     plots: dict[str, str] = {}
-    for row in pq.read_table(sft / "haptic_ts_train.parquet").to_pylist():
+    for row in pq.read_table(args.haptic or sft / "haptic_ts_train.parquet").to_pylist():
         images = row.get("images") or []
         stem = recording_stem(row)
         if images and stem:
             plots[stem] = images[0]["image"]
 
     minted, seen = [], set()
-    for row in pq.read_table(sft / "tactile_train.parquet").to_pylist():
+    for row in pq.read_table(args.tactile or sft / "tactile_train.parquet").to_pylist():
         src, stem = str(row.get("data_source")), recording_stem(row)
         if src not in MCQ_SOURCES or stem not in plots or (stem, src) in seen:
             continue
         seen.add((stem, src))
         minted.append(mint_row(row, plots[stem]))
 
-    out = sft / "haptic_mcq_train.parquet"
+    out = args.out or sft / "haptic_mcq_train.parquet"
     pq.write_table(pa.Table.from_pylist(minted), out)
     per_src = {s: sum(1 for m in minted if m["data_source"] == s) for s in MCQ_SOURCES}
     print(f"minted {len(minted)} rows over {len(plots)} recordings -> {out}\n{per_src}")

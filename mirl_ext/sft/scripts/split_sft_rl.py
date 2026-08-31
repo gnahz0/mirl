@@ -1,16 +1,17 @@
-"""Split each MIRL family into an SFT part and an RL part (default 20:80).
+"""Split each MIRL family into an SFT part and an RL part (ratio from
+config.json ``sft_frac``; currently 50:50, code default 20:80).
 
 GRPO must never be rewarded on something SFT already memorized, and several
 families ask many questions about one recording -- so the split unit is a GROUP
 (the underlying recording: shared 3DHaptic clip stem for tactile/haptic_ts,
 media path otherwise), never a row. Groups are shuffled deterministically and
 assigned greedily to whichever side is furthest below its target share,
-stratified by (data_source, label). SFT is the small side because every SFT
-row gets a teacher trace (gen_sft_targets.py generates for each row).
+stratified by (data_source, label). ``sft_frac`` sets the teacher-trace bill:
+every SFT row gets a trace (gen_sft_targets.py generates for each row).
 Known limitation (recorded in the manifest): ECG has no patient ids, so
 patient-level leakage cannot be prevented from these indexes.
 
-    python mirl_ext/sft/split_sft_rl.py --out-root /work/.../data/split
+    python mirl_ext/sft/scripts/split_sft_rl.py --out-root /work/.../data/split
 """
 
 from __future__ import annotations
@@ -22,10 +23,10 @@ import random
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from mirl_ext.data.schema import DATA_ROOT, config_path, first_media_path, recording_stem  # noqa: E402
 
-# Target SFT share of rows; lives in config.json ("sft_frac") like the paths.
+# Target SFT share of rows; lives in config.json ("sft_frac").
 SFT_FRAC = float(config_path("sft_frac", "MIRL_SFT_FRAC", "0.2"))
 
 # Group-id mode per family: "path" = media path, "stem" = shared 3DHaptic clip

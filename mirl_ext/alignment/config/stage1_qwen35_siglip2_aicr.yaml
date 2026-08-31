@@ -4,7 +4,7 @@
 log_level: INFO
 
 data:
-  root: ${oc.env:MIRL_DATA_ROOT,/work/mit/ppliang_mit/alecz/data/trainedve_raw}
+  root: ${oc.env:MIRL_ALIGN_DATA_ROOT,data/trainedve_raw}
   train_files:
     - ${data.root}/smellnet_train_clean.parquet
     - ${data.root}/ecg_train_nan_filtered.parquet
@@ -29,8 +29,8 @@ data:
   max_image_tokens: 1024
 
 model:
-  qwen35_path: /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
-  siglip2_text_path: /work/mit/ppliang_mit/alecz/hf_cache/models--google--siglip2-so400m-patch16-naflex/snapshots/cc24074f717b612951c2dead130904ab9b65a81e
+  qwen35_path: ${oc.env:MIRL_QWEN35_PATH,Qwen/Qwen3.5-9B}
+  siglip2_text_path: ${oc.env:MIRL_SIGLIP2_PATH,google/siglip2-so400m-patch16-naflex}
 
 loss:
   siglip_weight: 1.0
@@ -39,7 +39,7 @@ loss:
 train:
   seed: 42
   # Exact file paths, no directory resolution. init_checkpoint points at an
-  # alignment_state.pt (e.g. /scratch/dvdai_mit/alecz/checkpoints/<run>/best/alignment_state.pt)
+  # alignment_state.pt (e.g. $MIRL_SCRATCH_ROOT/checkpoints/<run>/best/alignment_state.pt)
   # and warm-starts weights on a fresh schedule. resume_checkpoint points at the
   # matching last/trainer_state.pt and requires init_checkpoint to be set to the
   # sibling last/alignment_state.pt.
@@ -65,7 +65,7 @@ train:
   val_every: 200
   val_batch_size: 256
   best_metric: val-core/map/overall
-  output_dir: ${oc.env:MIRL_OUTPUT_DIR,/scratch/dvdai_mit/alecz/checkpoints/alignment_qwen35_canonical_siglip}
+  output_dir: ${oc.env:MIRL_OUTPUT_DIR,checkpoints/alignment_qwen35_canonical_siglip}
 
 wandb:
   project: mirl-alignment

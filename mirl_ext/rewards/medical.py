@@ -7,7 +7,7 @@ token similarity + format compliance.
 Training reward = f1_weight * f1 + sim_weight * jaccard + format_weight * format
 """
 
-from ._common import extract_boxed_answer, format_reward, jaccard, set_prf1
+from ._common import extract_boxed_answer, format_reward, jaccard, score_dict, set_prf1
 
 
 def parse_conditions(text: str) -> set[str]:
@@ -17,11 +17,6 @@ def parse_conditions(text: str) -> set[str]:
         if sep in text:
             return {c.strip() for c in text.split(sep) if c.strip()}
     return {text} if text else set()
-
-
-def jaccard_similarity(pred_text: str, gt_text: str) -> float:
-    """Token-level Jaccard similarity between two strings."""
-    return jaccard(set(pred_text.lower().split()), set(gt_text.lower().split()))
 
 
 def compute_score(
@@ -41,17 +36,11 @@ def compute_score(
     fmt = format_reward(predict_str)
     acc = 1.0 if pred_conditions == gt_conditions else 0.0
     precision, recall, f1 = set_prf1(pred_conditions, gt_conditions)
-    jacc = jaccard_similarity(pred_text, gt_text)
+    jacc = jaccard(set(pred_text.split()), set(gt_text.split()))
 
     score = f1_weight * f1 + sim_weight * jacc + format_weight * fmt
 
-    return {
-        "score": score,
-        "acc": acc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall,
-        "jaccard": jacc,
-        "similarity": jacc,
-        "format": fmt,
-    }
+    return score_dict(
+        score=score, acc=acc, precision=precision, recall=recall,
+        f1=f1, jacc=jacc, similarity=jacc, fmt=fmt,
+    )

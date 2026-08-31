@@ -2,9 +2,9 @@
 
 This directory records the B200-specific environment used by the Qwen3.5
 migration. The active prefix is
-`/work/mit/ppliang_mit/alecz/envs/alec-mv`; the pre-migration environment is
+`$MIRL_PYENV`; the pre-migration environment is
 preserved at
-`/work/mit/ppliang_mit/alecz/envs/alec-mv-pre-qwen35-20260720`.
+`$MIRL_PYENV-pre-qwen35-20260720`.
 
 ## Pinned stack
 
@@ -30,24 +30,24 @@ preserved at
 `pip-freeze.lock` is the resolved pip inventory; it is an audit record rather
 than a single-shot requirements file because vLLM 0.18 declares Transformers
 `<5` while the upstream-tested Qwen3.5 commit reports version `5.3.0.dev0`.
-`build_alec_mv.sh` installs those packages in the tested order.
+`build_cluster_env.sh` installs those packages in the tested order.
 
 ## Build and verify
 
 Request an interactive B200 node, then run:
 
 ```bash
-srun --partition=b200-devel --account=ppliang_mit --nodes=1 \
+srun --partition=b200-devel --account=$SBATCH_ACCOUNT --nodes=1 \
   --gpus-per-node=1 --cpus-per-task=8 --mem=256G --time=04:00:00 \
   --job-name=mirl-env-build --pty bash -l
 
-MIRL_ENV_PREFIX=/work/mit/ppliang_mit/alecz/envs/alec-mv-qwen35-test \
-  /work/mit/ppliang_mit/alecz/mirl-qwen35/environments/mirl-qwen35/build_alec_mv.sh
+MIRL_ENV_PREFIX=$MIRL_PYENV-qwen35-test \
+  $MIRL_CLUSTER_ROOT/mirl-qwen35/environments/mirl-qwen35/build_cluster_env.sh
 ```
 
 The builder refuses to overwrite an existing prefix. Pip, compiler, Triton,
 TorchInductor, and vLLM caches are all placed below
-`/scratch/dvdai_mit/alecz`; Python user-site packages are disabled. It uses the
+`$MIRL_SCRATCH_ROOT`; Python user-site packages are disabled. It uses the
 cluster GCC 11.5 for FlashAttention because Conda's CUDA headers live in a
 target-specific include directory and the cluster compiler is the tested host
 compiler for this wheel.
@@ -56,18 +56,18 @@ The current prefix can be checked without downloads using:
 
 ```bash
 export PYTHONNOUSERSITE=1
-export TMPDIR=/scratch/dvdai_mit/alecz/tmp-qwen35
-export PIP_CACHE_DIR=/scratch/dvdai_mit/alecz/pip-cache-qwen35
-export XDG_CACHE_HOME=/scratch/dvdai_mit/alecz/cache-qwen35/xdg
-export TRITON_CACHE_DIR=/scratch/dvdai_mit/alecz/cache-qwen35/triton
-export TORCHINDUCTOR_CACHE_DIR=/scratch/dvdai_mit/alecz/cache-qwen35/inductor
-export VLLM_CACHE_ROOT=/scratch/dvdai_mit/alecz/cache-qwen35/vllm
-export FLASHINFER_WORKSPACE_BASE=/scratch/dvdai_mit/alecz/cache-qwen35/flashinfer
+export TMPDIR=$MIRL_SCRATCH_ROOT/tmp-qwen35
+export PIP_CACHE_DIR=$MIRL_SCRATCH_ROOT/pip-cache-qwen35
+export XDG_CACHE_HOME=$MIRL_SCRATCH_ROOT/cache-qwen35/xdg
+export TRITON_CACHE_DIR=$MIRL_SCRATCH_ROOT/cache-qwen35/triton
+export TORCHINDUCTOR_CACHE_DIR=$MIRL_SCRATCH_ROOT/cache-qwen35/inductor
+export VLLM_CACHE_ROOT=$MIRL_SCRATCH_ROOT/cache-qwen35/vllm
+export FLASHINFER_WORKSPACE_BASE=$MIRL_SCRATCH_ROOT/cache-qwen35/flashinfer
 
-/work/mit/ppliang_mit/alecz/envs/alec-mv/bin/python \
+"$MIRL_PYENV"/bin/python \
   environments/mirl-qwen35/verify_environment.py \
   --model-snapshot \
-  /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  $MIRL_CLUSTER_ROOT/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
 ```
 
 Add `--cuda` on a B200 node. The verifier accepts exactly one `pip check`

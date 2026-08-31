@@ -8,32 +8,7 @@ Training reward = acc + format_weight * format + sim_weight * similarity
 
 from difflib import SequenceMatcher
 
-from ._common import extract_boxed_answer, format_reward
-
-
-def acc_reward(pred_label: str, gt_label: str) -> float:
-    return 1.0 if pred_label == gt_label else 0.0
-
-
-def token_metrics(pred_label: str, gt_label: str) -> dict:
-    """Token-level precision, recall, F1, Jaccard, and blended similarity."""
-    pred_tokens = set(pred_label.split())
-    gt_tokens = set(gt_label.split())
-
-    if not pred_tokens and not gt_tokens:
-        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "jaccard": 1.0, "similarity": 1.0}
-    if not pred_tokens or not gt_tokens:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "jaccard": 0.0, "similarity": 0.0}
-
-    tp = len(pred_tokens & gt_tokens)
-    precision = tp / len(pred_tokens)
-    recall = tp / len(gt_tokens)
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    jaccard = len(pred_tokens & gt_tokens) / len(pred_tokens | gt_tokens)
-    seq_ratio = SequenceMatcher(None, pred_label, gt_label).ratio()
-    similarity = max(0.0, min(1.0, 0.5 * jaccard + 0.5 * seq_ratio))
-
-    return {"precision": precision, "recall": recall, "f1": f1, "jaccard": jaccard, "similarity": similarity}
+from ._common import extract_boxed_answer, format_reward, jaccard, score_dict, set_prf1
 
 
 def compute_score(
@@ -47,18 +22,15 @@ def compute_score(
     gt_label = ground_truth.lower()
 
     fmt = format_reward(predict_str)
-    acc = acc_reward(pred_label, gt_label)
-    metrics = token_metrics(pred_label, gt_label)
+    acc = 1.0 if pred_label == gt_label else 0.0
+    pred_tokens, gt_tokens = set(pred_label.split()), set(gt_label.split())
+    precision, recall, f1 = set_prf1(pred_tokens, gt_tokens)
+    jacc = jaccard(pred_tokens, gt_tokens)
+    similarity = 0.5 * jacc + 0.5 * SequenceMatcher(None, pred_label, gt_label).ratio()
 
-    score = acc + format_weight * fmt + sim_weight * metrics["similarity"]
+    score = acc + format_weight * fmt + sim_weight * similarity
 
-    return {
-        "score": score,
-        "acc": acc,
-        "f1": metrics["f1"],
-        "precision": metrics["precision"],
-        "recall": metrics["recall"],
-        "jaccard": metrics["jaccard"],
-        "similarity": metrics["similarity"],
-        "format": fmt,
-    }
+    return score_dict(
+        score=score, acc=acc, precision=precision, recall=recall,
+        f1=f1, jacc=jacc, similarity=similarity, fmt=fmt,
+    )

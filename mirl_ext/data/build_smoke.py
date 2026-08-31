@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import os
 from pathlib import Path
 
@@ -53,18 +54,15 @@ def build(data_root: Path, output: Path, max_video_bytes: int, scan_rows: int = 
                     break
                 if _usable(row, max_video_bytes):
                     candidates.append((_prompt_chars(row), row_index, row))
-                    candidates.sort(key=lambda candidate: candidate[:2])
-                    del candidates[count:]
                 row_index += 1
             if row_index >= scan_rows:
                 break
+        candidates = heapq.nsmallest(count, candidates, key=lambda candidate: candidate[:2])
         if len(candidates) < count:
             raise RuntimeError(f"{filename}: found {len(candidates)} usable rows, need {count}")
         selected_tables.append(pa.Table.from_pylist([candidate[2] for candidate in candidates], schema=parquet.schema_arrow))
 
     combined = pa.concat_tables(selected_tables)
-    if combined.num_rows != sum(SELECTIONS.values()):
-        raise AssertionError(combined.num_rows)
     output.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(combined, output, compression="zstd")
 

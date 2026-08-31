@@ -1,6 +1,4 @@
 {
-  "cluster_data_root": "/work/mit/ppliang_mit/alecz/data",
-  "cluster_scratch_root": "/scratch/dvdai_mit/alecz/data",
-  "sft_frac": 0.2,
+  "sft_frac": 0.5,
   "video_frames": 8
 }

@@ -117,18 +117,6 @@ class MultimodalAlignmentModel(nn.Module):
         references = self.encode_visual(pixels, grid, frozen=True, pool=False)
         return features, references, token_counts, None, logit_scale, logit_bias
     
-    # Rendering lives in mirl_ext.signals (shared with the future native-signal
-    # student path); these delegates keep the model's call surface unchanged.
-    @staticmethod
-    def _normalize(x: torch.Tensor) -> torch.Tensor:
-        return _signals.normalize(x)
-
-    def _timeseries_frames(self, signal: torch.Tensor) -> torch.Tensor:
-        return _signals.timeseries_frames(signal, self.vit_patch_size * self.vit_merge_size)
-
-    def _tactile_frames(self, tactile: torch.Tensor) -> torch.Tensor:
-        return _signals.tactile_frames(tactile, self.vit_patch_size * self.vit_merge_size)
-
     def encode_ts_trainable(
         self,
         signals: list[torch.Tensor],
@@ -136,10 +124,8 @@ class MultimodalAlignmentModel(nn.Module):
         device: torch.device,
     ) -> torch.Tensor:
         """Render one homogeneous sensor-family batch and encode it as video."""
-        if family == "tactile":
-            videos = [self._tactile_frames(signal.to(device)) for signal in signals]
-        else:
-            videos = [self._timeseries_frames(signal.to(device)) for signal in signals]
+        cell = self.vit_patch_size * self.vit_merge_size
+        videos = [_signals.family_frames(signal.to(device), family, cell) for signal in signals]
 
         processed = self.qwen_processor.video_processor(
             videos,

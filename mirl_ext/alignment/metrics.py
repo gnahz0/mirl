@@ -47,13 +47,10 @@ def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> d
     keys = sorted(values)
     flat = torch.cat([values[key].reshape(-1).double() for key in keys])
     dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-    reduced: dict[str, torch.Tensor] = {}
-    offset = 0
-    for key in keys:
-        size = values[key].numel()
-        reduced[key] = flat[offset : offset + size].view(values[key].shape)
-        offset += size
-    return reduced
+    return {
+        key: chunk.view(values[key].shape)
+        for key, chunk in zip(keys, flat.split([values[key].numel() for key in keys]))
+    }
 
 
 @dataclass(frozen=True)
@@ -298,11 +295,7 @@ def _metric_groups(
         loss_key = f"loss/task/{task}"
         if loss_key in loss_metrics:
             out[f"{aux}/loss/tactile/{task}"] = loss_metrics[loss_key]
-        for stat in _PUBLIC_STATS:
-            key = f"{stat}/task/{task}"
-            if key in prediction_metrics:
-                out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]
-        for stat in _AUX_STATS:
+        for stat in _PREDICTION_STATS:
             key = f"{stat}/task/{task}"
             if key in prediction_metrics:
                 out[f"{aux}/{stat}/tactile/{task}"] = prediction_metrics[key]
@@ -318,7 +311,7 @@ def _metric_groups(
 
     if split == "train":
         for key, value in loss_metrics.items():
-            if key.startswith("grad_norm/") or key in {"grad_norm", "logit_scale", "logit_bias"}:
+            if key in {"grad_norm", "logit_scale", "logit_bias"}:
                 out[f"{aux}/{key}"] = value
         out[f"{aux}/n/img"] = float(counts["n/img_image"] + counts["n/img_video"])
 

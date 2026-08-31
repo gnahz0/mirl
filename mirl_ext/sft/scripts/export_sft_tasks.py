@@ -1,9 +1,8 @@
 """Export every eligible row of a split half to a task JSONL for generation.
 
-Runs on the cluster (where the parquets live); the JSONL is small enough to copy
-to a laptop, which has the outbound internet the compute nodes lack. Every SFT
-row gets a teacher trace, so there is no sampling here -- the 20:80 split is the
-sampling. Each task carries the FULL original prompt (all system+user turns
+Runs on the cluster (where the parquets live); generation also runs cluster-side
+(compute nodes reach the teacher endpoint). Every SFT row gets a teacher trace,
+so there is no sampling here -- the split is the sampling. Each task carries the FULL original prompt (all system+user turns
 flattened), every media reference in original order, its ground truth (for
 laptop-side validation only -- the generator strips it before building
 requests), and answer_style: sources in schema.OPEN_SOURCES are free text with
@@ -11,7 +10,7 @@ no exact-match gate, everything else is gradable. SmellNet exports the 50-class
 single-substance task only; mixture and GC-MS rows are excluded and asserted
 absent.
 
-    python mirl_ext/sft/export_sft_tasks.py --out .../sft_tasks.jsonl
+    python mirl_ext/sft/scripts/export_sft_tasks.py --out .../sft_tasks.jsonl
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from mirl_ext.data.schema import (  # noqa: E402
     DATA_ROOT,
     FAMILIES,
@@ -106,8 +105,6 @@ def main() -> None:
                 n_open += style == "open"
                 total += 1
             if family == "smellnet_train":
-                bad = [s for s in exported_sources if "mixture" in s or "gc" in s.lower()]
-                assert not bad, f"smellnet export leaked excluded sources: {bad}"
                 assert set(exported_sources) <= {SMELLNET_BASE}, dict(exported_sources)
             print(
                 f"{family:22s} half_rows={len(rows):6d} exported={len(eligible):6d} "

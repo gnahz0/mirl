@@ -36,7 +36,6 @@ from .objective import (
     _build_text_label_bank,
     _compute_losses,
 )
-logger = logging.getLogger("alignment.trainer")
 
 
 def setup_logging(level_name: str) -> None:
@@ -45,8 +44,7 @@ def setup_logging(level_name: str) -> None:
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
         stream=sys.stdout,
     )
-    for name in ("qwen_vl_utils", "qwen_vl_utils.vision_process", "torchcodec"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("torchcodec").setLevel(logging.WARNING)
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 
@@ -181,6 +179,8 @@ class AccumulationWindow:
             if key in self.loss_sums:
                 self.loss_sums[key] += float(value)
                 self.loss_counts[key] += 1
+            elif key.startswith("loss/"):
+                raise RuntimeError(f"metric absent from _REDUCED_METRIC_KEYS: {key}")
             else:
                 # Gradient norm and SigLIP calibration are rank-local diagnostics.
                 self.local_values.setdefault(key, []).append(float(value))

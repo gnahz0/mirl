@@ -43,6 +43,31 @@ def test_schema_normalization_handles_json_extra_info_and_phantom_audio():
     assert "<audio>" not in content[1]["text"]
 
 
+def test_ts_stack_bypasses_qwen_vl_utils(tmp_path):
+    """A _stack{T}.png video must come back as the raw (tensor, metadata) tuple:
+    32 px tile width preserved (qwen_vl_utils would resize it to 64), odd frame
+    count padded by repeating the last frame."""
+    import numpy as np
+    import torch
+
+    pixels = np.random.default_rng(0).integers(0, 256, (5 * 64, 32), dtype=np.uint8)
+    strip = tmp_path / "abc123_stack5.png"
+    Image.fromarray(pixels, "L").save(strip)
+    messages = [{"role": "user", "content": [{"type": "video", "video": str(strip)}]}]
+
+    images, videos, audios = asyncio.run(
+        MIRLDataset.process_multi_modal_info(
+            messages, image_patch_size=16, config=OmegaConf.create({"max_video_frames": 8})
+        )
+    )
+    assert images is None and audios is None and len(videos) == 1
+    video, metadata = videos[0]
+    assert tuple(video.shape) == (6, 3, 64, 32)
+    assert torch.equal(video[5], video[4])
+    assert video[0, 0].numpy().tolist() == pixels[:64].tolist()
+    assert metadata["fps"] == 2.0 and metadata["total_num_frames"] == 6.0
+
+
 def test_image_budget_is_applied_during_async_rollout(tmp_path):
     image_path = tmp_path / "large.png"
     Image.new("RGB", (1024, 1024), color="white").save(image_path)

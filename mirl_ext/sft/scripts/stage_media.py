@@ -9,30 +9,31 @@ label-free. Rewrites the task JSONL with image_paths/frame_paths pointing at
 the staged copies (resolvable on the laptop via --image-root) and stamps
 staging_version into every task. Student parquets are never touched.
 
-    python mirl_ext/sft/stage_media.py --tasks sft_tasks.jsonl --out-root data/sft/media
+    python mirl_ext/sft/scripts/stage_media.py --tasks sft_tasks.jsonl --out-root data/sft/media
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mirl_ext.data.schema import config_path  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from mirl_ext.data.schema import config_path, iter_jsonl  # noqa: E402
+from mirl_ext.data.schema import media_stem as _stem  # noqa: E402
 
 STAGING_VERSION = "v2-640px-q85"
 VIDEO_FRAMES = int(config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
 
 
-def _stem(src: str) -> str:
-    return hashlib.sha1(src.encode()).hexdigest()[:20]
-
-
 def frames_from_video(src: Path, n: int, dest_dir: Path, stem: str) -> list[str]:
+    # Content-hashed like images: frames already on disk mean this video is done,
+    # so restaging after a split change only extracts videos new to the half.
+    existing = sorted(dest_dir.glob(f"{stem}_f*.jpg"))
+    if existing:
+        return [p.name for p in existing]
     import cv2
 
     cap = cv2.VideoCapture(str(src))
@@ -97,7 +98,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=8, help="parallel video extractions")
     args = ap.parse_args()
 
-    tasks = [json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip()]
+    tasks = list(iter_jsonl(args.tasks))
     n_img = n_vid = n_miss = 0
 
     # Many rows share one recording: extract each unique video once.

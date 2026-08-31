@@ -1,5 +1,25 @@
 # MIRL SFT (cold-start) plan
 
+> **SUPERSEDED — historical plan, kept for rationale only.**
+> `mirl_ext/sft/README.md` is authoritative for the pipeline as built (per
+> `mirl_ext/CLAUDE.md`). Known divergences from this plan:
+>
+> - **Split (§1):** the unit is a GROUP (underlying recording), never a row;
+>   ratio = `sft_frac` in `mirl_ext/sft/config.json` — not row-level seed-42
+>   exact-50/50. Live layout is `$DATA/split_grpo/{rl,sft,sft_parquet}/`, not
+>   `data/split/`. RL excludes haptic_ts entirely and uses `_base`/`_closed`
+>   variants.
+> - **Teacher generation (§2):** answer-blind zero-shot is primary, with
+>   `--answer-conditioned` only as the coverage tier; a single
+>   `DEFAULT_MODEL` in `gen_sft_targets.py` (no fallback ladder); on the
+>   cluster the key arrives via `MIRL_OPENAI_KEY` (the `~/.config/mirl` file
+>   is the local-run fallback).
+> - **Training (§4):** the launcher runs the project trainer
+>   `mirl_ext.sft.sft_trainer` (wraps verl's engine with the
+>   modality-homogeneous sampler) and writes checkpoints to
+>   `$MIRL_SCRATCH_ROOT/checkpoints/mirl-sft/$EXPERIMENT_NAME` — not
+>   `run_sft_engine.sh`/`examples/sft/*`.
+
 Goal: add a **supervised fine-tuning cold-start** stage before GRPO, on data held
 **disjoint** from the RL set, so RL never sees SFT examples (avoids leakage /
 memorization inflating RL reward). This mirrors the Revisual-R1 recipe already cited
@@ -60,7 +80,7 @@ Design:
 Reuse `tests/special_e2e/sft/run_sft_engine.sh` / `examples/sft/*` (FSDP, sequence packing, Liger `USE_LIGER=1`, optional LoRA):
 - base = the Qwen3.5-9B path (same as GRPO's `MODEL_PATH`); multimodal image inputs.
 - launcher `mirl_ext/sft/run_sft_b200.sbatch`.
-- output → `/scratch/dvdai_mit/alecz/checkpoints/sft_qwen35_v1`.
+- output → `$MIRL_SCRATCH_ROOT/checkpoints/sft_qwen35_v1`.
 - Short: 1–3 epochs, low LR (~1e-5), cosine, bf16 — standard cold-start.
 
 ## 5. GRPO from the SFT checkpoint

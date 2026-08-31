@@ -4,8 +4,9 @@ Moved verbatim from the alignment package so the same loaders and the same
 signal -> Qwen-video-tile render are available to Stage-1 alignment today and
 to a native-signal SFT/RL student path later. Rendering: [C, T] series become
 one merger-cell-wide tile column per frame; [T, 16, 16] tactile maps become
-one nearest-resized frame per timestep. Normalization is the recording's
-global peak-to-peak range (CLIMB's ECG recipe).
+one nearest-resized frame per timestep. Series are z-scored per channel over
+time (already-z-scored ECG passes through unchanged); tactile is z-scored
+over the whole recording. Both clamp at 4 sigma and scale to [-1, 1].
 """
 
 from __future__ import annotations
@@ -54,15 +55,16 @@ def load_signal(sig_entry: dict) -> tuple[torch.Tensor, str]:
 
 
 def normalize(x: torch.Tensor) -> torch.Tensor:
-    """Scale by the recording's global peak-to-peak range (CLIMB's ECG recipe)."""
+    """Z-score each row over the last dim, clamped at 4 sigma, scaled to [-1, 1].
+
+    Constant rows map to zero (zero numerator against the clamped std)."""
     if not torch.isfinite(x).all():
         raise ValueError("signal contains non-finite values")
 
     x = x.float()
-    value_range = x.max() - x.min()
-    if value_range == 0:
-        return torch.zeros_like(x)
-    return x / value_range
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True, unbiased=False)
+    return ((x - mean) / std.clamp_min(1e-6)).clamp(-4.0, 4.0) / 4.0
 
 
 def timeseries_frames(signal: torch.Tensor, cell: int) -> torch.Tensor:
@@ -79,8 +81,17 @@ def timeseries_frames(signal: torch.Tensor, cell: int) -> torch.Tensor:
 
 
 def tactile_frames(tactile: torch.Tensor, side: int) -> torch.Tensor:
-    """Scale the recording globally and resize each [16, 16] map to one
-    ``side`` x ``side`` merger cell."""
-    value = normalize(tactile)
+    """Z-score the whole recording and resize each [16, 16] map to one
+    ``side`` x ``side`` merger cell.
+
+    One global scale keeps the spatial pressure pattern (OpenTouch's recipe);
+    per-taxel scaling would render untouched taxels' noise at full amplitude."""
+    value = normalize(tactile.float().reshape(1, -1)).reshape_as(tactile)
     value = F.interpolate(value.unsqueeze(1), size=(side, side), mode="nearest")
     return value.expand(-1, 3, -1, -1)
+
+
+def family_frames(signal: torch.Tensor, family: str, cell: int) -> torch.Tensor:
+    """The family -> renderer dispatch shared by the ts-native builder and
+    Stage-1 (``no duplicated math`` invariant, rl/ts_native_DESIGN.md)."""
+    return tactile_frames(signal, cell) if family == "tactile" else timeseries_frames(signal, cell)

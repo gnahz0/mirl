@@ -7,7 +7,7 @@ cherry-picked.
 
 ## Provenance and safety snapshot
 
-- New branch/worktree: `qwen3.5` at `/work/mit/ppliang_mit/alecz/mirl-qwen35`.
+- New branch/worktree: `qwen3.5` at `$MIRL_CLUSTER_ROOT/mirl-qwen35`.
 - Pinned base: `verl-project/verl@6a6242f3d8ec7d9f8b4936f4905144707d91fe3b`.
 - Historical fork point used for the 62-file inventory:
   `f56c89334f3d3b1942555782a10f28dee0bd2f28`.
@@ -21,10 +21,10 @@ cherry-picked.
 
   The result must contain exactly 62 paths.
 - Pre-migration patches, source archives, repository state, and checksums are in
-  `/work/mit/ppliang_mit/alecz/migration-backup/2026-07-20-qwen35/`.
+  `$MIRL_CLUSTER_ROOT/migration-backup/2026-07-20-qwen35/`.
   `SHA256SUMS` covers the backup files.  The 2.2 GB Stage-1 checkpoint was not
   duplicated; its source checksum is recorded separately.
-- The `baseline` and `trainedve-raw` worktrees and the `alec-mv` environment are
+- The `baseline` and `trainedve-raw` worktrees and the `mirl-b200` environment are
   read-only migration inputs.
 
 ## Disposition vocabulary
@@ -39,7 +39,7 @@ cherry-picked.
 ## Current migration status (2026-07-21)
 
 - **Environment complete:** `environments/mirl-qwen35` records the working
-  `alec-mv` prefix, exact Conda/Pip artifacts, build order, and CPU/B200 kernel
+  `mirl-b200` prefix, exact Conda/Pip artifacts, build order, and CPU/B200 kernel
   verifier. Runtime and compiler caches are rooted on `/scratch`.
 - **Combined image/video path complete:** `mirl_ext.data.MIRLDataset`, all six
   reward families, the deterministic eight-row real-media smoke fixture, and
@@ -55,9 +55,13 @@ cherry-picked.
   aggregate video grid. The focused adapter in
   `verl/experimental/agent_loop/agent_loop.py` expands only the position grid;
   its regression tests live in `tests/mirl/test_qwen35_mrope.py`.
-- **Still deferred:** raw time-series actor inputs and Stage-1 visual alignment
-  remain Stage 5. Their historical launchers are provenance snapshots, not
-  runnable Qwen3.5 jobs.
+- **Since superseded (was "still deferred"):** Stage-1 visual alignment now
+  runs as the production Qwen3.5 pipeline in `mirl_ext/alignment/` (launcher
+  `mirl_ext/alignment/run_stage1_b200.sbatch`), and the native time-series
+  path is the ts-native pseudo-video strips (`mirl_ext/rl/`, `TS_NATIVE=1`) —
+  the historical raw-embedding vLLM passthrough was deliberately superseded,
+  not ported. `run_trainedve_raw_b200.sbatch` remains a historical Qwen3-VL
+  provenance snapshot (do not submit).
 
 ## Historical baseline: all 62 paths
 
@@ -200,19 +204,20 @@ Before any Stage-1 export, every required vision-tower key and shape must match
 Qwen3.5-9B.  Existing Qwen3-VL artifacts are read-only and must never be
 overwritten.
 
-## Repository-owned Slurm launchers
+## Repository-owned Slurm launchers (historical)
 
 The three root launchers were copied byte-for-byte into `examples/mirl/slurm/`
 at bootstrap as provenance-controlled snapshots:
 
-- `run_combined_b200.sbatch` (replaced by the runnable Stage-4 Qwen3.5 smoke),
-- `run_trainedve_raw_b200.sbatch` (to be replaced in Stage 5), and
-- `run_stage1_b200.sbatch` (to be replaced in Stage 5).
+- `run_combined_b200.sbatch` (was replaced by the runnable Stage-4 Qwen3.5
+  smoke),
+- `run_trainedve_raw_b200.sbatch` (still a Qwen3-VL snapshot — it targets the
+  retired worktree; do not submit), and
+- `run_stage1_b200.sbatch` (snapshot since deleted; Stage-1 now submits the
+  production launcher `mirl_ext/alignment/run_stage1_b200.sbatch`).
 
-Only `run_combined_b200.sbatch` is Qwen3.5-ready. The Stage-1 snapshot still
-names the removed `mirl-align` worktree; do not submit the raw-signal or Stage-1
-snapshots. Their purpose is to make later launcher changes visible in branch
-review.
+The snapshots' purpose was to make later launcher changes visible in branch
+review. See `examples/mirl/slurm/README.md` for the current launcher set.
 
 ## Deliberately dropped patch classes
 

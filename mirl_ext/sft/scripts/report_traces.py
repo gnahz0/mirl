@@ -6,31 +6,25 @@ reasons), so yield IS teacher accuracy. --audit N additionally prints a
 stratified sample of accepted traces for the manual grounding read automatic
 validation cannot replace.
 
-    python mirl_ext/sft/report_traces.py data/sft/traces.jsonl --audit 6
+    python mirl_ext/sft/scripts/report_traces.py data/sft/traces.jsonl --audit 6
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
-import json
 import re
 import statistics
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from mirl_ext.sft.scripts.build_sft_parquet import last_records  # noqa: E402
 
 
 def load_last_records(paths: list[Path]) -> list[dict]:
     """Last record per uid; unparseable lines (kill-truncated tails) skipped."""
-    last: dict[str, dict] = {}
-    for path in paths:
-        for line in path.read_text().splitlines():
-            if line.strip():
-                try:
-                    rec = json.loads(line)
-                    last[rec["uid"]] = rec
-                except (json.JSONDecodeError, KeyError):
-                    continue
-    return list(last.values())
+    return list(last_records(paths)[0].values())
 
 
 def attempt_list(rec: dict) -> list[dict]:
@@ -75,7 +69,7 @@ def report(records: list[dict]) -> None:
     n_completions = len(all_attempts) + sum(
         1 for r in records if r.get("status", "accepted") == "accepted"
     )
-    malformed = sum(1 for a in all_attempts if a["reason"] not in ("wrong", "wrong_out_of_space"))
+    malformed = sum(1 for a in all_attempts if a["reason"] != "wrong")
     leaks = sum(1 for a in all_attempts if a["reason"] == "leak")
     print(f"\ncompletions={n_completions} malformed_rate={pct(malformed, n_completions)} "
           f"leak_rejection_rate={pct(leaks, n_completions)}")

@@ -9,6 +9,7 @@ here, so they can never drift apart again.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ _CONFIG = Path(__file__).parents[1] / "sft" / "config.json"
 
 
 def config_path(key: str, env: str, fallback: str) -> str:
-    """Cluster paths live in sft/config.json (or env overrides), never in code."""
+    """Resolve env (mirl.env) -> sft/config.json -> fallback; cluster paths never live in code."""
     if os.environ.get(env):
         return os.environ[env].rstrip("/")
     if _CONFIG.is_file():
@@ -30,11 +31,28 @@ def config_path(key: str, env: str, fallback: str) -> str:
 DATA_ROOT = config_path("cluster_data_root", "MIRL_DATA_ROOT", "data")
 SCRATCH_ROOT = config_path("cluster_scratch_root", "MIRL_SCRATCH_ROOT", "scratch")
 
+
+def media_stem(path) -> str:
+    """FROZEN staged-media stem: sha1 of the source-path string, 20 hex chars.
+    On-disk staged filenames and --frames-from-staging joins depend on it —
+    never change this hash."""
+    return hashlib.sha1(str(path).encode()).hexdigest()[:20]
+
+
+def iter_jsonl(path):
+    """Strict JSONL reader: parse every non-blank line, fail loud on a malformed
+    one (task files are fully machine-written). Trace files instead need the
+    lenient last-record-per-uid readers in sft/scripts."""
+    with open(path) as fh:
+        for line in fh:
+            if line.strip():
+                yield json.loads(line)
+
 FAMILIES = [
     "smellnet_train",
     "ecg_train",
     "haptic_ts_train",
-    "haptic_mcq_train",  # minted by sft/make_haptic_mcq.py; absent until it runs
+    "haptic_mcq_train",  # minted by sft/scripts/make_haptic_mcq.py; absent until it runs
     "climb_train",
     "human_behaviour_train",
     "tactile_train",
@@ -126,16 +144,7 @@ def prompt_messages(row: dict) -> list[dict]:
     """The row's FULL prompt message list -- NOT prompt[0]: smellnet/climb/tactile
     carry system + user turns, and dropping the user turn loses the question and
     the <image>/<video> placeholder (this bug shipped once)."""
-    p = row.get("prompt")
-    if isinstance(p, list):
-        out = []
-        for m in p:
-            if isinstance(m, dict):
-                out.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-            else:
-                out.append({"role": "user", "content": str(m)})
-        return out
-    return [{"role": "user", "content": str(p or "")}]
+    return [{"role": m["role"], "content": m["content"]} for m in row["prompt"]]
 
 
 def prompt_text(row: dict) -> str:
@@ -147,10 +156,7 @@ def extra_info(row: dict) -> dict:
     """extra_info is stored as a JSON STRING in every MIRL parquet."""
     ei = row.get("extra_info")
     if isinstance(ei, str):
-        try:
-            ei = json.loads(ei)
-        except json.JSONDecodeError:
-            return {}
+        ei = json.loads(ei)
     return ei if isinstance(ei, dict) else {}
 
 

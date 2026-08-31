@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build this environment from a B200 interactive Slurm allocation. The default
-# paths are the cluster locations used by MIRL, but all three may be overridden.
-MIRL_ENV_PREFIX="${MIRL_ENV_PREFIX:-/work/mit/ppliang_mit/alecz/envs/alec-mv}"
-MIRL_WORKTREE="${MIRL_WORKTREE:-/work/mit/ppliang_mit/alecz/mirl-qwen35}"
-MIRL_SCRATCH_ROOT="${MIRL_SCRATCH_ROOT:-/scratch/dvdai_mit/alecz}"
-MIRL_HF_CACHE_ROOT="${MIRL_HF_CACHE_ROOT:-/work/mit/ppliang_mit/alecz/hf_cache}"
+# Build this environment from a B200 interactive Slurm allocation. Defaults
+# come from the $MIRL_* vars in mirl.env (source it first); each may be
+# overridden.
+MIRL_ENV_PREFIX="${MIRL_ENV_PREFIX:-$MIRL_PYENV}"
+MIRL_WORKTREE="${MIRL_WORKTREE:-$MIRL_CLUSTER_ROOT/mirl-qwen35}"
+MIRL_SCRATCH_ROOT="${MIRL_SCRATCH_ROOT:?source mirl.env first}"
+MIRL_HF_CACHE_ROOT="${MIRL_HF_CACHE_ROOT:-$MIRL_CLUSTER_ROOT/hf_cache}"
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "Run this script inside an interactive Slurm allocation." >&2

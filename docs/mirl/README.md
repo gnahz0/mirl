@@ -25,7 +25,7 @@ historical Qwen3-VL fork to Qwen3.5. It is based on official verl commit
   runs, so position-only video grids must be expanded to the same temporal
   layout. A regression also prevents generated visual special tokens from
   consuming nonexistent media grids.
-- `environments/mirl-qwen35` defines and verifies the B200-specific `alec-mv`
+- `environments/mirl-qwen35` defines and verifies the B200-specific `mirl-b200`
   stack. Temporary files, pip downloads, Ray sockets, and compiler caches live
   on `/scratch`, while source, logs, and Parquet indexes remain on `/work`.
 
@@ -51,23 +51,23 @@ training sharding.
 | `examples/mirl/slurm/run_combined_b200.sbatch` | Two-B200 one-step smoke submission |
 | `environments/mirl-qwen35/` | Rebuild script, verifier, and exact environment records |
 | `tests/mirl/` | Dataset, reward, and Qwen3.5 video-MRoPE regressions |
-| `docs/mirl/CONTINUATION.md` | Current operational state and next-agent handoff |
+| `docs/mirl/CONTINUATION.md` | Frozen 2026-07-21 migration handoff (current state: `mirl_ext/CLAUDE.md`) |
 | `docs/mirl/qwen35-migration-ledger.md` | Historical file-by-file migration decisions |
 
-## Verify `alec-mv`
+## Verify `mirl-b200`
 
 From the repository root:
 
 ```bash
 export PYTHONNOUSERSITE=1
-export TMPDIR=/scratch/dvdai_mit/alecz/tmp-qwen35
-export PIP_CACHE_DIR=/scratch/dvdai_mit/alecz/pip-cache-qwen35
+export TMPDIR=$MIRL_SCRATCH_ROOT/tmp-qwen35
+export PIP_CACHE_DIR=$MIRL_SCRATCH_ROOT/pip-cache-qwen35
 export FORCE_QWENVL_VIDEO_READER=torchcodec
 
-/work/mit/ppliang_mit/alecz/envs/alec-mv/bin/python \
+"$MIRL_PYENV"/bin/python \
   environments/mirl-qwen35/verify_environment.py \
   --model-snapshot \
-  /work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  $MIRL_CLUSTER_ROOT/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a
 ```
 
 Use `--cuda` inside a B200 allocation to exercise FlashAttention,
@@ -76,7 +76,7 @@ causal-conv1d, and the FLA gated-delta kernel.
 ## Run the smoke test
 
 ```bash
-cd /work/mit/ppliang_mit/alecz/mirl-qwen35
+cd $MIRL_CLUSTER_ROOT/mirl-qwen35
 sbatch examples/mirl/slurm/run_combined_b200.sbatch
 ```
 

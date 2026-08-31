@@ -15,14 +15,14 @@ sys.path.insert(0, str(ROOT))
 
 from mirl_ext.rewards import combined  # noqa: E402
 from mirl_ext.data.schema import OPEN_SOURCES, prompt_messages, prompt_text  # noqa: E402
-from mirl_ext.sft.build_sft_parquet import (  # noqa: E402
+from mirl_ext.sft.scripts.build_sft_parquet import (  # noqa: E402
     accepted_traces,
     build_record,
     check_record,
     sft_messages,
 )
-from mirl_ext.sft.export_sft_tasks import keep_row  # noqa: E402
-from mirl_ext.sft.gen_sft_targets import (  # noqa: E402
+from mirl_ext.sft.scripts.export_sft_tasks import keep_row  # noqa: E402
+from mirl_ext.sft.scripts.gen_sft_targets import (  # noqa: E402
     SYSTEM_PROMPT,
     TeacherTask,
     build_request,
@@ -30,8 +30,8 @@ from mirl_ext.sft.gen_sft_targets import (  # noqa: E402
     read_status,
     validate,
 )
-from mirl_ext.sft.split_sft_rl import assign_groups  # noqa: E402
-from mirl_ext.sft.stage_media import _stem  # noqa: E402
+from mirl_ext.sft.scripts.split_sft_rl import assign_groups  # noqa: E402
+from mirl_ext.sft.scripts.stage_media import _stem  # noqa: E402
 
 GOOD_THINK = (
     "<think>The upper zones show patchy consolidation with air bronchograms and "
@@ -70,6 +70,18 @@ def test_answer_key_sentinel_never_reaches_request():
     )
     messages, n_media = build_request(task, None, None)
     assert sentinel not in json.dumps(messages) and n_media == 0
+
+
+def test_answer_conditioned_request_reveals_answer_and_swaps_system():
+    from mirl_ext.sft.scripts.gen_sft_targets import RATIONALIZE_SYSTEM
+
+    messages, _ = build_request(_task(), None, None, answer="No PE")
+    assert messages[0]["content"] == RATIONALIZE_SYSTEM
+    assert "VERIFIED ANSWER: No PE" in messages[1]["content"][0]["text"]
+    # Default path stays answer-blind and uses the zero-shot system prompt.
+    blind, _ = build_request(_task(), None, None)
+    assert blind[0]["content"] == SYSTEM_PROMPT
+    assert "VERIFIED ANSWER" not in blind[1]["content"][0]["text"]
 
 
 def test_request_contains_no_demonstrations():
@@ -148,8 +160,8 @@ def test_rationale_length_bounds():
 
 def test_leakage_phrases_rejected():
     for phrase in ("the correct answer is", "the provided answer", "given the answer",
-                   "ground truth", "I was told", "support set", "examples above",
-                   "the description says", "the blue line"):
+                   "the verified answer", "ground truth", "I was told", "support set",
+                   "examples above", "the description says", "the blue line"):
         text = f"<think>Reasoning mentioning {phrase} somewhere in the rationale, at length.</think> \\boxed{{No PE}}"
         assert _v(text)[1] == "leak", phrase
 
@@ -286,7 +298,7 @@ def test_open_gt_rows_train_on_ground_truth_text():
 
 
 def test_minted_haptic_mcq_row():
-    from mirl_ext.sft.make_haptic_mcq import mint_row
+    from mirl_ext.sft.scripts.make_haptic_mcq import mint_row
 
     tactile_row = {
         "data_source": "initial_fingers",
@@ -334,7 +346,7 @@ def test_smellnet_descriptions_are_the_canonical_50():
     path = ROOT / "data/sft/meta/text_description.json"
     if not path.is_file():
         return  # descriptions live with the (unsynced) data dir; skip elsewhere
-    from mirl_ext.sft.gen_sft_episodes import CATEGORY
+    from mirl_ext.sft.scripts.gen_sft_episodes import CATEGORY
 
     desc = load_descriptions(path)
     assert set(desc) == set(CATEGORY) and len(desc) == 50

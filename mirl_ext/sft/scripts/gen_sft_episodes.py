@@ -7,7 +7,7 @@ student sees only the original 50-way prompt + query plot, so the episode
 scaffolding must never be cited). Planning is deterministic from --seed.
 
     # laptop (endpoint access + staged plots); resume-by-uid, re-runnable
-    python mirl_ext/sft/gen_sft_episodes.py --out data/sft/ts_traces_episodes.jsonl [--dry-run|--limit 10]
+    python mirl_ext/sft/scripts/gen_sft_episodes.py --out data/sft/ts_traces_episodes.jsonl [--dry-run|--limit 10]
 """
 
 from __future__ import annotations
@@ -23,16 +23,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from mirl_ext.rewards._common import extract_boxed_answer, format_reward  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gen_sft_targets import (  # noqa: E402
-    DEFAULT_MODEL,
+from mirl_ext.sft.scripts.gen_sft_targets import (  # noqa: E402
     _LEAK_RE,
     _img,
     _norm,
     _resolve_image,
+    add_teacher_client_args,
     backoff,
     make_client,
     read_status,
@@ -70,8 +68,7 @@ assert len(ALL_CLASSES) == 50, f"CATEGORY has {len(ALL_CLASSES)} classes, expect
 
 # Self-containment filter on top of _LEAK_RE: the student never sees the episode
 # scaffolding, so citing it is a leak. Bare "support(s)"/"example" deliberately
-# spared ("this supports garlic", "for example"). Subsumes gen_sft_targets'
-# _GALLERY_LEAK_RE word list -- keep in sync.
+# spared ("this supports garlic", "for example").
 _EPISODE_LEAK_RE = re.compile(
     r"\b(support(s|ing)?[ -](set|plot|image|example|recording)s?|"
     r"demonstrations?|galler(y|ies)|references?|examples|candidates?|"
@@ -181,11 +178,6 @@ def sample_candidates(y, counter, rng, n_hard, n_rand):
     return hard, rand
 
 
-def sample_supports(cls, pool_by_class, shots, rng):
-    pool = pool_by_class[cls]
-    return rng.sample(pool, min(shots, len(pool)))
-
-
 def make_episode(task, negatives_hard, negatives_rand, pool_by_class, shots, rng):
     y = task["ground_truth"]
     order = [y] + negatives_hard + negatives_rand
@@ -195,7 +187,7 @@ def make_episode(task, negatives_hard, negatives_rand, pool_by_class, shots, rng
         "y": y,
         "order": order,
         "hard": negatives_hard,
-        "supports": {c: sample_supports(c, pool_by_class, shots, rng) for c in order},
+        "supports": {c: rng.sample(pool_by_class[c], min(shots, len(pool_by_class[c]))) for c in order},
     }
 
 
@@ -403,21 +395,16 @@ def main() -> None:
     )
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--image-root", type=Path, default=Path("data/sft/ts_images"))
-    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--n-way", type=int, default=5)
     ap.add_argument("--shots", type=int, default=3, help="support plots per candidate")
     ap.add_argument("--hard-negatives", type=int, default=2, help="same-category negatives")
-    ap.add_argument("--limit", type=int, default=0, help="0 = all remaining")
     ap.add_argument("--concurrency", type=int, default=4, help="~1-2 MB payload/request")
-    ap.add_argument("--max-attempts", type=int, default=4)
-    ap.add_argument("--max-completion-tokens", type=int, default=2048)
-    ap.add_argument("--request-timeout", type=float, default=180.0)
     ap.add_argument(
         "--descriptions", type=Path, default=Path("data/sft/meta/text_description.json"),
         help="upstream SmellNet per-substance profiles, shown per candidate; "
         "missing file or --descriptions '' disables",
     )
-    ap.add_argument("--seed", type=int, default=42)
+    add_teacher_client_args(ap)
     ap.add_argument("--dry-run", action="store_true", help="one episode: layout + call + verdict")
     args = ap.parse_args()
 
@@ -472,7 +459,7 @@ def main() -> None:
     stats = _fresh_stats()
     t0 = time.time()
     # Append + flush per record; as_completed so a slow call never holds back
-    # finished results (see gen_sft_targets.py for the war stories).
+    # finished results (a kill must not lose paid work).
     with args.out.open("a") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [pool.submit(generate_one, client, e, args, stats) for e in todo]
         for fut in as_completed(futures):

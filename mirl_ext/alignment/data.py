@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from mirl_ext.data.schema import MULTILABEL_TASKS, SMELLNET_MIXTURE, recording_stem
+from mirl_ext.data.schema import MULTILABEL_TASKS, SMELLNET_MIXTURE, media_refs, recording_stem
 from mirl_ext.data.schema import TACTILE_TASK_LABELS as TASK_LABELS
 from mirl_ext.data.signals import load_signal, signal_family as _signal_family
 
@@ -109,14 +109,10 @@ class AlignmentDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
-    def _load_signal(self, sig_entry: dict) -> tuple[torch.Tensor, str]:
-        return load_signal(sig_entry)
-
     def __getitem__(self, idx: int) -> dict:
         sample = self.rows[idx]
-        signals = sample.get("signals") or []
-        if signals:
-            media, family = self._load_signal(signals[0])
+        if sample.get("signals"):
+            media, family = load_signal(sample["signals"][0])
             return {
                 "kind": "signal",
                 "media": media,
@@ -124,16 +120,10 @@ class AlignmentDataset(Dataset):
                 "text": sample["reward_model"]["ground_truth"],
                 **({"targets": sample["_tactile_targets"]} if "_tactile_targets" in sample else {}),
             }
-
-        images = sample.get("images") or []
+        images, video_path = media_refs(sample)
         if images:
-            image = images[0]
-            path = image if isinstance(image, str) else image.get("image") or image.get("path")
-            return {"kind": "image", "media": str(path)}
-
-        video = sample["videos"][0]
-        path = video if isinstance(video, str) else video.get("video") or video.get("path")
-        return {"kind": "video", "media": str(path)}
+            return {"kind": "image", "media": images[0]}
+        return {"kind": "video", "media": video_path}
 
 
 class HomogeneousBatchSampler(Sampler[list[int]]):
@@ -158,16 +148,11 @@ class HomogeneousBatchSampler(Sampler[list[int]]):
         self.batch_size = batch_size
         self.signal_repeat_factors = dict(signal_repeat_factors or {})
 
+        # Count through the same chunking as __iter__ so __len__ never drifts.
         effective_sizes = {
             group: len(rows) * self.signal_repeat_factors.get(group[1], 1) for group, rows in self.groups.items()
         }
-        global_batch_size = self.batch_size * self.world_size
-        batch_counts = {
-            group: (size + global_batch_size - 1) // global_batch_size for group, size in effective_sizes.items()
-        }
-        self.num_batches = sum(
-            count for group, count in batch_counts.items() if effective_sizes[group] >= self.world_size
-        )
+        self.num_batches = len(self._global_batches({g: list(range(n)) for g, n in effective_sizes.items()}))
 
     def _global_batches(self, pools: dict) -> list[list[int]]:
         """Build global batches that give every rank a sample."""

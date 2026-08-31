@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -12,8 +10,6 @@ from omegaconf import DictConfig
 from .data import TACTILE_SPANS, TASK_LABELS
 from .metrics import _TS_FAMILIES
 from .model import MultimodalAlignmentModel
-
-logger = logging.getLogger("alignment.trainer")
 
 LabelBank = dict[str, tuple[tuple[str, ...], torch.Tensor]]
 TSEval = tuple[
@@ -30,19 +26,13 @@ def _build_text_label_bank(
     model: MultimodalAlignmentModel,
     vocabularies: dict[str, tuple[str, ...]],
     device: torch.device,
-    batch_size: int = 256,
 ) -> LabelBank:
     """Encode each split's complete family label vocabulary once with SigLIP2."""
     bank: LabelBank = {}
     for family in _TS_FAMILIES:
         labels = tuple(vocabularies.get(family, ()))
-        if not labels:
-            continue
-        chunks = [
-            model.encode_text(list(labels[start : start + batch_size]), device=device).float()
-            for start in range(0, len(labels), batch_size)
-        ]
-        bank[family] = (labels, torch.cat(chunks, dim=0).detach())
+        if labels:
+            bank[family] = (labels, model.encode_text(list(labels), device=device))
     return bank
 
 
@@ -52,10 +42,8 @@ def _build_tactile_bank(
     device: torch.device,
 ) -> tuple[tuple[str, ...], torch.Tensor]:
     """Encode all six tactile task vocabularies as one bank."""
-    labels: list[str] = []
-    for task, task_labels in TASK_LABELS.items():
-        labels.extend(task_labels)
-    return tuple(labels), model.encode_text(labels, device=device).float().detach()
+    labels = [label for task_labels in TASK_LABELS.values() for label in task_labels]
+    return tuple(labels), model.encode_text(labels, device=device)
 
 
 def _label_siglip_loss(
@@ -230,8 +218,6 @@ def _compute_losses(
                 world_size,
             )
             metrics.update(per_task)
-            tactile_targets = tactile_targets.detach()
-            tactile_masks = tactile_masks.detach()
         else:
             candidate_labels, text_embeddings = label_bank[family]
             l_ts = _label_siglip_loss(
@@ -275,10 +261,9 @@ def _compute_losses(
     metrics["loss/total"] = total.detach().item()
     metrics["logit_scale"] = log_logit_scale.detach().exp().item()
     metrics["logit_bias"] = logit_bias.detach().item()
-    return (
-        total,
-        metrics,
-        (
-            (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
-        ),
+    ts_eval: TSEval = (
+        (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
+        if z_ts is not None
+        else (None, [], [], None, None)
     )
+    return total, metrics, ts_eval

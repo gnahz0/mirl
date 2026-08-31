@@ -10,7 +10,7 @@ Training reward = f1_weight * token_f1 + sim_weight * similarity
 import re
 from difflib import SequenceMatcher
 
-from ._common import extract_boxed_answer, jaccard, set_prf1
+from ._common import extract_boxed_answer, jaccard, score_dict, set_prf1
 
 _STOP = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
@@ -48,13 +48,7 @@ def compute_score(
     acc = 1.0 if pred_text.strip().lower() == ground_truth.strip().lower() else 0.0
     score = f1_weight * f1 + sim_weight * similarity
 
-    return {
-        "score": score,
-        "acc": acc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall,
-        "jaccard": jacc,
-        "similarity": similarity,
-        "format": 0.0,
-    }
+    return score_dict(
+        score=score, acc=acc, precision=precision, recall=recall,
+        f1=f1, jacc=jacc, similarity=similarity, fmt=0.0,
+    )

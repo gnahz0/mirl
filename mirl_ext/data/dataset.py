@@ -4,31 +4,53 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import logging
 import os
+import re
 from typing import Any
 
 import torch
 from PIL import Image
 
+from mirl_ext.data.schema import extra_info as parse_extra_info
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 logger = logging.getLogger(__name__)
 
+# ts-native strips (rl/build_ts_native_parquet.py): T Stage-1 pseudo-video
+# frames stacked vertically in one grayscale PNG, frame count in the name.
+_TS_STACK_RE = re.compile(r"_stack(\d+)\.png$")
 
-def _extra_info_as_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return {"raw": value}
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    return {"value": value}
+
+def _clamp_video(entry: dict, max_video_frames) -> None:
+    """Drop None-valued limit fields (an explicit None defeats qwen_vl_utils'
+    ele.get defaults and crashes frame sampling), then cap max_frames."""
+    for field in ("min_frames", "max_frames", "fps", "nframes"):
+        if entry.get(field) is None:
+            entry.pop(field, None)
+    if max_video_frames is not None:
+        entry["max_frames"] = min(entry.get("max_frames", 768), int(max_video_frames))
+
+
+def fetch_ts_stack(path: str, nframes: int) -> tuple[torch.Tensor, dict]:
+    """Strip PNG -> the ([T,3,H,W] float 0-255, metadata) tuple both the agent
+    loop and the trainer already pass through for real videos.
+
+    Deliberately bypasses qwen_vl_utils: its frame-list path feeds image_factor
+    (32) to fetch_image as the PATCH size, so frames get smart_resized with
+    factor 64 and the 32 px Stage-1 tile width doubles. The HF video processor
+    is measured identity on these dims (rl/ts_native_DESIGN.md)."""
+    import numpy as np
+
+    strip = np.asarray(Image.open(path).convert("L"), dtype=np.float32)
+    frames = torch.from_numpy(strip).reshape(nframes, -1, strip.shape[1])
+    if nframes % 2:  # even frame count, same convention as qwen_vl_utils
+        frames = torch.cat([frames, frames[-1:]])
+        nframes += 1
+    # Contiguous like fetch_video's output; stride-0 views can trip IPC paths.
+    video = frames.unsqueeze(1).expand(-1, 3, -1, -1).contiguous()
+    metadata = {"fps": 2.0, "frames_indices": list(range(nframes)), "total_num_frames": float(nframes)}
+    return video, metadata
 
 
 class MIRLDataset(RLHFDataset):
@@ -49,11 +71,7 @@ class MIRLDataset(RLHFDataset):
         for raw_video in normalized.get(self.video_key, None) or []:
             video = dict(raw_video) if isinstance(raw_video, dict) else raw_video
             if isinstance(video, dict):
-                for field in ("min_frames", "max_frames", "fps", "nframes"):
-                    if video.get(field) is None:
-                        video.pop(field, None)
-                if max_video_frames is not None:
-                    video["max_frames"] = min(video.get("max_frames", 768), int(max_video_frames))
+                _clamp_video(video, max_video_frames)
             videos.append(video)
         normalized[self.video_key] = videos
         # Explicit base call, not super(): HF's multiprocess filter pickles this file-loaded class, and zero-arg super() can then resolve against a reconstructed class.
@@ -67,7 +85,7 @@ class MIRLDataset(RLHFDataset):
         row.pop(self.audio_key, None)
         row["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
 
-        extra_info = _extra_info_as_dict(row.get("extra_info"))
+        extra_info = parse_extra_info(row)
         row["extra_info"] = extra_info
         row["index"] = extra_info.get("index", 0)
         row["tools_kwargs"] = extra_info.get("tools_kwargs", {})
@@ -117,11 +135,13 @@ class MIRLDataset(RLHFDataset):
                         existing = item.get("max_pixels")
                         item["max_pixels"] = min(int(existing), max_image_pixels) if existing else max_image_pixels
                 elif item.get("type") == "video":
-                    for field in ("min_frames", "max_frames", "fps", "nframes"):
-                        if item.get(field) is None:
-                            item.pop(field, None)
-                    if max_video_frames is not None:
-                        item["max_frames"] = min(item.get("max_frames", 768), int(max_video_frames))
+                    source = item.get("video")
+                    if isinstance(source, str) and _TS_STACK_RE.search(source):
+                        # ts-native strip: fetched by _process_multi_modal_info,
+                        # never by qwen_vl_utils; the caps below don't apply.
+                        kept.append(item)
+                        continue
+                    _clamp_video(item, max_video_frames)
                     source = item.get("video")
                     if max_video_bytes and isinstance(source, str):
                         try:
@@ -135,26 +155,25 @@ class MIRLDataset(RLHFDataset):
 
     @classmethod
     def _process_multi_modal_info(cls, messages: list[dict], image_patch_size, config):
-        from qwen_vl_utils import process_vision_info
-
         cls._prepare_media_messages(messages, image_patch_size=image_patch_size, config=config)
-        has_visual = any(
-            isinstance(message.get("content"), list)
-            and any(
-                isinstance(item, dict) and item.get("type") in {"image", "video"}
-                for item in message["content"]
-            )
-            for message in messages
-        )
-        if has_visual:
-            images, videos = process_vision_info(
-                messages,
-                image_patch_size=image_patch_size,
-                return_video_metadata=True,
-            )
-        else:
-            images, videos = None, None
-        return images, videos, RLHFDataset._extract_audio_info(messages)
+        stacks, other_media = [], 0
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") not in ("image", "video"):
+                    continue
+                source = item.get("video")
+                if isinstance(source, str) and (stack := _TS_STACK_RE.search(source)):
+                    stacks.append(fetch_ts_stack(source, int(stack.group(1))))
+                else:
+                    other_media += 1
+        if stacks:
+            # ts-native rows carry exactly one media: the strip (builder invariant).
+            assert not other_media and len(stacks) == 1, "ts-native strip must be the row's only media"
+            return None, stacks, cls._extract_audio_info(messages)
+        return RLHFDataset._process_multi_modal_info(messages, image_patch_size=image_patch_size, config=config)
 
     @classmethod
     async def process_multi_modal_info(cls, messages: list[dict], image_patch_size, config):

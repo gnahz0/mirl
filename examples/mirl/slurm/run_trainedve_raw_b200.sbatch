@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch raw-signal GRPO using the correctly aligned Qwen3-VL vision encoder.
-# Submit:   sbatch /work/mit/ppliang_mit/alecz/run_trainedve_raw_b200.sbatch
-# Watch:    tail -f /work/mit/ppliang_mit/alecz/logs/trainedve_raw_<jobid>.out
+# Submit:   sbatch $MIRL_CLUSTER_ROOT/run_trainedve_raw_b200.sbatch
+# Watch:    tail -f $MIRL_CLUSTER_ROOT/logs/trainedve_raw_<jobid>.out
 # Cancel:   scancel <jobid>
 #
 # Config: training script defaults to N_GPUS_PER_NODE=4, ROLLOUT_TP=2 (=> 2 data-parallel
@@ -10,7 +10,6 @@
 # To scale up: set --gpus-per-node=8 here AND export N_GPUS_PER_NODE=8 below.
 #SBATCH --job-name=trainedve_raw
 #SBATCH --partition=b200-batch
-#SBATCH --account=ppliang_mit
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
@@ -20,8 +19,6 @@
                       # plus periodic validation video-decode spike. 1600G matched the config that
                       # survived 14 real training steps + full validation (job 101320).
 #SBATCH --time=24:00:00   # partition max (b200-batch TIMELIMIT = 1-00:00:00)
-#SBATCH --output=/work/mit/ppliang_mit/alecz/logs/trainedve_raw_%j.out
-#SBATCH --error=/work/mit/ppliang_mit/alecz/logs/trainedve_raw_%j.out
 
 set -eo pipefail   # not -u: conda's activate script references unbound vars
 
@@ -51,31 +48,31 @@ export NCCL_ALGO=Ring         # stick to the most battle-tested algorithm
 export TORCH_FR_BUFFER_SIZE=2000
 export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1
-mkdir -p /work/mit/ppliang_mit/alecz/logs/nccl_traces
-export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/work/mit/ppliang_mit/alecz/logs/nccl_traces/trace_${SLURM_JOB_ID:-manual}_rank
+mkdir -p $MIRL_CLUSTER_ROOT/logs/nccl_traces
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$MIRL_CLUSTER_ROOT/logs/nccl_traces/trace_${SLURM_JOB_ID:-manual}_rank
 
 # --- keep ALL caches off the 93 GB home quota (point everything at /work or /scratch) ---
-export HF_HOME=/work/mit/ppliang_mit/alecz/hf_cache
+export HF_HOME=$MIRL_CLUSTER_ROOT/hf_cache
 export HF_HUB_OFFLINE=0
-export TRITON_CACHE_DIR=/work/mit/ppliang_mit/alecz/.cache/triton
-export TORCHINDUCTOR_CACHE_DIR=/work/mit/ppliang_mit/alecz/.cache/inductor
-export XDG_CACHE_HOME=/work/mit/ppliang_mit/alecz/.cache/xdg
-export VLLM_CACHE_ROOT=/work/mit/ppliang_mit/alecz/.cache/vllm
-export RAY_TMPDIR=/scratch/${USER}/alecz/ray_tmp
+export TRITON_CACHE_DIR=$MIRL_CLUSTER_ROOT/.cache/triton
+export TORCHINDUCTOR_CACHE_DIR=$MIRL_CLUSTER_ROOT/.cache/inductor
+export XDG_CACHE_HOME=$MIRL_CLUSTER_ROOT/.cache/xdg
+export VLLM_CACHE_ROOT=$MIRL_CLUSTER_ROOT/.cache/vllm
+export RAY_TMPDIR="$MIRL_SCRATCH_ROOT"/ray_tmp
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" "$RAY_TMPDIR"
 
 # --- wandb + run identity (script reads PROJECT_NAME/EXPERIMENT_NAME; CKPT_DIR derives from them) ---
 export PROJECT_NAME="multiverse"
-export WANDB_API_KEY="$(cat /work/mit/ppliang_mit/alecz/.wandb_key)"
-export WANDB_ENTITY="aleczhang-massachusetts-institute-of-technology"
+export WANDB_API_KEY="$(cat $MIRL_CLUSTER_ROOT/.wandb_key)"
+export WANDB_ENTITY="$MIRL_WANDB_ENTITY"
 export WANDB_RESUME="allow"   # fresh IDs start at 0; later 24h relays can append cleanly
 export TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 
 # --- activate the Blackwell-built env (prefix env on /work) ---
-source /home/dvdai_mit/miniconda3/etc/profile.d/conda.sh
-conda activate /work/mit/ppliang_mit/alecz/envs/alec-mv
+source $MIRL_CONDA_SH
+conda activate $MIRL_PYENV
 
-cd /work/mit/ppliang_mit/alecz/mirl-trainedve
+cd $MIRL_CLUSTER_ROOT/mirl-trainedve
 
 # --- CONTROLLED A/B: baseline (stock Qwen3-VL vision encoder) vs trainedve (our merged VE).
 # Both variants train/eval on the SAME parquets + SAME reward code on this cluster; the ONLY
@@ -83,9 +80,9 @@ cd /work/mit/ppliang_mit/alecz/mirl-trainedve
 # Fresh run ids (…-v2) so relays append cleanly and we never collide with the old merged
 # baseline-ve-main history (which caused wandb "step < current step, ignored" drops).
 RUN_VARIANT="trainedve"
-STOCK_VE=/work/mit/ppliang_mit/alecz/hf_cache/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
-ALIGNMENT_BEST=/scratch/dvdai_mit/alecz/checkpoints/alignment_stage1_v2/best/alignment_state.pt
-TRAINED_VE=/scratch/dvdai_mit/alecz/models/qwen3vl-8b-trained-ve-correct-v2
+STOCK_VE=$MIRL_CLUSTER_ROOT/hf_cache/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+ALIGNMENT_BEST=$MIRL_SCRATCH_ROOT/checkpoints/alignment_stage1_v2/best/alignment_state.pt
+TRAINED_VE=$MIRL_SCRATCH_ROOT/models/qwen3vl-8b-trained-ve-correct-v2
 case "$RUN_VARIANT" in
   baseline)
     export MODEL_PATH="$STOCK_VE"
@@ -94,7 +91,7 @@ case "$RUN_VARIANT" in
   trainedve)
     if [[ ! -f "$TRAINED_VE/CORRECT_STAGE1_VE.json" ]]; then
       echo "[sbatch] exporting correct Stage-1 best VE into full Qwen3-VL checkpoint"
-      python /work/mit/ppliang_mit/alecz/mirl-align/scripts/export_stage1_visual_to_hf.py \
+      python $MIRL_CLUSTER_ROOT/mirl-align/scripts/export_stage1_visual_to_hf.py \
         --base-model "$STOCK_VE" \
         --alignment-checkpoint "$ALIGNMENT_BEST" \
         --output-dir "$TRAINED_VE"
@@ -102,7 +99,7 @@ case "$RUN_VARIANT" in
     export MODEL_PATH="$TRAINED_VE"
     export EXPERIMENT_NAME="trainedve-correct-raw"
     export WANDB_RUN_ID="trainedve-correct-raw-v1"
-    export DATA_DIR="/work/mit/ppliang_mit/alecz/data/trainedve_raw" ;;
+    export DATA_DIR="$MIRL_DATA_ROOT/trainedve_raw" ;;
   tstok)
     # A/B for data representation: stock VE, but time-series datasets (ecg/smellnet/haptic_ts)
     # fed as RAW NUMERIC TEXT TOKENS instead of plot images. See data/TIME_SERIES_TOKENS.md.

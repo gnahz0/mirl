@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Render the time-series datasets (smellnet / ecg / haptic_ts) into static
 graph images and rewrite their annotation JSONs to reference the images instead
-of the raw signal files. (Ported from the historical fork's baseline branch;
-paths now come from mirl_ext/sft/config.json.)
+of the raw signal files. (Ported from the historical fork's baseline branch.)
 
 Why: the combined Qwen3-VL run consumes images/videos, not raw `.pt`/`.csv`
 time series. The "time series as images" approach plots each signal once and
@@ -48,50 +47,63 @@ def _img_path(dataset, signal_path):
     return os.path.join(IMG_ROOT, dataset, f"{h}.png")
 
 
-def _render_smellnet(csv_path, out):
+def _render_lines(series, ylabels, *, figsize, lw, color, ylabel_fontsize, xlabel, title, out):
+    """Shared stacked-line-panel skeleton for smellnet/ecg. Keeps the Agg
+    preamble in-body: pool workers may hit this as the first pyplot import."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
-    import pandas as pd
 
-    df = pd.read_csv(csv_path)
-    cols = [c for c in df.columns if df[c].dtype.kind in "fiu"] or list(df.columns)
-    fig, axes = plt.subplots(len(cols), 1, figsize=(8, max(3, 1.5 * len(cols))), sharex=True)
+    fig, axes = plt.subplots(len(series), 1, figsize=figsize, sharex=True)
     axes = np.atleast_1d(axes)
-    for ax, c in zip(axes, cols):
-        ax.plot(df[c].values, lw=1.0)
-        ax.set_ylabel(str(c), fontsize=9)
+    for ax, y, label in zip(axes, series, ylabels):
+        ax.plot(y, lw=lw, color=color)
+        ax.set_ylabel(label, fontsize=ylabel_fontsize)
         ax.grid(alpha=0.3)
-    axes[-1].set_xlabel("time step")
-    fig.suptitle("E-nose gas sensor readings")
+    axes[-1].set_xlabel(xlabel)
+    fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(out, dpi=RENDER_DPI)
     plt.close(fig)
 
 
+def _render_smellnet(csv_path, out):
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    cols = [c for c in df.columns if df[c].dtype.kind in "fiu"] or list(df.columns)
+    _render_lines(
+        [df[c].values for c in cols],
+        [str(c) for c in cols],
+        figsize=(8, max(3, 1.5 * len(cols))),
+        lw=1.0,
+        color=None,
+        ylabel_fontsize=9,
+        xlabel="time step",
+        title="E-nose gas sensor readings",
+        out=out,
+    )
+
+
 def _render_ecg(pt_path, out):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
     import torch
 
     a = torch.load(pt_path, map_location="cpu", weights_only=False).float().numpy()
     if a.ndim == 1:
         a = a[None, :]
     C = a.shape[0]
-    fig, axes = plt.subplots(C, 1, figsize=(9, max(3, 1.1 * C)), sharex=True)
-    axes = np.atleast_1d(axes)
-    for i, ax in enumerate(axes):
-        ax.plot(a[i], lw=0.9, color="k")
-        ax.set_ylabel(f"lead {i + 1}", fontsize=8)
-        ax.grid(alpha=0.3)
-    axes[-1].set_xlabel("sample")
-    fig.suptitle("ECG leads")
-    fig.tight_layout()
-    fig.savefig(out, dpi=RENDER_DPI)
-    plt.close(fig)
+    _render_lines(
+        list(a),
+        [f"lead {i + 1}" for i in range(C)],
+        figsize=(9, max(3, 1.1 * C)),
+        lw=0.9,
+        color="k",
+        ylabel_fontsize=8,
+        xlabel="sample",
+        title="ECG leads",
+        out=out,
+    )
 
 
 def _render_haptic(pt_path, key, out):

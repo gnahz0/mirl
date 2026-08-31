@@ -6,7 +6,7 @@ compared order-agnostically via set operations.
 Training reward = acc_weight * acc + sim_weight * jaccard + format_weight * format
 """
 
-from ._common import extract_boxed_answer, format_reward, jaccard, set_prf1
+from ._common import extract_boxed_answer, format_reward, jaccard, score_dict, set_prf1
 
 
 def parse_labels(answer_str: str) -> set[str]:
@@ -14,10 +14,6 @@ def parse_labels(answer_str: str) -> set[str]:
     if not answer_str:
         return set()
     return {label.strip().upper() for label in answer_str.split(",") if label.strip()}
-
-
-def acc_reward(pred_labels: set[str], gt_labels: set[str]) -> float:
-    return 1.0 if pred_labels == gt_labels else 0.0
 
 
 def compute_score(
@@ -32,19 +28,13 @@ def compute_score(
     gt_labels = parse_labels(ground_truth)
 
     fmt = format_reward(predict_str)
-    acc = acc_reward(pred_labels, gt_labels)
+    acc = 1.0 if pred_labels == gt_labels else 0.0
     jacc = jaccard(pred_labels, gt_labels)
     precision, recall, f1 = set_prf1(pred_labels, gt_labels)
 
     score = acc_weight * acc + sim_weight * jacc + format_weight * fmt
 
-    return {
-        "score": score,
-        "acc": acc,
-        "jaccard": jacc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall,
-        "similarity": jacc,
-        "format": fmt,
-    }
+    return score_dict(
+        score=score, acc=acc, precision=precision, recall=recall,
+        f1=f1, jacc=jacc, similarity=jacc, fmt=fmt,
+    )
