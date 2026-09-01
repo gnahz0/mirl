@@ -115,18 +115,10 @@ Rules:
 4. \\boxed{} must contain the answer exactly as given. Keep the reasoning to
    2-5 sentences."""
 
-# Only facts verified against the data/renderer: smellnet channel names are the
-# CSV headers, ECG is 8 leads x 10 s @ 250 Hz drawn one panel per lead, tactile
+# Only facts verified against the data/renderer: ECG is 8 leads x 10 s @ 250 Hz drawn one panel per lead, tactile
 # frames come from the visual-tactile glove videos, human_behaviour attaches
 # frames plus the in-prompt transcript (its <audio> tag has no attached audio).
 _FAMILY_CONTEXT = {
-    "smellnet_train": (
-        "The query is a multichannel MOX e-nose recording of one substance, shown "
-        "as one panel per sensor channel (NO2, C2H5OH, VOC, CO, Alcohol, LPG) over "
-        "time. Judge it by relative channel activation, onset and peak timing, "
-        "plateau vs. decay shape, stability, and cross-channel relationships -- "
-        "not absolute values."
-    ),
     "ecg_train": (
         "The query is a resting ECG recording (8 leads, 10 seconds at 250 Hz), "
         "shown as one panel per lead. Judge rhythm regularity and rate, P/QRS/T "
@@ -171,23 +163,9 @@ _FAMILY_CONTEXT = {
 }
 
 
-def load_descriptions(path: str | Path) -> dict[str, str]:
-    """The 50 upstream SmellNet substance descriptions (weak priors)."""
-    desc = json.loads(Path(path).read_text())
-    if len(desc) != 50:
-        raise SystemExit(f"{path}: expected 50 substance descriptions, got {len(desc)}")
-    return desc
 
-
-def family_context(family: str, descriptions: dict[str, str] | None = None) -> str:
-    ctx = _FAMILY_CONTEXT[family]
-    if family == "smellnet_train" and descriptions:
-        lines = [f"- {name}: {descriptions[name]}" for name in sorted(descriptions)]
-        ctx += (
-            "\n\nReference substance descriptions (uncertain class-level priors, "
-            "not measured prototypes):\n" + "\n".join(lines)
-        )
-    return ctx
+def family_context(family: str) -> str:
+    return _FAMILY_CONTEXT[family]
 
 
 # ---- shared helpers (imported by gen_sft_episodes) ----
@@ -297,13 +275,13 @@ class MediaMissing(Exception):
 
 
 def build_request(
-    task: TeacherTask, image_root, descriptions, answer: str | None = None
+    task: TeacherTask, image_root, answer: str | None = None
 ) -> tuple[list[dict], int]:
     """(chat messages, media count). Order: family context, question, media.
     ``answer`` is the ONE sanctioned path for ground truth into a request --
     only --answer-conditioned mode passes it."""
     question = re.sub(r"<(image|video|audio)>", "", task.prompt).strip()
-    text = f"{family_context(task.family, descriptions)}\n\nQUESTION:\n{question}"
+    text = f"{family_context(task.family)}\n\nQUESTION:\n{question}"
     if answer is not None:
         text += f"\n\nVERIFIED ANSWER: {answer}\nWrite the reasoning that derives this answer from the media alone."
     content: list[dict] = [{"type": "text", "text": text}]
@@ -363,7 +341,7 @@ def validate(text: str, ground_truth: str, task: TeacherTask) -> tuple[bool, str
     return True, "ok", predicted
 
 
-def generate_one(client, task: TeacherTask, ground_truth: str, args, descriptions) -> dict:
+def generate_one(client, task: TeacherTask, ground_truth: str, args) -> dict:
     """One record per task, whatever happens: accepted / exhausted / error."""
     record = {
         "uid": task.uid,
@@ -387,7 +365,7 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
     }
     try:
         messages, n_media = build_request(
-            task, args.image_root, descriptions,
+            task, args.image_root,
             answer=ground_truth if args.answer_conditioned else None,
         )
     except MediaMissing as exc:
@@ -426,7 +404,7 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args, description
     return record
 
 
-def dry_run(tasks: list[TeacherTask], args, descriptions, answers=None) -> None:
+def dry_run(tasks: list[TeacherTask], args, answers=None) -> None:
     """Print one sanitized request per family. No API call, no ground truth."""
     seen: set[str] = set()
     for task in tasks:
@@ -437,7 +415,6 @@ def dry_run(tasks: list[TeacherTask], args, descriptions, answers=None) -> None:
             messages, n_media = build_request(
                 task,
                 args.image_root,
-                descriptions,
                 answer=answers[task.uid] if args.answer_conditioned else None,
             )
         except MediaMissing as exc:
@@ -459,10 +436,6 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--image-root", type=Path, default=None)
     ap.add_argument("--families", nargs="*", default=None)
-    ap.add_argument(
-        "--descriptions", type=Path, default=Path("data/sft/meta/text_description.json"),
-        help="the 50 upstream SmellNet substance descriptions",
-    )
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=None, help="omit = endpoint default (1.0)")
     add_teacher_client_args(ap)
@@ -490,12 +463,6 @@ def main() -> None:
     answers = {t["uid"]: t["ground_truth"] for t in rows}
     tasks = [TeacherTask.from_row(t) for t in rows]
 
-    descriptions = (
-        load_descriptions(args.descriptions)
-        if args.descriptions.is_file() and any(t.family == "smellnet_train" for t in tasks)
-        else None
-    )
-
     status = read_status(args.out)
     skip = {"accepted"} if args.answer_conditioned else {"accepted", "exhausted"}
     todo = [t for t in tasks if status.get(t.uid) not in skip]
@@ -507,7 +474,7 @@ def main() -> None:
         f"retry_errors={sum(1 for s in status.values() if s == 'error')} to_generate={len(todo)}"
     )
     if args.dry_run:
-        dry_run(todo or tasks, args, descriptions, answers)
+        dry_run(todo or tasks, args, answers)
         return
     if not todo:
         return
@@ -537,7 +504,7 @@ def main() -> None:
     # slow call never stalls the resume checkpoint.
     with args.out.open("a") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futs = {
-            pool.submit(generate_one, client, t, answers[t.uid], args, descriptions): t
+            pool.submit(generate_one, client, t, answers[t.uid], args): t
             for t in todo
         }
         for done, fut in enumerate(as_completed(futs), 1):

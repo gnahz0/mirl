@@ -34,7 +34,7 @@ from mirl_ext.data.schema import DATA_ROOT, SCRATCH_ROOT  # noqa: E402
 from mirl_ext.data.signals import family_frames, load_signal  # noqa: E402
 
 CELL = 32  # ViT patch 16 x spatial merge 2: the Stage-1 tile width and tactile side
-FAMILIES = ("smellnet", "ecg", "haptic_ts")
+FAMILIES = ("ecg", "haptic_ts")
 
 
 def render_frames(sig_entry: dict, max_frames: int) -> tuple[torch.Tensor, int]:
@@ -138,7 +138,7 @@ def build(args) -> None:
                 kept_counts.append(kept)
                 out_rows.append(to_video_row(row, os.path.join(out_dir, name)))
             # GAP before the first TS_NATIVE run: run_qwen35_grpo.sh expects RL-half
-            # train files (split_grpo/rl/smellnet_train_base_tsnative.parquet), but
+            # train files (split_grpo/rl/<fam>_tsnative.parquet), but
             # this writes UNSPLIT root-level files and load_join row-index-asserts
             # against the unsplit trainedve_raw corpora -- needs a base-filter/output
             # suffix and a split-aware join (or a documented rename+re-split step).
@@ -166,7 +166,7 @@ def probe(args) -> None:
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
     for family in args.families:
         rows, raw, _ = load_join(args.data_root, args.raw_root, family, "train")
-        # First row of every data_source (covers smellnet base+mixture), then fill to 3.
+        # First row of every data_source, then fill to 3.
         by_source: dict[str, int] = {}
         for i, g in enumerate(rows):
             by_source.setdefault(g["data_source"], i)

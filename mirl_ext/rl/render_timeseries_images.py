@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the time-series datasets (smellnet / ecg / haptic_ts) into static
+"""Render the time-series datasets (ecg / haptic_ts) into static
 graph images and rewrite their annotation JSONs to reference the images instead
 of the raw signal files. (Ported from the historical fork's baseline branch.)
 
@@ -35,7 +35,7 @@ from mirl_ext.data.schema import DATA_ROOT, SCRATCH_ROOT  # noqa: E402
 
 DATA = DATA_ROOT
 IMG_ROOT = os.path.join(SCRATCH_ROOT, "ts_images")
-DATASETS = ("smellnet", "ecg", "haptic_ts")
+DATASETS = ("ecg", "haptic_ts")
 
 # Unified render quality across all datasets (kept just under Qwen3-VL's
 # ~1.0M-pixel processor cap so nothing gets downscaled and token cost is even).
@@ -48,7 +48,7 @@ def _img_path(dataset, signal_path):
 
 
 def _render_lines(series, ylabels, *, figsize, lw, color, ylabel_fontsize, xlabel, title, out):
-    """Shared stacked-line-panel skeleton for smellnet/ecg. Keeps the Agg
+    """Shared stacked-line-panel skeleton for ecg. Keeps the Agg
     preamble in-body: pool workers may hit this as the first pyplot import."""
     import matplotlib
     matplotlib.use("Agg")
@@ -67,23 +67,6 @@ def _render_lines(series, ylabels, *, figsize, lw, color, ylabel_fontsize, xlabe
     fig.savefig(out, dpi=RENDER_DPI)
     plt.close(fig)
 
-
-def _render_smellnet(csv_path, out):
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    cols = [c for c in df.columns if df[c].dtype.kind in "fiu"] or list(df.columns)
-    _render_lines(
-        [df[c].values for c in cols],
-        [str(c) for c in cols],
-        figsize=(8, max(3, 1.5 * len(cols))),
-        lw=1.0,
-        color=None,
-        ylabel_fontsize=9,
-        xlabel="time step",
-        title="E-nose gas sensor readings",
-        out=out,
-    )
 
 
 def _render_ecg(pt_path, out):
@@ -147,9 +130,7 @@ def _render_one(task):
             return (signal_path, out, "skip", "")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         tmp = out + ".tmp.png"
-        if dataset == "smellnet":
-            _render_smellnet(signal_path, tmp)
-        elif dataset == "ecg":
+        if dataset == "ecg":
             _render_ecg(signal_path, tmp)
         elif dataset == "haptic_ts":
             _render_haptic(signal_path, key, tmp)

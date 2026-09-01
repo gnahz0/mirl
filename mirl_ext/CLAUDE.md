@@ -120,18 +120,11 @@ saves `best/` and a resumable `last/`; the run also saves one final encoder.
 Every family has a published recipe that contradicts some choice this code
 makes; read the relevant one before changing a data path.
 
-- **SmellNet** ([MIT-MI/SmellNet](https://github.com/MIT-MI/SmellNet),
-  [arXiv:2506.00239](https://arxiv.org/abs/2506.00239) v5): base is 6ch@1Hz,
-  50-way, chance 2%; the mixture task is 4ch@10Hz proportion **regression**
-  upstream — its tolerance-based metric is not comparable to our exact-string
-  accuracy. Temporal differencing at lag 25 s is their dominant
-  hyperparameter (+18-27 points on every temporal model). Their normalization
-  is per-channel z-score with global train statistics. Four mixture recipes
-  (84 rows, 9.7% of mixture) are split by separator/order conventions; base
-  has 50 collision-free labels, so exact match is correct there — do not add
-  similarity credit to base. Mixture `clove`/`orange` are extracts, physically
-  different from base `cloves`/`mandarin orange`; never merge the labels.
-  Stage-1 alignment is base-only (the loader removes `smellnet_mixture`).
+- **SmellNet is EXCLUDED from the project** (decision 2026-08-31, this
+  branch): its parquets/raw CSVs stay on disk (`smellnet_*` at the data
+  root, backup at `data/raw_backup/SmellNet_base_data`) but no pipeline
+  reads them. Alignment code/tests keep their smellnet parts — that lineage
+  already trained the current encoder and is frozen history.
 - **Tactile** ([OpenTouch](https://opentouch-tactile.github.io/),
   [arXiv:2512.16842](https://arxiv.org/abs/2512.16842)): upstream has **no
   text modality** — semantics come from a closed 29-class grasp taxonomy; the
@@ -157,15 +150,15 @@ makes; read the relevant one before changing a data path.
   `TRAIN_ROOT`); the root-level `<fam>_train.parquet` files are the UNSPLIT
   corpora and overlap the SFT half (bug fixed 2026-08-29 — it had trained on
   full corpora). Validation files live at the root, never split.
-- **RL touches gradable sources only**: smellnet is `_base`-only (mixture is
-  tolerance-scored regression upstream), tactile/human_behaviour use the
-  `_closed` variants (open free-text stripped, was 28% of each), and
-  haptic_ts is excluded entirely (100% `haptic_tactile` open captions).
-  haptic_mcq exists only for SFT — no RL half was ever minted.
+- **RL touches gradable sources only**: tactile/human_behaviour use the
+  `_closed` variants (open free-text stripped, was 28% of each); haptic_ts
+  is excluded entirely (100% `haptic_tactile` open captions); smellnet is
+  excluded project-wide. haptic_mcq exists only for SFT — no RL half was
+  ever minted.
 
 ## Gotcha: `prompt` is a MESSAGE LIST, not a string
 
-smellnet/climb/tactile carry two messages (system + user); ecg/haptic_ts carry
+climb/tactile carry two messages (system + user); ecg/haptic_ts carry
 one. The media placeholder and the question live in the USER turn, so reading
 `prompt[0]` silently drops both — use `mirl_ext.data.schema.prompt_messages()`.
 Qwen3.5's chat template rejects a system-only list, so
@@ -182,9 +175,7 @@ rows that exhaust fall back to one answer-conditioned pass over all families,
 marked `mode=answer_conditioned` so the tiers stay separable. Open sources are
 skipped (no exact-match gate). **Task uids are positions within
 the split-half parquet — any re-split invalidates every old uid; never resume
-an old trace file across splits.** Few-shot episodes (`gen_sft_episodes.py`)
-supply the smellnet traces (zero-shot smellnet measured 0%, episodes 98%
-yield; see `sft/README.md`). The native-signal student path is not yet
+an old trace file across splits.** The native-signal student path is not yet
 integrated: ts-family SFT currently trains on rendered plots.
 
 **Open-response rows are EXCLUDED from SFT training** (decision 2026-08-22,

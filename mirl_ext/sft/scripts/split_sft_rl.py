@@ -33,7 +33,6 @@ SFT_FRAC = float(config_path("sft_frac", "MIRL_SFT_FRAC", "0.2"))
 # stem. Split the data/ veRL indexes (rendered plots) -- NOT trainedve_raw/*,
 # which is Stage-1 alignment data that never reaches GRPO.
 FAMILIES: dict[str, str] = {
-    "smellnet_train": "path",
     "ecg_train": "path",
     "haptic_ts_train": "stem",
     "climb_train": "path",
@@ -154,9 +153,6 @@ def main() -> None:
             "ECG rows carry a record id, not a patient id; PTB-XL has multiple ECGs "
             "per patient (~21.8k records / ~18.9k patients), so patient-level leakage "
             "between the SFT and RL halves cannot be prevented from these indexes.",
-            "SmellNet records the same substance across several sessions/days. Those "
-            "are separate recordings and may land on opposite sides; that is intended "
-            "(labels repeat by design) but it is NOT full independence.",
         ],
     }
 

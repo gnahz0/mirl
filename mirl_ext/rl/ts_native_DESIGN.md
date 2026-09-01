@@ -1,6 +1,6 @@
 # Native time-series input for RL (`_tsnative` parquets)
 
-Goal: feed the gradable ts families (smellnet `_base`, ecg) to GRPO the way
+Goal: feed the gradable ts family (ecg) to GRPO the way
 Stage-1 alignment feeds them — `mirl_ext/data/signals.py` pseudo-video frames —
 instead of the current static matplotlib plots (`render_timeseries_images.py`).
 The builder also renders haptic_ts strips, but nothing consumes them in RL
@@ -13,7 +13,7 @@ Prompts, ground truth, `reward_model`, and `extra_info` stay byte-identical
 ## Representation
 
 Each signal is rendered by the **same signals.py functions Stage-1 uses** (no
-duplicated math): `timeseries_frames(signal, cell=32)` for smellnet/ecg
+duplicated math): `timeseries_frames(signal, cell=32)` for ecg
 (`[C,T]` → `ceil(T/32)` frames of `C·32 × 32`, z-scored per channel, ±4σ →
 [-1,1], -1 tail padding, channel boundaries on 32 px) and
 `tactile_frames(t, side=32)` for haptic_ts — both **identical to Stage-1**.
@@ -46,7 +46,7 @@ One deviation from Stage-1, counted per row by the builder: a **frame cap**
 (default 256, evenly spaced, first+last kept). Haptic recordings run
 T=108..3346 and uncapped tails would blow `MAX_PROMPT_LENGTH=11264` with
 timestamp runs. Normalization happens **before** the pick, over the full
-recording, exactly as Stage-1. ECG (79 frames) and smellnet (~19–21) never hit
+recording, exactly as Stage-1. ECG (79 frames) never hits
 the cap. `data.max_video_frames=8` never touches strips (that knob only feeds
 qwen_vl_utils path-video sampling).
 
@@ -80,7 +80,7 @@ dropped and counted — expect exactly 4 in ecg_train (the `nan_filtered` delta)
   `verl/utils/tokenizer/tokenizer.py` already unpacks the tuple and sets
   `do_sample_frames=False`).
 - `examples/mirl/multiverse/run_qwen35_grpo.sh`: `TS_NATIVE=1` selects the
-  `_tsnative` files for smellnet (`_base`) and ecg under the RL-half/closed
+  `_tsnative` files for ecg under the RL-half/closed
   protocol; haptic_ts is excluded from RL entirely.
 
 For the record, `TS_TOKENS=1`/`_tstok` was the third, dormant representation:
@@ -95,9 +95,6 @@ launcher now errors on `TS_TOKENS=1` — no model adapter, no builder here.
   (metadata fps defaults to 2.0, so ECG reads as a "40 s video"). Harmless and
   uniform across rows; could later set `sample_fps` to the true sensor rate —
   that changes prompt text, i.e. a new lineage.
-- **Prompt wording is stale**: smellnet's system turn still says "image …
-  each subplot is a sensor channel". Kept byte-identical on purpose (clean A/B
-  vs the plot arm); re-wording is a deliberate follow-up decision.
 - **vLLM-side reprocessing** is derived, not yet measured: the probe covers
   the MIRLDataset fetch + HF video processor; the first smoke run should
   confirm vLLM applies the same processor path (the tactile-mp4 rows already

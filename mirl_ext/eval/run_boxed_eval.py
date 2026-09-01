@@ -31,7 +31,6 @@ from mirl_ext.rewards._common import extract_boxed_answer
 from verl.utils.tokenizer.chat_template import apply_chat_template
 
 VAL_FAMILIES = [
-    "smellnet_valid",
     "ecg_valid",
     "haptic_ts_valid",
     "climb_valid",

@@ -13,7 +13,6 @@ import pyarrow.parquet as pq
 
 
 SELECTIONS = {
-    "smellnet_train.parquet": 1,
     "ecg_train.parquet": 1,
     "haptic_ts_train.parquet": 1,
     "climb_train.parquet": 1,

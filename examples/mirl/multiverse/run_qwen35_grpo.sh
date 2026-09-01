@@ -68,9 +68,9 @@ join_train() {
 if [[ "${TS_NATIVE:-0}" == "1" ]]; then
     # Stage-1 pseudo-video strips for the ts families (mirl_ext/rl/ts_native_DESIGN.md).
     # haptic_ts is 100% open free-text (haptic_tactile) — ungradable, excluded from RL.
-    train_files="$(join_train _tsnative smellnet_train_base ecg_train),$(join_train '' climb_train human_behaviour_train_closed tactile_train_closed)"
+    train_files="$(join_train _tsnative ecg_train),$(join_train '' climb_train human_behaviour_train_closed tactile_train_closed)"
     train_files="${train_files//],[/,}"  # merge into ONE list: `[a],[b]` is a Hydra choice sweep and errors in run mode
-    val_files="$(join_files _tsnative smellnet_valid_base ecg_valid),$(join_files '' climb_valid human_behaviour_valid_fast_closed tactile_valid_fast_closed)"
+    val_files="$(join_files _tsnative ecg_valid),$(join_files '' climb_valid human_behaviour_valid_fast_closed tactile_valid_fast_closed)"
     val_files="${val_files//],[/,}"
 elif [[ "${TS_TOKENS:-0}" == "1" ]]; then
     # Historical raw-numeric-text A/B; its _tstok parquets predate the RL-half
@@ -80,8 +80,8 @@ elif [[ "${TS_TOKENS:-0}" == "1" ]]; then
 else
     # haptic_ts excluded: 100% open free-text, ungradable for RL; closed variants
     # strip the open sources from tactile/human_behaviour (28% of each).
-    train_files="$(join_train '' smellnet_train_base ecg_train climb_train human_behaviour_train_closed tactile_train_closed)"
-    val_files="$(join_files '' smellnet_valid_base ecg_valid climb_valid human_behaviour_valid_fast_closed tactile_valid_fast_closed)"
+    train_files="$(join_train '' ecg_train climb_train human_behaviour_train_closed tactile_train_closed)"
+    val_files="$(join_files '' ecg_valid climb_valid human_behaviour_valid_fast_closed tactile_valid_fast_closed)"
 fi
 
 PROJECT_NAME="${PROJECT_NAME:-multiverse-qwen35}"
@@ -139,7 +139,12 @@ if [[ "${SMOKE}" != "1" ]]; then
     fi
     export WANDB_API_KEY="$(<"${WANDB_KEY_FILE}")"
     export WANDB_ENTITY="${MIRL_WANDB_ENTITY:?source mirl.env first}"
-    echo "wandb: forcing entity=${WANDB_ENTITY} (key file: ${WANDB_KEY_FILE})"
+    # Shared-account netrc trap, layer 2: some Ray worker-spawn path resolved
+    # the COLLEAGUE's key from /home/dvdai_mit despite driver env forcing
+    # (jobs 632349/634092: actor "logged in as weianxie" -> CommError). Point
+    # HOME at our namespace so ~/.netrc is OUR netrc in every child process.
+    export HOME="$MIRL_CLUSTER_ROOT"
+    echo "wandb: forcing entity=${WANDB_ENTITY} (key file: ${WANDB_KEY_FILE}; HOME=${HOME})"
 fi
 
 CKPT_DIR="${CKPT_DIR:-$MIRL_SCRATCH_ROOT/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"

@@ -49,7 +49,6 @@ def iter_jsonl(path):
                 yield json.loads(line)
 
 FAMILIES = [
-    "smellnet_train",
     "ecg_train",
     "haptic_ts_train",
     "haptic_mcq_train",  # minted by sft/scripts/make_haptic_mcq.py; absent until it runs
@@ -58,6 +57,9 @@ FAMILIES = [
     "tactile_train",
 ]
 
+# SmellNet is excluded from active pipelines (2026-08-31). These two consts
+# exist solely for the frozen Stage-1 alignment lineage, whose loader filters
+# smellnet_mixture and whose tests exercise that path.
 SMELLNET_BASE = "smellnet_base"
 SMELLNET_MIXTURE = "smellnet_mixture"
 
@@ -141,7 +143,7 @@ assert not (OPEN_SOURCES & set(TACTILE_TASK_LABELS))
 
 
 def prompt_messages(row: dict) -> list[dict]:
-    """The row's FULL prompt message list -- NOT prompt[0]: smellnet/climb/tactile
+    """The row's FULL prompt message list -- NOT prompt[0]: climb/tactile
     carry system + user turns, and dropping the user turn loses the question and
     the <image>/<video> placeholder (this bug shipped once)."""
     return [{"role": m["role"], "content": m["content"]} for m in row["prompt"]]

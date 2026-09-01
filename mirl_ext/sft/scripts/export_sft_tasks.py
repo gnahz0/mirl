@@ -6,9 +6,7 @@ so there is no sampling here -- the split is the sampling. Each task carries the
 flattened), every media reference in original order, its ground truth (for
 laptop-side validation only -- the generator strips it before building
 requests), and answer_style: sources in schema.OPEN_SOURCES are free text with
-no exact-match gate, everything else is gradable. SmellNet exports the 50-class
-single-substance task only; mixture and GC-MS rows are excluded and asserted
-absent.
+no exact-match gate, everything else is gradable.
 
     python mirl_ext/sft/scripts/export_sft_tasks.py --out .../sft_tasks.jsonl
 """
@@ -26,17 +24,9 @@ from mirl_ext.data.schema import (  # noqa: E402
     DATA_ROOT,
     FAMILIES,
     OPEN_SOURCES,
-    SMELLNET_BASE,
     media_refs,
     prompt_text,
 )
-
-
-def keep_row(family: str, data_source: str | None) -> bool:
-    """SmellNet keeps only the 50-class single-substance task."""
-    if family == "smellnet_train":
-        return data_source == SMELLNET_BASE
-    return True
 
 
 def main() -> None:
@@ -75,8 +65,7 @@ def main() -> None:
             eligible = [
                 (i, row)
                 for i, row in enumerate(rows)
-                if keep_row(family, row.get("data_source"))
-                and str((row.get("reward_model") or {}).get("ground_truth") or "").strip()
+                if str((row.get("reward_model") or {}).get("ground_truth") or "").strip()
             ]
             exported_sources: collections.Counter = collections.Counter()
             labels = set()
@@ -104,8 +93,6 @@ def main() -> None:
                 n_media += bool(images or video_path)
                 n_open += style == "open"
                 total += 1
-            if family == "smellnet_train":
-                assert set(exported_sources) <= {SMELLNET_BASE}, dict(exported_sources)
             print(
                 f"{family:22s} half_rows={len(rows):6d} exported={len(eligible):6d} "
                 f"labels={len(labels):5d} with_media={n_media} open={n_open}"

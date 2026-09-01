@@ -20,8 +20,8 @@ The mode field keeps the two tiers separable downstream: filter to
 
 Sources in `schema.OPEN_SOURCES` (haptic_ts descriptions, tactile
 captions/notes, free-text video QA) have no exact-match gate and are skipped.
-`gen_sft_episodes.py` (few-shot smellnet episodes, 98% yield) is the fallback —
-zero-shot smellnet measured 0% even with the substance descriptions.
+SmellNet is excluded from the project entirely (2026-08-31; parquets kept on
+disk, nothing reads them).
 
 Cluster parquet commands run inside srun (`srun -p cpu -c 8 --mem=32G …`);
 `data/sft/` is not synced — scp task/trace files.

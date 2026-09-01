@@ -21,12 +21,10 @@ from mirl_ext.sft.scripts.build_sft_parquet import (  # noqa: E402
     check_record,
     sft_messages,
 )
-from mirl_ext.sft.scripts.export_sft_tasks import keep_row  # noqa: E402
 from mirl_ext.sft.scripts.gen_sft_targets import (  # noqa: E402
     SYSTEM_PROMPT,
     TeacherTask,
     build_request,
-    load_descriptions,
     read_status,
     validate,
 )
@@ -68,24 +66,24 @@ def test_answer_key_sentinel_never_reaches_request():
     task = TeacherTask.from_row(
         {"uid": "x#1", "family": "climb_train", "prompt": "Describe.", "ground_truth": sentinel}
     )
-    messages, n_media = build_request(task, None, None)
+    messages, n_media = build_request(task, None)
     assert sentinel not in json.dumps(messages) and n_media == 0
 
 
 def test_answer_conditioned_request_reveals_answer_and_swaps_system():
     from mirl_ext.sft.scripts.gen_sft_targets import RATIONALIZE_SYSTEM
 
-    messages, _ = build_request(_task(), None, None, answer="No PE")
+    messages, _ = build_request(_task(), None, answer="No PE")
     assert messages[0]["content"] == RATIONALIZE_SYSTEM
     assert "VERIFIED ANSWER: No PE" in messages[1]["content"][0]["text"]
     # Default path stays answer-blind and uses the zero-shot system prompt.
-    blind, _ = build_request(_task(), None, None)
+    blind, _ = build_request(_task(), None)
     assert blind[0]["content"] == SYSTEM_PROMPT
     assert "VERIFIED ANSWER" not in blind[1]["content"][0]["text"]
 
 
 def test_request_contains_no_demonstrations():
-    messages, _ = build_request(_task(), None, None)
+    messages, _ = build_request(_task(), None)
     assert [m["role"] for m in messages] == ["system", "user"]
     parts = messages[1]["content"]
     assert len(parts) == 1 and parts[0]["type"] == "text"  # context + question only
@@ -99,13 +97,6 @@ def test_prompt_flattening_keeps_all_turns():
                       {"role": "user", "content": "<image>\nQ?"}]}
     assert [m["role"] for m in prompt_messages(row)] == ["system", "user"]
     assert prompt_text(row) == "SYS\n\n<image>\nQ?"
-
-
-def test_smellnet_mixture_and_gcms_rows_excluded():
-    assert keep_row("smellnet_train", "smellnet_base")
-    assert not keep_row("smellnet_train", "smellnet_mixture")
-    assert not keep_row("smellnet_train", "smellnet_gcms")
-    assert keep_row("climb_train", "ct")
 
 
 def test_open_sources_never_marked_gradable():
@@ -186,8 +177,6 @@ def test_multilabel_and_letter_set_semantics_follow_rl_rewards():
     assert _v(med, gt="Pleural Effusion, Support Devices")[0]  # order-invariant set
     tac = GOOD_THINK + " \\boxed{B, A}"
     assert _v(tac, gt="A,B", task=_task(data_source="initial_fingers"))[0]
-    smell = GOOD_THINK + " \\boxed{brazil nut}"
-    assert _v(smell, gt="brazil_nut", task=_task(data_source="smellnet_base"))[0]
     hb = GOOD_THINK + " \\boxed{no ptsd}"
     assert _v(hb, gt="No PTSD", task=_task(data_source="ptsd_in_the_wild"))[0]
     assert combined.compute_score("ecg", GOOD_THINK + " \\boxed{Normal}", "Normal")["acc"] == 1.0
@@ -341,15 +330,6 @@ def test_position_video_grid_expansion():
 def test_staging_stems_deterministic():
     assert _stem("/a/b.mp4") == _stem("/a/b.mp4") != _stem("/a/c.mp4")
 
-
-def test_smellnet_descriptions_are_the_canonical_50():
-    path = ROOT / "data/sft/meta/text_description.json"
-    if not path.is_file():
-        return  # descriptions live with the (unsynced) data dir; skip elsewhere
-    from mirl_ext.sft.scripts.gen_sft_episodes import CATEGORY
-
-    desc = load_descriptions(path)
-    assert set(desc) == set(CATEGORY) and len(desc) == 50
 
 
 if __name__ == "__main__":

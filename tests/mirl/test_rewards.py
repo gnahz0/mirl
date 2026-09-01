@@ -11,7 +11,6 @@ from mirl_ext.rewards.combined import compute_score
         ("initial_fingers", "reasoning</think>\\boxed{A,B}", "A,B"),
         ("meld_emotion", "reasoning</think>\\boxed{happy}", "happy"),
         ("mri", "reasoning</think>\\boxed{Glioma Tumor}", "Glioma Tumor"),
-        ("smellnet_base", "reasoning</think>\\boxed{allspice}", "allspice"),
         ("ecg", "reasoning</think>\\boxed{Normal}", "Normal"),
         (
             "haptic_tactile",

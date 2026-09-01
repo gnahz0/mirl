@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mirl_ext.rewards import ecg, haptic_ts, human_behaviour, medical, smellnet, tactile
+from mirl_ext.rewards import ecg, haptic_ts, human_behaviour, medical, tactile
 from mirl_ext.data.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, TACTILE_SOURCES
 
 
@@ -33,8 +33,6 @@ def compute_score(
         return human_behaviour.compute_score(solution_str, ground_truth)
     if data_source in MEDICAL_SOURCES:
         return medical.compute_score(solution_str, ground_truth)
-    if data_source in {"smellnet_base", "smellnet_mixture"}:
-        return smellnet.compute_score(solution_str, ground_truth)
     if data_source == "ecg":
         return ecg.compute_score(solution_str, ground_truth)
     if data_source == "haptic_tactile":
