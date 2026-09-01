@@ -93,7 +93,6 @@ def _render_haptic(pt_path, key, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import numpy as np
     import torch
 
     o = torch.load(pt_path, map_location="cpu", weights_only=False)

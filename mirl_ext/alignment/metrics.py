@@ -8,10 +8,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from mirl_ext.data.schema import MULTILABEL_TASKS
+
 from .data import (
     _CLASSIFICATION_FAMILIES,
     _TS_FAMILIES,
-    MULTILABEL_TASKS,
     TACTILE_SPANS,
     TASK_LABELS,
 )
@@ -22,7 +23,6 @@ _PREDICTION_STATS = _PUBLIC_STATS + _AUX_STATS
 
 _REDUCED_METRIC_KEYS = (
     "loss/siglip",
-    "loss/ts_smellnet",
     "loss/ts_ecg",
     "loss/ts_tactile",
     *(f"loss/task/{task}" for task in TASK_LABELS),
@@ -57,7 +57,7 @@ def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> d
 class BankSpec:
     """One scoring unit: some rows ranked against some bank of label embeddings."""
 
-    key: str  # "ts_smellnet" | "task/force_level"
+    key: str  # "ts_ecg" | "task/force_level"
     labels: tuple[str, ...]
     embeddings: torch.Tensor  # (K, D) frozen bank or bank slice
     multilabel: bool = False

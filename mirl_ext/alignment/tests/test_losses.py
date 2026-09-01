@@ -35,7 +35,7 @@ def _signal_batch(size: int) -> dict:
     return {
         "kind": "signal",
         "media": [0] * size,
-        "family": "smellnet",
+        "family": "ecg",
     }
 
 
@@ -299,7 +299,7 @@ def test_structured_tactile_metrics_merge_as_one_family():
         torch.tensor(-1.0),
     )
     merged = _merge_prediction_metrics(
-        {"map/ts_smellnet": 0.5, "map/overall": 0.5},
+        {"map/ts_ecg": 0.5, "map/overall": 0.5},
         tactile,
     )
 
@@ -369,20 +369,19 @@ def test_prediction_coverage_exposes_top1_collapse():
 
 
 def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
-    labels = ["a", "b"] * 3
-    families = ["smellnet", "smellnet", "ecg", "ecg", "tactile", "tactile"]
-    z = torch.eye(6)
+    labels = ["a", "b"] * 2
+    families = ["ecg", "ecg", "tactile", "tactile"]
+    z = torch.eye(4)
     bank = {
-        "smellnet": (("a", "b"), z[[0, 1]]),
-        "ecg": (("a", "b"), z[[2, 3]]),
+        "ecg": (("a", "b"), z[[0, 1]]),
         # Reverse tactile candidates so top-1 is zero while Recall@5 stays one.
-        "tactile": (("a", "b"), z[[5, 4]]),
+        "tactile": (("a", "b"), z[[3, 2]]),
     }
     reports = {}
     specs = build_bank_specs(bank, None)
     metrics = _score_units(specs, (z, labels, families, None, None), per_class=reports)
 
-    for family in ("smellnet", "ecg", "tactile"):
+    for family in ("ecg", "tactile"):
         for stat in ("accuracy", "recall_at_1", "recall_at_5", "map"):
             assert f"{stat}/ts_{family}" in metrics
         assert metrics[f"prediction_coverage/ts_{family}"] == 1.0
@@ -390,12 +389,12 @@ def test_prediction_metrics_are_uniform_per_family_and_equal_family_overall():
     assert metrics["recall_at_1/ts_tactile"] == 0.0
     assert metrics["recall_at_5/ts_tactile"] == 1.0
     assert metrics["map/ts_tactile"] == 0.5
-    assert metrics["accuracy/overall"] == pytest.approx(2 / 3)
-    assert metrics["recall_at_1/overall"] == pytest.approx(2 / 3)
+    assert metrics["accuracy/overall"] == pytest.approx(1 / 2)
+    assert metrics["recall_at_1/overall"] == pytest.approx(1 / 2)
     assert metrics["recall_at_5/overall"] == 1.0
-    assert metrics["map/overall"] == pytest.approx(5 / 6)
+    assert metrics["map/overall"] == pytest.approx(3 / 4)
     assert metrics["prediction_coverage/overall"] == 1.0
-    assert set(reports) == {"smellnet", "ecg"}
+    assert set(reports) == {"ecg"}
 
 
 def test_validation_metrics_keep_a_compact_core():
@@ -403,7 +402,6 @@ def test_validation_metrics_keep_a_compact_core():
         "val",
         loss_metrics={
             "loss/siglip": 0.15,
-            "loss/ts_smellnet": 0.14,
             "loss/ts_ecg": 0.16,
             "loss/ts_tactile": 0.15,
             "loss/distill": 0.1,
@@ -412,16 +410,15 @@ def test_validation_metrics_keep_a_compact_core():
         counts={
             "n/img_image": 2,
             "n/img_video": 1,
-            "n/ts_signal": 9,
-            "n/ts_smellnet": 3,
+            "n/ts_signal": 6,
             "n/ts_ecg": 3,
             "n/ts_tactile": 3,
         },
         prediction_metrics={
-            "accuracy/ts_smellnet": 0.5,
-            "recall_at_1/ts_smellnet": 0.5,
-            "recall_at_5/ts_smellnet": 0.8,
-            "prediction_coverage/ts_smellnet": 0.2,
+            "accuracy/ts_ecg": 0.5,
+            "recall_at_1/ts_ecg": 0.5,
+            "recall_at_5/ts_ecg": 0.8,
+            "prediction_coverage/ts_ecg": 0.2,
             "accuracy/overall": 0.5,
             "recall_at_1/overall": 0.3,
             "recall_at_5/overall": 0.7,
@@ -435,8 +432,8 @@ def test_validation_metrics_keep_a_compact_core():
         },
     )
 
-    assert metrics["val-core/accuracy/smellnet"] == 0.5
-    assert metrics["val-core/recall_at_5/smellnet"] == 0.8
+    assert metrics["val-core/accuracy/ecg"] == 0.5
+    assert metrics["val-core/recall_at_5/ecg"] == 0.8
     assert metrics["val-core/accuracy/overall"] == 0.5
     assert metrics["val-core/recall_at_1/overall"] == 0.3
     assert metrics["val-core/recall_at_5/overall"] == 0.7
@@ -445,11 +442,10 @@ def test_validation_metrics_keep_a_compact_core():
     assert metrics["val-core/recall_at_1/tactile"] == 0.1
     assert metrics["val-core/recall_at_5/tactile"] == 0.3
     assert metrics["val-core/map/tactile"] == 0.2
-    assert metrics["val-aux/prediction_coverage/smellnet"] == 0.2
+    assert metrics["val-aux/prediction_coverage/ecg"] == 0.2
     assert metrics["val-aux/prediction_coverage/tactile"] == 0.4
     assert metrics["val-aux/prediction_coverage/overall"] == 0.3
     assert metrics["val-core/loss/aggregate"] == 0.25
-    assert metrics["val-core/loss/smellnet"] == 0.14
     assert metrics["val-core/loss/ecg"] == 0.16
     assert metrics["val-core/loss/tactile"] == 0.15
     assert metrics["val-aux/loss/siglip"] == 0.15
@@ -458,17 +454,16 @@ def test_validation_metrics_keep_a_compact_core():
 
 def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
     metrics = {
-        "accuracy/ts_smellnet": 0.5,
-        "recall_at_1/ts_smellnet": 0.5,
-        "recall_at_5/ts_smellnet": 0.8,
-        "prediction_coverage/ts_smellnet": 0.2,
+        "accuracy/ts_ecg": 0.5,
+        "recall_at_1/ts_ecg": 0.5,
+        "recall_at_5/ts_ecg": 0.8,
+        "prediction_coverage/ts_ecg": 0.2,
         "accuracy/overall": 0.5,
         "recall_at_1/overall": 0.45,
         "recall_at_5/overall": 0.75,
         "map/overall": 0.55,
         "prediction_coverage/overall": 0.3,
         "loss/siglip": 0.75,
-        "loss/ts_smellnet": 0.7,
         "loss/ts_ecg": 0.8,
         "loss/ts_tactile": 0.75,
         "loss/distill": 0.5,
@@ -487,27 +482,26 @@ def test_training_metrics_publish_only_core_scores_and_actionable_diagnostics():
         {
             "n/img_image": 2,
             "n/img_video": 1,
-            "n/ts_smellnet": 8,
+            "n/ts_ecg": 8,
         }
     )
 
     grouped = _metric_groups("train", metrics, counts, metrics)
 
-    assert grouped["train-core/accuracy/smellnet"] == 0.5
+    assert grouped["train-core/accuracy/ecg"] == 0.5
     assert grouped["train-core/recall_at_1/overall"] == 0.45
     assert grouped["train-core/recall_at_5/overall"] == 0.75
     assert grouped["train-core/map/overall"] == 0.55
-    assert grouped["train-core/recall_at_5/smellnet"] == 0.8
+    assert grouped["train-core/recall_at_5/ecg"] == 0.8
     assert grouped["train-core/accuracy/tactile"] == 0.25
     assert grouped["train-core/recall_at_1/tactile"] == 0.25
     assert grouped["train-core/recall_at_5/tactile"] == 0.75
     assert grouped["train-core/map/tactile"] == 0.5
-    assert grouped["train-aux/prediction_coverage/smellnet"] == 0.2
+    assert grouped["train-aux/prediction_coverage/ecg"] == 0.2
     assert grouped["train-aux/prediction_coverage/tactile"] == 0.4
     assert grouped["train-aux/prediction_coverage/overall"] == 0.3
     assert grouped["train-aux/n/img"] == 3.0
     assert grouped["train-core/loss/aggregate"] == 1.25
-    assert grouped["train-core/loss/smellnet"] == 0.7
     assert grouped["train-core/loss/ecg"] == 0.8
     assert grouped["train-core/loss/tactile"] == 0.75
     assert grouped["train-aux/loss/siglip"] == 0.75
@@ -526,7 +520,7 @@ def test_loss_registration_and_batch_counts_fail_closed():
     window = AccumulationWindow(torch.device("cpu"))
     window.add(_signal_batch(3), {}, (None, [], [], None, None))
     _, counts, _ = window.flush()
-    assert counts["n/ts_smellnet"] == 3
+    assert counts["n/ts_ecg"] == 3
     assert counts["n/ts_signal"] == 3  # derived from the per-family totals
 
 

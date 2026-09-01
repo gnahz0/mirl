@@ -21,27 +21,6 @@ def _dataset(tmp_path, name, rows, **kwargs):
     return AlignmentDataset([str(path)], **kwargs)
 
 
-def test_smellnet_mixture_never_enters_rows_or_label_vocab(tmp_path):
-    rows = [
-        {
-            "data_source": source,
-            "signals": [{"signal": f"missing-{index}.csv", "format": ""}],
-            "reward_model": {"ground_truth": label},
-        }
-        for index, (source, label) in enumerate(
-            (
-                ("smellnet_base", "apple"),
-                ("smellnet_base", "pear"),
-                ("smellnet_mixture", "apple + pear"),
-            )
-        )
-    ]
-    dataset = _dataset(tmp_path, "smellnet", rows)
-
-    assert len(dataset) == 2
-    assert {row["data_source"] for row in dataset.rows} == {"smellnet_base"}
-    assert dataset.ts_label_vocabs == {"smellnet": ("apple", "pear")}
-
 
 def _haptic_signal_row(tensor_path, stem, caption="unused open description"):
     return {
@@ -78,9 +57,9 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
             [
                 _haptic_signal_row(tensor_path, "recording"),
                 {
-                    "data_source": "smellnet_base",
-                    "signals": [{"signal": "/not-loaded/apple.csv", "format": ""}],
-                    "reward_model": {"ground_truth": "apple"},
+                    "data_source": "ecg",
+                    "signals": [{"signal": "/not-loaded/rec.pt", "format": "ts_pt"}],
+                    "reward_model": {"ground_truth": "Normal"},
                     "extra_info": None,
                 },
             ]
@@ -110,7 +89,7 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
     assert torch.equal(sample["media"], tactile)
     assert sample["targets"]["initial_fingers"] == (0, 1, 5)
     assert sample["targets"]["force_level"] == (1,)
-    assert dataset.ts_label_vocabs == {"smellnet": ("apple",)}
+    assert dataset.ts_label_vocabs == {"ecg": ("Normal",)}
 
     batch = collate_alignment([sample])
     # One (1, 30) target/mask pair over the concatenated vocabularies; each answer lands in its task's span.
@@ -147,7 +126,7 @@ def test_collate_keeps_complete_source_homogeneous_signals():
             {
                 "kind": "signal",
                 "media": signal,
-                "family": "smellnet",
+                "family": "ecg",
                 "text": label,
             }
             for signal, label in zip(signals, ("apple", "pear"), strict=True)
@@ -155,7 +134,7 @@ def test_collate_keeps_complete_source_homogeneous_signals():
     )
 
     assert batch["kind"] == "signal"
-    assert batch["family"] == "smellnet"
+    assert batch["family"] == "ecg"
     assert all(actual is expected for actual, expected in zip(batch["media"], signals, strict=True))
     assert batch["text"] == ["apple", "pear"]
 
@@ -163,7 +142,7 @@ def test_collate_keeps_complete_source_homogeneous_signals():
 class _GroupedDataset:
     def __init__(self):
         self.sampling_groups = {
-            ("signal", "smellnet_base"): list(range(0, 12)),
+            ("signal", "ecg_b"): list(range(0, 12)),
             ("signal", "ecg"): list(range(12, 24)),
             ("signal", "haptic_tactile"): list(range(24, 36)),
             ("image", "climb"): list(range(36, 48)),
@@ -213,7 +192,7 @@ def test_homogeneous_sampler_consumes_all_rows_once_across_ranks():
 def test_distributed_sampler_keeps_tail_ranks_in_lockstep():
     dataset = _GroupedDataset()
     dataset.sampling_groups = {
-        ("signal", "smellnet_base"): list(range(5)),
+        ("signal", "ecg_b"): list(range(5)),
         ("signal", "ecg"): list(range(5, 9)),
         ("signal", "haptic_tactile"): list(range(9, 13)),
     }
@@ -247,7 +226,7 @@ def test_homogeneous_sampler_repeats_only_configured_signal_sources():
         rank=0,
         world_size=2,
         seed=13,
-        signal_repeat_factors={"smellnet_base": 3, "haptic_tactile": 2},
+        signal_repeat_factors={"ecg_b": 3, "haptic_tactile": 2},
     )
     rank1 = HomogeneousBatchSampler(
         dataset,
@@ -255,7 +234,7 @@ def test_homogeneous_sampler_repeats_only_configured_signal_sources():
         rank=1,
         world_size=2,
         seed=13,
-        signal_repeat_factors={"smellnet_base": 3, "haptic_tactile": 2},
+        signal_repeat_factors={"ecg_b": 3, "haptic_tactile": 2},
     )
 
     counts = {group: 0 for group in dataset.sampling_groups}
@@ -266,7 +245,7 @@ def test_homogeneous_sampler_repeats_only_configured_signal_sources():
             counts[owner[index]] += 1
 
     assert counts == {
-        ("signal", "smellnet_base"): 36,
+        ("signal", "ecg_b"): 36,
         ("signal", "ecg"): 12,
         ("signal", "haptic_tactile"): 24,
         ("image", "climb"): 12,

@@ -57,12 +57,6 @@ FAMILIES = [
     "tactile_train",
 ]
 
-# SmellNet is excluded from active pipelines (2026-08-31). These two consts
-# exist solely for the frozen Stage-1 alignment lineage, whose loader filters
-# smellnet_mixture and whose tests exercise that path.
-SMELLNET_BASE = "smellnet_base"
-SMELLNET_MIXTURE = "smellnet_mixture"
-
 # Free-text sources (checked once against the data): captions/notes and open QA
 # whose answers can't be exact-match graded. Everything else is closed.
 OPEN_SOURCES = {

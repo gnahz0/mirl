@@ -164,10 +164,6 @@ _FAMILY_CONTEXT = {
 
 
 
-def family_context(family: str) -> str:
-    return _FAMILY_CONTEXT[family]
-
-
 # ---- shared helpers (imported by gen_sft_episodes) ----
 
 def load_api_key() -> str:
@@ -281,7 +277,7 @@ def build_request(
     ``answer`` is the ONE sanctioned path for ground truth into a request --
     only --answer-conditioned mode passes it."""
     question = re.sub(r"<(image|video|audio)>", "", task.prompt).strip()
-    text = f"{family_context(task.family)}\n\nQUESTION:\n{question}"
+    text = f"{_FAMILY_CONTEXT[task.family]}\n\nQUESTION:\n{question}"
     if answer is not None:
         text += f"\n\nVERIFIED ANSWER: {answer}\nWrite the reasoning that derives this answer from the media alone."
     content: list[dict] = [{"type": "text", "text": text}]

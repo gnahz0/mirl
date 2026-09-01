@@ -26,12 +26,12 @@ style but are load-bearing:
 
 - **Loss reductions.** Distillation uses cosine similarity with
   `torch.segment_reduce` so every visual sample weighs equally despite
-  different token counts. SmellNet and ECG sum candidate-pair losses per
-  anchor, then take a class-balanced anchor mean. Each tactile task uses the
+  different token counts. ECG sums candidate-pair losses per anchor, then
+  takes a class-balanced anchor mean. Each tactile task uses the
   global mean over its observed sample-label pairs, and the six task losses
   average equally. Changing a reduction silently rebalances training.
-- **SigLIP uses complete fixed label banks**: SmellNet 50, ECG 7, and six
-  closed tactile QA banks of 6/6/4/2/8/4 choices (initial-contact and
+- **SigLIP uses complete fixed label banks**: ECG 7 and six closed tactile
+  QA banks of 6/6/4/2/8/4 choices (initial-contact and
   highest-pressure may have multiple positives). `log_logit_scale` and
   `logit_bias` init to log(10) and -10 and train **without weight decay**
   (the ndim<=1 optimizer group in `train.py` enforces this).
@@ -52,7 +52,8 @@ style but are load-bearing:
   never pre-populate `loss/*` with 0.0. The cross-rank reduction uses the
   static `_REDUCED_METRIC_KEYS` list — deriving keys from a step's dict
   deadlocks when ranks disagree. Selection uses `val-core/map/overall`
-  (equal-family mean over SmellNet, ECG, tactile).
+  (equal-family mean over ECG and tactile; SmellNet was a third family until
+  its 2026-08-31 exclusion — old-lineage metrics are not comparable).
 - **Checkpoint config keys are exact file paths, never directories**:
   `train.init_checkpoint` -> an `alignment_state.pt` (weights-only, fresh
   schedule); `train.resume_checkpoint` -> the matching `last/trainer_state.pt`

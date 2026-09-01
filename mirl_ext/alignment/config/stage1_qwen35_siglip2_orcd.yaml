@@ -5,13 +5,11 @@ log_level: INFO
 data:
   root: ${oc.env:MIRL_ALIGN_DATA_ROOT,data}
   train_files:
-    - ${data.root}/smellnet_train_clean.parquet
     - ${data.root}/ecg_train_nan_filtered.parquet
     - ${data.root}/haptic_ts_train.parquet
     - ${data.root}/climb_train.parquet
     - ${data.root}/tactile_train.parquet
   val_files:
-    - ${data.root}/smellnet_valid_clean.parquet
     - ${data.root}/ecg_valid_nan_filtered.parquet
     - ${data.root}/haptic_ts_valid.parquet
     - ${data.root}/climb_valid.parquet
@@ -42,7 +40,6 @@ train:
   resume_checkpoint: null
   # Approximate square-root sampling across the signal sources.
   signal_repeat_factors:
-    smellnet_base: 13
     haptic_tactile: 5
   # Two GPUs and four-step accumulation give an effective batch of 256.
   batch_size: 32

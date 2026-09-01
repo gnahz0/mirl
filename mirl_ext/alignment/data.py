@@ -9,14 +9,14 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from mirl_ext.data.schema import MULTILABEL_TASKS, SMELLNET_MIXTURE, media_refs, recording_stem
+from mirl_ext.data.schema import media_refs, recording_stem
 from mirl_ext.data.schema import TACTILE_TASK_LABELS as TASK_LABELS
 from mirl_ext.data.signals import load_signal, signal_family as _signal_family
 
 # Metric reduction order must be identical on every rank, so this tuple is the one
 # definition of it; tactile aligns against TASK_LABELS and never has a vocabulary.
-_TS_FAMILIES: tuple[str, ...] = ("smellnet", "ecg", "tactile")
-_CLASSIFICATION_FAMILIES: tuple[str, ...] = ("smellnet", "ecg")
+_TS_FAMILIES: tuple[str, ...] = ("ecg", "tactile")
+_CLASSIFICATION_FAMILIES: tuple[str, ...] = ("ecg",)
 
 # Column span of each task inside the concatenated tactile bank: the six tasks are
 # independent Bernoulli decisions under the sigmoid, so one bank is equivalent to six.
@@ -81,7 +81,6 @@ class AlignmentDataset(Dataset):
         for path in data_files:
             rows.extend(pq.read_table(path).to_pylist())
 
-        rows = [row for row in rows if row["data_source"] != SMELLNET_MIXTURE]
         tactile_rows = [
             row for row in rows if (signals := row.get("signals") or []) and _signal_family(signals[0]) == "tactile"
         ]

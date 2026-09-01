@@ -14,7 +14,6 @@ no exact-match gate, everything else is gradable.
 from __future__ import annotations
 
 import argparse
-import collections
 import json
 import sys
 from pathlib import Path
@@ -67,7 +66,6 @@ def main() -> None:
                 for i, row in enumerate(rows)
                 if str((row.get("reward_model") or {}).get("ground_truth") or "").strip()
             ]
-            exported_sources: collections.Counter = collections.Counter()
             labels = set()
             n_media = n_open = 0
             for i, row in eligible:
@@ -88,7 +86,6 @@ def main() -> None:
                     "answer_style": style,
                 }
                 fh.write(json.dumps(task) + "\n")
-                exported_sources[str(data_source)] += 1
                 labels.add(gt)
                 n_media += bool(images or video_path)
                 n_open += style == "open"

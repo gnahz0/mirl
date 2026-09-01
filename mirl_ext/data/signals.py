@@ -13,45 +13,28 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-SIGNAL_FORMATS = {"": "smellnet", "ts_pt": "ecg", "tactile_pt": "tactile"}
+SIGNAL_FORMATS = {"ts_pt": "ecg", "tactile_pt": "tactile"}
 
 
 def signal_family(sig_entry: dict) -> str:
     return SIGNAL_FORMATS[sig_entry["format"]]
 
 
-def load_signal_csv(path: str) -> torch.Tensor:
-    """SmellNet CSV -> [C, T] float tensor, time columns dropped."""
-    with open(path) as f:
-        header = f.readline().strip().split(",")
-    keep_idx = [i for i, name in enumerate(header) if "time" not in name.casefold()]
-    data = np.genfromtxt(
-        path,
-        delimiter=",",
-        skip_header=1,
-        usecols=keep_idx,
-        dtype=np.float32,
-    )
-    return torch.from_numpy(np.ascontiguousarray(data.T))
-
 
 def load_signal(sig_entry: dict) -> tuple[torch.Tensor, str]:
     """One signals[] entry -> (tensor, family). ecg: [8, 2500]; tactile:
-    [T, 16, 16] selected by key; smellnet: [C, T] from CSV."""
+    [T, 16, 16] selected by key."""
     family = signal_family(sig_entry)
     path = sig_entry["signal"]
     if family == "ecg":
         signal = torch.load(path, map_location="cpu", weights_only=False)
         return signal.float().contiguous(), family
-    if family == "tactile":
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        signal = torch.as_tensor(payload["tactile"][sig_entry["key"]])
-        return signal.float().contiguous(), family
-    return load_signal_csv(path), family
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    signal = torch.as_tensor(payload["tactile"][sig_entry["key"]])
+    return signal.float().contiguous(), family
 
 
 def normalize(x: torch.Tensor) -> torch.Tensor:

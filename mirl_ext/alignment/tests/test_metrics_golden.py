@@ -16,7 +16,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from mirl_ext.alignment.data import MULTILABEL_TASKS, TACTILE_SPANS  # noqa: E402
+from mirl_ext.alignment.data import TACTILE_SPANS  # noqa: E402
+from mirl_ext.data.schema import MULTILABEL_TASKS  # noqa: E402
 from mirl_ext.alignment.metrics import (  # noqa: E402
     _bank_metrics,
     _bank_stats,
@@ -71,7 +72,9 @@ def _assert_rows(actual: list[dict], expected: list[dict], label: str) -> None:
 
 @pytest.mark.parametrize("case", ["smell", "ecg"])
 def test_single_label_families_score_unchanged(golden, case):
-    """smellnet and ecg keep every scalar and every per-class row."""
+    """Both golden vectors keep every scalar and per-class row. The "smell" data
+    survives smellnet's exclusion as a pure numeric vector (50 labels, skewed
+    support, unobserved classes) scored through a generically keyed spec."""
     data = golden["inputs"][case]
     rows: list[dict] = []
     spec = _single_label_spec(data["candidates"], data["bank"])
@@ -124,34 +127,30 @@ def test_tactile_ranking_is_unchanged_and_classification_uses_learned_bias(golde
 
 
 def test_mixed_families_and_overall_rollup_unchanged(golden):
-    """Both single-label families in one pass, then the equal-family overall."""
-    smell, ecg = golden["inputs"]["smell"], golden["inputs"]["ecg"]
-    specs = build_bank_specs(
-        {
-            "smellnet": (tuple(smell["candidates"]), _tensor(smell["bank"])),
-            "ecg": (tuple(ecg["candidates"]), _tensor(ecg["bank"])),
-        },
-        None,
-    )
+    """ecg scored alongside golden tactile, then the equal-family overall.
+    (smellnet left _TS_FAMILIES 2026-08-31; the overall mean is recomputed here
+    from the per-family golden values instead of pinned as a scalar.)"""
+    ecg = golden["inputs"]["ecg"]
+    specs = build_bank_specs({"ecg": (tuple(ecg["candidates"]), _tensor(ecg["bank"]))}, None)
     reports: dict[str, list[dict]] = {}
     stats = new_stats(specs, torch.device("cpu"))
     update_stats(
         stats,
         specs,
-        (
-            torch.cat([_tensor(smell["z"]), _tensor(ecg["z"])]),
-            [*smell["labels"], *ecg["labels"]],
-            ["smellnet"] * len(smell["labels"]) + ["ecg"] * len(ecg["labels"]),
-            None,
-            None,
-        ),
+        (_tensor(ecg["z"]), list(ecg["labels"]), ["ecg"] * len(ecg["labels"]), None, None),
         None,
         None,
     )
     mixed = _merge_prediction_metrics(prediction_metrics(stats, specs, per_class=reports), golden["golden"]["tactile"])
 
-    _assert_same(mixed, golden["golden"]["mixed"], "mixed")
-    assert sorted(reports) == golden["golden"]["mixed_report_families"]
+    expected = {f"{key}/ts_ecg": value for key, value in golden["golden"]["ecg"].items()}
+    expected.update(golden["golden"]["tactile"])
+    for stat in ("accuracy", "recall_at_1", "recall_at_5", "map"):
+        expected[f"{stat}/overall"] = (
+            golden["golden"]["ecg"][stat] + golden["golden"]["tactile"][f"{stat}/ts_tactile"]
+        ) / 2
+    _assert_same(mixed, expected, "mixed")
+    assert sorted(reports) == ["ecg"]
 
 
 def test_metric_groups_surface_unchanged(golden):
@@ -169,7 +168,8 @@ def test_metric_groups_surface_unchanged(golden):
         },
         golden["golden"]["mixed"],
     )
-    _assert_same(groups, golden["golden"]["groups_val"], "groups_val")
+    expected = {key: value for key, value in golden["golden"]["groups_val"].items() if "smellnet" not in key}
+    _assert_same(groups, expected, "groups_val")
 
 
 def test_streaming_equals_one_shot(golden):

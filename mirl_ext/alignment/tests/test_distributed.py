@@ -169,15 +169,15 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=2)
     try:
         candidates = ("A", "B")
-        bank = {"smellnet": (candidates, torch.eye(2)), "ecg": (candidates, torch.eye(2))}
+        bank = {"ecg": (candidates, torch.eye(2)), "tactile": (candidates, torch.eye(2))}
         specs = build_bank_specs(bank, None)
         smell_z = torch.tensor([[1.0, 0.0], [0.2, 0.8]])
         ecg_z = torch.tensor([[0.0, 1.0], [0.9, 0.1], [0.3, 0.7]])
 
-        # Rank 0 sees only smellnet, rank 1 only ecg -- the shape the old per-family reduce could not agree on.
+        # Rank 0 sees only ecg, rank 1 only tactile -- the shape the old per-family reduce could not agree on.
         shard = (
-            (smell_z, ["A", "B"], ["smellnet"] * 2),
-            (ecg_z, ["B", "A", "B"], ["ecg"] * 3),
+            (smell_z, ["A", "B"], ["ecg"] * 2),
+            (ecg_z, ["B", "A", "B"], ["tactile"] * 3),
         )[rank]
         stats = new_stats(specs, torch.device("cpu"))
         update_stats(stats, specs, (shard[0], shard[1], shard[2], None, None), None, None)
@@ -190,7 +190,7 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
             (
                 torch.cat([smell_z, ecg_z]),
                 ["A", "B", "B", "A", "B"],
-                ["smellnet"] * 2 + ["ecg"] * 3,
+                ["ecg"] * 2 + ["tactile"] * 3,
                 None,
                 None,
             ),
