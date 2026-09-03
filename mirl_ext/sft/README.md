@@ -20,37 +20,70 @@ The mode field keeps the two tiers separable downstream: filter to
 
 Sources in `schema.OPEN_SOURCES` (haptic_ts descriptions, tactile
 captions/notes, free-text video QA) have no exact-match gate and are skipped.
-SmellNet is excluded from the project entirely (2026-08-31; parquets kept on
-disk, nothing reads them).
 
 Cluster parquet commands run inside srun (`srun -p cpu -c 8 --mem=32G …`);
 `data/sft/` is not synced — scp task/trace files.
 
 ```bash
-# cluster: split (ratio = sft_frac in config.json), export every SFT row, stage media
+# cluster: split (ratio = sft_frac in config.json), export every SFT row, stage media.
+# Use a NEW staging root: cache/source/frame-recipe mismatches fail closed.
 python mirl_ext/sft/scripts/split_sft_rl.py --out-root $DATA/split_grpo
-python mirl_ext/sft/scripts/export_sft_tasks.py --out $DATA/split/sft_tasks.jsonl
+# Derive closed time-series MCQs after the recording-locked split.
+python mirl_ext/sft/scripts/export_sft_tasks.py \
+    --out $DATA/split/sft_tasks.jsonl \
+    --families climb_train ecg_train human_behaviour_train tactile_train
 python mirl_ext/sft/scripts/stage_media.py --tasks $DATA/split/sft_tasks.jsonl \
-    --out-root $MIRL_SCRATCH_ROOT/data/sft_media --workers 16 --max-side 1536
+    --out-root $MIRL_SCRATCH_ROOT/data/sft_media_v4 --workers 16 --max-side 1536
 # rsync sft_tasks.staged.jsonl + media to the laptop
 
-# laptop: preview (no API call), generate (billed; rerun = resume), report
-python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \
-    --out data/sft/traces.jsonl --image-root data/sft/media --dry-run
-python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \
-    --out data/sft/traces.jsonl --image-root data/sft/media
-python mirl_ext/sft/scripts/report_traces.py data/sft/traces.jsonl --audit 8
+# Tactile teacher traces use the complete synchronized RGB+heatmap composite,
+# not separately rendered `.pt` collages: ~1 fps, min 4, max 24 frames.
+python mirl_ext/sft/scripts/stage_tactile_v2.py \
+    --tasks $DATA/split/sft_tasks.jsonl \
+    --out-root $MIRL_SCRATCH_ROOT/data/sft_tactile_v10_mmtouch_min4/media
+# emits $DATA/split/sft_tasks.tactile_v2.jsonl
 
-# cluster: build parquets, then a tiny trainer run as the smoke test
-python mirl_ext/sft/scripts/build_sft_parquet.py --traces $DATA/split/traces.jsonl
-torchrun --nproc_per_node=1 -m verl.trainer.sft_trainer model.path=$QWEN35 \
-    data.train_files=$DATA/split_grpo/sft_parquet/climb_train_sft.parquet \
-    data.max_length=16384 data.train_max_samples=16 trainer.total_epochs=1
+# internet-capable cluster CPU node: preview (no API call), generate (billed;
+# rerun = resume), report
+python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \
+    --out data/sft/traces_v4.jsonl --image-root data/sft/media_v4 --dry-run
+python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \
+    --out data/sft/traces_v4.jsonl --image-root data/sft/media_v4
+# Coverage pass: accepted blind traces stay untouched; exhausted/error rows retry
+# with the verified answer exposed and are marked mode=answer_conditioned.
+python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \
+    --out data/sft/traces_v4.jsonl --image-root data/sft/media_v4 --answer-conditioned
+python mirl_ext/sft/scripts/report_traces.py data/sft/traces_v4.jsonl --audit 8
+
+# cluster: after copying the trace back, freeze exactly the teacher's images/frames,
+# join only unchanged source rows, then audit every parquet + training-media byte.
+python mirl_ext/sft/scripts/select_trace_frames.py \
+    --tasks $DATA/split/sft_tasks.staged.jsonl \
+    --traces $DATA/split/traces_v4.jsonl \
+    --out-root $MIRL_SCRATCH_ROOT/data/sft_frames_v4
+python mirl_ext/sft/scripts/build_sft_parquet.py \
+    --traces $DATA/split/traces_v4.jsonl \
+    --media-from-staging $MIRL_SCRATCH_ROOT/data/sft_frames_v4
+python mirl_ext/sft/scripts/audit_sft_parquet.py \
+    --parquet-root $DATA/split_grpo/sft_parquet \
+    --media-root $MIRL_SCRATCH_ROOT/data/sft_frames_v4 \
+    --traces $DATA/split/traces_v4.jsonl
+SMOKE=1 sbatch mirl_ext/sft/run_sft_b200.sbatch
 ```
 
 The builder keeps every accepted row from the SFT half in training. It does
 not create another internal validation split; evaluation uses the untouched
 task validation files outside `split_grpo/sft/`.
+
+Do not reuse legacy staged tasks, trace files, frozen-frame roots, or audit
+manifests after changing a split, prompt/media row, frame count, image size, or
+source file. Source-row fingerprints and SHA-256 manifests intentionally stop
+instead of silently joining or training stale artifacts. The launcher accepts
+only the four explicit closed-task parquets and refuses a Hydra override of
+`data.train_files`.
+The launcher appends the audit SHA to `EXPERIMENT_NAME`, so changed data cannot
+resume an old dataloader/checkpoint. Set a new `EXPERIMENT_NAME` prefix (or
+`RESUME_MODE=disable`) when changing the base model or training hyperparameters.
 
 Tests: `python mirl_ext/sft/tests/test_sft_pipeline.py`.
 

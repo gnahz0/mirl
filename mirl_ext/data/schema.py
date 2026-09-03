@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import string
+from dataclasses import dataclass
 from pathlib import Path
 
 _CONFIG = Path(__file__).parents[1] / "sft" / "config.json"
@@ -51,7 +53,6 @@ def iter_jsonl(path):
 FAMILIES = [
     "ecg_train",
     "haptic_ts_train",
-    "haptic_mcq_train",  # minted by sft/scripts/make_haptic_mcq.py; absent until it runs
     "climb_train",
     "human_behaviour_train",
     "tactile_train",
@@ -66,54 +67,144 @@ OPEN_SOURCES = {
     "intentqa", "siq2", "mimeqa",                             # free-text video QA
 }
 
-# The six closed tactile QA tasks with their verbalized label banks (Stage-1
-# aligns against these; SFT grades their letters; make_haptic_mcq mints from them).
-TACTILE_TASK_LABELS: dict[str, tuple[str, ...]] = {
-    "initial_fingers": (
-        "initial contact: thumb",
-        "initial contact: index finger",
-        "initial contact: middle finger",
-        "initial contact: ring finger",
-        "initial contact: pinky finger",
-        "initial contact: palm",
+@dataclass(frozen=True)
+class TactileTaskSpec:
+    """Closed tactile task semantics shared by parsing, training, and metrics."""
+
+    name: str
+    labels: tuple[str, ...]
+    min_choices: int = 1
+    max_choices: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.labels:
+            raise ValueError("a tactile task needs a name and at least one label")
+        if not 1 <= self.min_choices <= self.max_choices <= len(self.labels):
+            raise ValueError(
+                f"invalid choice cardinality for {self.name}: "
+                f"{self.min_choices}..{self.max_choices} over {len(self.labels)} labels"
+            )
+
+    @property
+    def multilabel(self) -> bool:
+        return self.max_choices > 1
+
+
+# The six closed tactile QA tasks are declared once here. Every compatibility
+# view below (label banks, spans, multilabel membership) is derived from these
+# specs so Stage-1, SFT, reward routing, and metrics cannot disagree silently.
+TACTILE_TASK_SPECS: tuple[TactileTaskSpec, ...] = (
+    TactileTaskSpec(
+        "initial_fingers",
+        (
+            "initial contact: thumb",
+            "initial contact: index finger",
+            "initial contact: middle finger",
+            "initial contact: ring finger",
+            "initial contact: pinky finger",
+            "initial contact: palm",
+        ),
+        max_choices=6,
     ),
-    "highest_pressure": (
-        "highest pressure: thumb",
-        "highest pressure: index finger",
-        "highest pressure: middle finger",
-        "highest pressure: ring finger",
-        "highest pressure: pinky finger",
-        "highest pressure: palm",
+    TactileTaskSpec(
+        "highest_pressure",
+        (
+            "highest pressure: thumb",
+            "highest pressure: index finger",
+            "highest pressure: middle finger",
+            "highest pressure: ring finger",
+            "highest pressure: pinky finger",
+            "highest pressure: palm",
+        ),
+        max_choices=6,
     ),
-    "force_level": (
-        "force level: light, under 5 newtons",
-        "force level: moderate, 5 to 10 newtons",
-        "force level: firm, 10 to 20 newtons",
-        "force level: strong, over 20 newtons",
+    TactileTaskSpec(
+        "force_level",
+        (
+            "force level: light, under 5 newtons",
+            "force level: moderate, 5 to 10 newtons",
+            "force level: firm, 10 to 20 newtons",
+            "force level: strong, over 20 newtons",
+        ),
     ),
-    "grip_stability": (
-        "grip stability: stable",
-        "grip stability: unstable",
+    TactileTaskSpec(
+        "grip_stability",
+        (
+            "grip stability: stable",
+            "grip stability: unstable",
+        ),
     ),
-    "contact_feature": (
-        "contact geometry: edge",
-        "contact geometry: flat surface",
-        "contact geometry: curved surface",
-        "contact geometry: corner",
-        "contact geometry: multiple edges",
-        "contact geometry: edge and surface",
-        "contact geometry: transitioning from edge to surface",
-        "contact geometry: complex geometry with multiple features",
+    TactileTaskSpec(
+        "contact_feature",
+        (
+            "contact geometry: edge",
+            "contact geometry: flat surface",
+            "contact geometry: curved surface",
+            "contact geometry: corner",
+            "contact geometry: multiple edges",
+            "contact geometry: edge and surface",
+            "contact geometry: transitioning from edge to surface",
+            "contact geometry: complex geometry with multiple features",
+        ),
     ),
-    "local_shape": (
-        "local surface shape: flat",
-        "local surface shape: convex",
-        "local surface shape: concave",
-        "local surface shape: edge",
+    TactileTaskSpec(
+        "local_shape",
+        (
+            "local surface shape: flat",
+            "local surface shape: convex",
+            "local surface shape: concave",
+            "local surface shape: edge",
+        ),
     ),
-}
-MULTILABEL_TASKS = frozenset(("initial_fingers", "highest_pressure"))
-TACTILE_MCQ_SOURCES = tuple(TACTILE_TASK_LABELS)
+)
+TACTILE_TASKS: dict[str, TactileTaskSpec] = {spec.name: spec for spec in TACTILE_TASK_SPECS}
+if len(TACTILE_TASKS) != len(TACTILE_TASK_SPECS):
+    raise ValueError("duplicate tactile task name")
+
+# Compatibility names retained for call sites that only need one projection.
+TACTILE_TASK_LABELS: dict[str, tuple[str, ...]] = {name: spec.labels for name, spec in TACTILE_TASKS.items()}
+MULTILABEL_TASKS = frozenset(name for name, spec in TACTILE_TASKS.items() if spec.multilabel)
+
+TACTILE_TASK_SPANS: dict[str, tuple[int, int]] = {}
+_tactile_offset = 0
+for _tactile_spec in TACTILE_TASK_SPECS:
+    TACTILE_TASK_SPANS[_tactile_spec.name] = (
+        _tactile_offset,
+        _tactile_offset + len(_tactile_spec.labels),
+    )
+    _tactile_offset += len(_tactile_spec.labels)
+TACTILE_NUM_LABELS = _tactile_offset
+del _tactile_offset, _tactile_spec
+
+
+def parse_tactile_answer(answer: object, task: str) -> tuple[int, ...]:
+    """Parse one letter answer into sorted label IDs and enforce task cardinality.
+
+    All tasks use the same set-valued representation: a single-label answer is
+    just a set with one member. Task specs decide only how many unique choices
+    are legal; they do not fork parsing or target construction.
+    """
+    try:
+        spec = TACTILE_TASKS[task]
+    except KeyError as exc:
+        raise ValueError(f"unknown tactile task {task!r}") from exc
+
+    choices = [choice.strip() for choice in str(answer).split(",")]
+    if any(len(choice) != 1 or choice not in string.ascii_uppercase for choice in choices):
+        raise ValueError(f"invalid answer {answer!r} for {task}")
+    indices = tuple(sorted({string.ascii_uppercase.index(choice) for choice in choices}))
+    if any(index >= len(spec.labels) for index in indices):
+        raise ValueError(f"invalid answer {answer!r} for {task}")
+    if not spec.min_choices <= len(indices) <= spec.max_choices:
+        expected = (
+            str(spec.min_choices)
+            if spec.min_choices == spec.max_choices
+            else f"{spec.min_choices}..{spec.max_choices}"
+        )
+        raise ValueError(
+            f"{task} expects {expected} unique choice(s), got {len(indices)} in {answer!r}"
+        )
+    return indices
 
 # Reward-routing source sets (rewards/combined.py dispatches on these).
 TACTILE_SOURCES = {

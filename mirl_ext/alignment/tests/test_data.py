@@ -1,8 +1,8 @@
-
 import json
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 
 from mirl_ext.alignment.data import (
@@ -11,6 +11,8 @@ from mirl_ext.alignment.data import (
     AlignmentDataset,
     HomogeneousBatchSampler,
     _annotation_targets,
+    _media_kind,
+    _parse_annotation_answer,
     collate_alignment,
 )
 
@@ -19,7 +21,6 @@ def _dataset(tmp_path, name, rows, **kwargs):
     path = tmp_path / f"{name}.parquet"
     pq.write_table(pa.Table.from_pylist(rows), path)
     return AlignmentDataset([str(path)], **kwargs)
-
 
 
 def _haptic_signal_row(tensor_path, stem, caption="unused open description"):
@@ -83,9 +84,15 @@ def test_structured_tactile_join_changes_only_haptic_targets(tmp_path):
 
     dataset = AlignmentDataset(
         [str(data_path), str(annotation_path)],
+        sample_media_kinds=("signal", "image"),
     )
     sample = dataset[0]
 
+    assert len(dataset) == 2
+    assert set(dataset.sampling_groups) == {
+        ("signal", "haptic_tactile"),
+        ("signal", "ecg"),
+    }
     assert torch.equal(sample["media"], tactile)
     assert sample["targets"]["initial_fingers"] == (0, 1, 5)
     assert sample["targets"]["force_level"] == (1,)
@@ -114,6 +121,59 @@ def test_structured_tactile_join_masks_conflicting_answers():
         _tactile_annotation("recording", "force_level", "B"),
     ]
     assert _annotation_targets(rows, {"recording"})["recording"] == {}
+
+
+def test_tactile_answer_parser_uses_one_set_path_with_task_cardinality():
+    assert _parse_annotation_answer("A, B, F", "initial_fingers") == (0, 1, 5)
+    assert _parse_annotation_answer("B,F", "highest_pressure") == (1, 5)
+    assert _parse_annotation_answer("B", "force_level") == (1,)
+    assert _parse_annotation_answer("A,A", "grip_stability") == (0,)
+
+    for task in ("force_level", "grip_stability", "contact_feature", "local_shape"):
+        with pytest.raises(ValueError, match="expects 1 unique choice"):
+            _parse_annotation_answer("A,B", task)
+    with pytest.raises(ValueError, match="unknown tactile task"):
+        _parse_annotation_answer("A", "typo")
+    with pytest.raises(ValueError, match="invalid answer"):
+        _parse_annotation_answer("a", "initial_fingers")
+
+
+def test_tactile_row_without_annotations_fails_before_training(tmp_path):
+    tensor_path = tmp_path / "recording.pt"
+    torch.save({"tactile": {"right": torch.randn(12, 16, 16)}}, tensor_path)
+    with pytest.raises(ValueError, match="no unambiguous closed-task annotations"):
+        _dataset(tmp_path, "unannotated", [_haptic_signal_row(tensor_path, "recording")])
+
+
+def test_alignment_media_dispatch_rejects_missing_or_ambiguous_rows():
+    with pytest.raises(ValueError, match="exactly one"):
+        _media_kind({"data_source": "missing"})
+    with pytest.raises(ValueError, match="exactly one"):
+        _media_kind(
+            {
+                "data_source": "ambiguous",
+                "images": [{"image": "image.png"}],
+                "videos": [{"video": "video.mp4"}],
+            }
+        )
+
+
+def test_alignment_video_keeps_data_source_for_sampling_policy(tmp_path):
+    dataset = _dataset(
+        tmp_path,
+        "video",
+        [_tactile_annotation("recording", "initial_fingers", "A")],
+    )
+
+    sample = dataset[0]
+    assert sample == {
+        "kind": "video",
+        "media": "/not-loaded/recording.mp4",
+        "family": "initial_fingers",
+    }
+    batch = collate_alignment([sample])
+    assert batch["kind"] == "video"
+    assert batch["family"] == "initial_fingers"
 
 
 def test_collate_keeps_complete_source_homogeneous_signals():

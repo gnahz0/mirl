@@ -1,1 +1,1 @@
-"""Qwen3.5 vision alignment for images, video, and native time series."""
+"""Qwen3.5 alignment for visual media and dense native time series."""

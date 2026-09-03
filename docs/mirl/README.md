@@ -14,8 +14,8 @@ historical Qwen3-VL fork to Qwen3.5. It is based on official verl commit
 - `mirl_ext.data.MIRLDataset` adapts the existing Parquet files to current
   verl, including JSON-encoded `extra_info`, historical phantom audio markers,
   TorchCodec video decoding, and bounded image/video token policies.
-- `mirl_ext.rewards.combined.compute_score` dispatches the six MIRL reward
-  families: tactile, human behaviour, medical/CLIMB, SmellNet, ECG, and haptic
+- `mirl_ext.rewards.combined.compute_score` dispatches the five active MIRL
+  reward families: tactile, human behaviour, medical/CLIMB, ECG, and haptic
   time series.
 - `examples/mirl/multiverse/run_qwen35_grpo.sh` is the Qwen3.5-9B FSDP2 + vLLM
   GRPO launcher. `SMOKE=1` reduces it to eight real-media examples and one
@@ -29,10 +29,15 @@ historical Qwen3-VL fork to Qwen3.5. It is based on official verl commit
   stack. Temporary files, pip downloads, Ray sockets, and compiler caches live
   on `/scratch`, while source, logs, and Parquet indexes remain on `/work`.
 
-The default GRPO pipeline still uses the existing image/video representation for
-all six families. Raw-signal Stage-1 visual alignment is now runnable as a
-separate Qwen3.5 pipeline under `mirl_ext.alignment`; exporting its trained visual
-tower into a full Qwen checkpoint for SFT/RL remains the next handoff step.
+The current GRPO launcher trains on the closed, gradable ECG, CLIMB, human
+behaviour, and tactile sets; open-ended haptic descriptions are deliberately
+excluded from RL. Raw-signal Stage-1 under `mirl_ext.alignment` aligns ECG and
+tactile recordings while preserving the Qwen visual tower on CLIMB images and
+videos, human-behavior videos, and tactile RGB+heatmap composites. Human and
+CLIMB videos use at most eight frames; tactile composites use approximately
+1 FPS with a 4-frame floor and 24-frame ceiling. Its trained visual tower can be exported into a full
+Hugging Face Qwen checkpoint with
+`mirl_ext/alignment/export_stage1_vision.py` for downstream SFT/RL.
 
 Qwen3.5-9B interleaves Gated Delta Net and full-attention layers. The launcher
 therefore keeps padding removal and Ulysses sequence parallelism disabled, in
@@ -45,8 +50,8 @@ training sharding.
 | --- | --- |
 | `mirl_ext/data/dataset.py` | Current verl dataset adapter and media limits |
 | `mirl_ext/data/build_smoke.py` | Deterministic eight-row fixture from real MIRL data |
-| `mirl_ext/rewards/` | Six reward implementations and combined dispatcher |
-| `mirl_ext/alignment/` | Qwen3.5 vision/SigLIP2 raw-signal alignment pipeline |
+| `mirl_ext/rewards/` | Five active reward implementations and combined dispatcher |
+| `mirl_ext/alignment/` | Qwen3.5 vision/SigLIP2 ECG+tactile alignment pipeline |
 | `examples/mirl/multiverse/run_qwen35_grpo.sh` | Local/allocation launcher |
 | `examples/mirl/slurm/run_combined_b200.sbatch` | Two-B200 one-step smoke submission |
 | `environments/mirl-qwen35/` | Rebuild script, verifier, and exact environment records |

@@ -101,7 +101,7 @@ case "$RUN_VARIANT" in
     export WANDB_RUN_ID="trainedve-correct-raw-v1"
     export DATA_DIR="$MIRL_DATA_ROOT/trainedve_raw" ;;
   tstok)
-    # A/B for data representation: stock VE, but time-series datasets (ecg/smellnet/haptic_ts)
+    # A/B for data representation: stock VE, but time-series datasets (ECG/haptic_ts)
     # fed as RAW NUMERIC TEXT TOKENS instead of plot images. See data/TIME_SERIES_TOKENS.md.
     export MODEL_PATH="$STOCK_VE"
     export EXPERIMENT_NAME="ts-tokens"

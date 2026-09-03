@@ -17,7 +17,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mirl_ext.alignment.data import TACTILE_SPANS  # noqa: E402
-from mirl_ext.data.schema import MULTILABEL_TASKS  # noqa: E402
 from mirl_ext.alignment.metrics import (  # noqa: E402
     _bank_metrics,
     _bank_stats,
@@ -28,6 +27,7 @@ from mirl_ext.alignment.metrics import (  # noqa: E402
     prediction_metrics,
     update_stats,
 )
+from mirl_ext.data.schema import MULTILABEL_TASKS  # noqa: E402
 
 FIXTURE = Path(__file__).parent / "fixtures" / "metrics_golden.json"
 
@@ -70,11 +70,11 @@ def _assert_rows(actual: list[dict], expected: list[dict], label: str) -> None:
         assert got == want, f"{label}: row {index} changed"
 
 
-@pytest.mark.parametrize("case", ["smell", "ecg"])
+@pytest.mark.parametrize("case", ["wide", "ecg"])
 def test_single_label_families_score_unchanged(golden, case):
-    """Both golden vectors keep every scalar and per-class row. The "smell" data
-    survives smellnet's exclusion as a pure numeric vector (50 labels, skewed
-    support, unobserved classes) scored through a generically keyed spec."""
+    """Both golden vectors keep every scalar and per-class row. The wide case
+    exercises 50 labels, skewed support, and unobserved classes through a
+    generically keyed single-label spec."""
     data = golden["inputs"][case]
     rows: list[dict] = []
     spec = _single_label_spec(data["candidates"], data["bank"])
@@ -83,7 +83,7 @@ def test_single_label_families_score_unchanged(golden, case):
         spec,
         rows_out=rows,
     )
-    name = "smellnet" if case == "smell" else "ecg"
+    name = "wide_single_label" if case == "wide" else "ecg"
     _assert_same(metrics, golden["golden"][name], name)
     _assert_rows(rows, golden["golden"][f"{name}_rows"], name)
 
@@ -127,9 +127,7 @@ def test_tactile_ranking_is_unchanged_and_classification_uses_learned_bias(golde
 
 
 def test_mixed_families_and_overall_rollup_unchanged(golden):
-    """ecg scored alongside golden tactile, then the equal-family overall.
-    (smellnet left _TS_FAMILIES 2026-08-31; the overall mean is recomputed here
-    from the per-family golden values instead of pinned as a scalar.)"""
+    """ECG scored alongside golden tactile, then the equal-family overall."""
     ecg = golden["inputs"]["ecg"]
     specs = build_bank_specs({"ecg": (tuple(ecg["candidates"]), _tensor(ecg["bank"]))}, None)
     reports: dict[str, list[dict]] = {}
@@ -162,13 +160,12 @@ def test_metric_groups_surface_unchanged(golden):
             "n/img_image": 2,
             "n/img_video": 1,
             "n/ts_signal": 9,
-            "n/ts_smellnet": 3,
             "n/ts_ecg": 3,
             "n/ts_tactile": 3,
         },
         golden["golden"]["mixed"],
     )
-    expected = {key: value for key, value in golden["golden"]["groups_val"].items() if "smellnet" not in key}
+    expected = golden["golden"]["groups_val"]
     _assert_same(groups, expected, "groups_val")
 
 

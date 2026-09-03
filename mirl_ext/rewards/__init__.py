@@ -1,1 +1,1 @@
-"""Rule-based rewards for the six MIRL modality families."""
+"""Rule-based rewards for the five MIRL task families."""

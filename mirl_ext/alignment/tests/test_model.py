@@ -1,23 +1,26 @@
-
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from mirl_ext.alignment.model import MultimodalAlignmentModel
-from mirl_ext.data.signals import normalize, tactile_frames, timeseries_frames
+from mirl_ext.alignment.model import AlignmentOutput, MultimodalAlignmentModel
+from mirl_ext.data.signals import family_frames, normalize, signal_family, tactile_frames, timeseries_frames
 
 
 def _renderer() -> MultimodalAlignmentModel:
     model = MultimodalAlignmentModel.__new__(MultimodalAlignmentModel)
     torch.nn.Module.__init__(model)
+    model.max_video_frames = 8
+    model.tactile_video_fps = 1.0
+    model.tactile_min_video_frames = 4
+    model.tactile_max_video_frames = 24
     return model
 
 
 def test_scalar_rendering_preserves_values_geometry_and_missing_masks():
-    smell = torch.arange(40, dtype=torch.float32).unsqueeze(0)
-    video = timeseries_frames(smell, 32)
-    expected = normalize(smell)[0]
+    signal = torch.arange(40, dtype=torch.float32).unsqueeze(0)
+    video = timeseries_frames(signal, 32)
+    expected = normalize(signal)[0]
     assert torch.equal(video[0, 0, 0], expected[:32])
     assert torch.equal(video[1, 0, 0, :8], expected[32:])
     assert torch.equal(video[:, 0], video[:, 1])
@@ -61,6 +64,52 @@ def test_tactile_rendering_uses_one_rgb_cell_per_full_frame():
     assert torch.equal(frames[:, 0], frames[:, 1])
     assert torch.equal(frames[:, 1], frames[:, 2])
     assert frames.min() >= -1 and frames.max() <= 1
+
+
+def test_alignment_output_is_named_and_tuple_compatible():
+    tensors = [torch.tensor(float(index)) for index in range(6)]
+    output = AlignmentOutput(*tensors)
+
+    assert output.visual_embeddings is tensors[0]
+    assert output.reference_embeddings is tensors[1]
+    assert output.visual_token_counts is tensors[2]
+    assert output.signal_embeddings is tensors[3]
+    assert tuple(output) == tuple(tensors)
+
+
+def test_signal_and_media_dispatches_fail_closed():
+    with pytest.raises(ValueError, match="unsupported signal format"):
+        signal_family({"format": "unknown"})
+    with pytest.raises(ValueError, match="unsupported signal family"):
+        family_frames(torch.zeros(1, 4), "unknown", 32)
+    with pytest.raises(ValueError, match="unsupported alignment media kind"):
+        _renderer().forward("audio", [torch.zeros(1)], None, 1024)
+    with pytest.raises(ValueError, match="missing its data source"):
+        _renderer().forward("video", ["clip.mp4"], None, 1024)
+    with pytest.raises(ValueError, match="empty media batch"):
+        _renderer().forward("image", [], None, 1024)
+    with pytest.raises(ValueError, match="channels, time"):
+        timeseries_frames(torch.empty(8, 0), 32)
+    with pytest.raises(ValueError, match="time, height, width"):
+        tactile_frames(torch.empty(0, 16, 16), 32)
+
+
+def test_video_sampling_is_tactile_specific():
+    model = _renderer()
+    assert model.video_sampling_kwargs("initial_fingers") == {
+        "fps": 1.0,
+        "num_frames": None,
+        "min_frames": 4,
+        "max_frames": 24,
+    }
+    expected_fixed_eight = {
+        "fps": None,
+        "num_frames": None,
+        "min_frames": 1,
+        "max_frames": 8,
+    }
+    assert model.video_sampling_kwargs("mosei_emotion") == expected_fixed_eight
+    assert model.video_sampling_kwargs("climb") == expected_fixed_eight
 
 
 def test_qwen_branch_can_return_tokens_or_pool_per_sample():

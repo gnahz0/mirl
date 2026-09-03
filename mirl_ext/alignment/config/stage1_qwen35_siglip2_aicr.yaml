@@ -1,10 +1,13 @@
-# Stage 1 on AICR: train Qwen3.5's vision encoder on native time series and preserve images.
+# Stage 1 on AICR: train Qwen3.5's vision encoder on native time series and preserve vision.
 # Experiment history and rationale live in mirl_ext/CLAUDE.md.
 
 log_level: INFO
 
 data:
   root: ${oc.env:MIRL_ALIGN_DATA_ROOT,data/trainedve_raw}
+  # Native signals remain dense. Human-behavior and CLIMB videos use at most
+  # eight frames; tactile composites use approximately 1 FPS (4..24 frames).
+  sample_media_kinds: [signal, image, video]
   train_files:
     - ${data.root}/ecg_train_nan_filtered.parquet
     - ${data.root}/haptic_ts_train.parquet
@@ -18,12 +21,14 @@ data:
     - ${data.root}/human_behaviour_valid.parquet
     - ${data.root}/tactile_valid.parquet
   # tactile_{train,valid} supplies both closed QA labels for haptic_ts and
-  # visual-preservation anchors.
-  # The loader excludes mixtures; Stage 1 learns the 50-way base-substance task.
+  # RGB+tactile-heatmap visual-preservation anchors.
 
   # Batches contain one media kind and one data_source.
 
   max_video_frames: 8
+  tactile_video_fps: 1.0
+  tactile_min_video_frames: 4
+  tactile_max_video_frames: 24
   max_image_tokens: 1024
 
 model:
@@ -45,10 +50,12 @@ train:
   resume_checkpoint: null
   # Repeat complete shuffled passes over low-resource signal sources. Values are
   # positive integers; omitted sources and all visual sources repeat once.
-  # Validation is always one-pass. These factors approximate alpha=0.25
-  # temperature sampling across the signal sources.
+  # Validation is always one-pass. sqrt-sampling for the two-family era
+  # (ecg ~39k vs tactile ~2.2k, ratio ~20:1 -> sqrt ~ 4.5): the old 11x was
+  # alpha=0.25 tuned for the three-family mix where smellnet absorbed the
+  # repetition; 11x on 2.2k recordings is a memorization vector.
   signal_repeat_factors:
-    haptic_tactile: 11
+    haptic_tactile: 5
   # Four GPUs and two-step accumulation give a global batch of up to 256.
   batch_size: 32
   grad_accum_steps: 2
@@ -60,7 +67,9 @@ train:
   warmup_ratio: 0.03
   grad_clip: 1.0
   val_every: 200
-  val_batch_size: 256
+  # Validation does not affect optimization. Keep its per-rank media batches
+  # small because image groups retain both trainable and reference embeddings.
+  val_batch_size: 16
   best_metric: val-core/map/overall
   output_dir: ${oc.env:MIRL_OUTPUT_DIR,checkpoints/alignment_qwen35_canonical_siglip}
 

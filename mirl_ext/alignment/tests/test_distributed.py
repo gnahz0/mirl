@@ -171,13 +171,13 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
         candidates = ("A", "B")
         bank = {"ecg": (candidates, torch.eye(2)), "tactile": (candidates, torch.eye(2))}
         specs = build_bank_specs(bank, None)
-        smell_z = torch.tensor([[1.0, 0.0], [0.2, 0.8]])
-        ecg_z = torch.tensor([[0.0, 1.0], [0.9, 0.1], [0.3, 0.7]])
+        rank0_z = torch.tensor([[1.0, 0.0], [0.2, 0.8]])
+        rank1_z = torch.tensor([[0.0, 1.0], [0.9, 0.1], [0.3, 0.7]])
 
         # Rank 0 sees only ecg, rank 1 only tactile -- the shape the old per-family reduce could not agree on.
         shard = (
-            (smell_z, ["A", "B"], ["ecg"] * 2),
-            (ecg_z, ["B", "A", "B"], ["tactile"] * 3),
+            (rank0_z, ["A", "B"], ["ecg"] * 2),
+            (rank1_z, ["B", "A", "B"], ["tactile"] * 3),
         )[rank]
         stats = new_stats(specs, torch.device("cpu"))
         update_stats(stats, specs, (shard[0], shard[1], shard[2], None, None), None, None)
@@ -188,7 +188,7 @@ def _asymmetric_worker(rank: int, results: dict, port: int) -> None:
             reference_stats,
             specs,
             (
-                torch.cat([smell_z, ecg_z]),
+                torch.cat([rank0_z, rank1_z]),
                 ["A", "B", "B", "A", "B"],
                 ["ecg"] * 2 + ["tactile"] * 3,
                 None,

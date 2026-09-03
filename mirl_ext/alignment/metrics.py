@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from mirl_ext.data.schema import MULTILABEL_TASKS
+from mirl_ext.data.schema import TACTILE_TASKS
 
 from .data import (
     _CLASSIFICATION_FAMILIES,
@@ -38,6 +39,20 @@ _COUNT_KEYS: tuple[str, ...] = (
 )
 
 
+class TSEval(NamedTuple):
+    """Signal predictions retained for streaming metrics; tuple-compatible."""
+
+    embeddings: torch.Tensor | None
+    labels: list[str]
+    families: list[str]
+    tactile_targets: torch.Tensor | None
+    tactile_masks: torch.Tensor | None
+
+    @classmethod
+    def empty(cls) -> TSEval:
+        return cls(None, [], [], None, None)
+
+
 def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> dict[str, torch.Tensor]:
     """Sum every entry of ``values`` across ranks with exactly one collective.
     Callers fix the key set before any data is seen, so the packed buffer is
@@ -49,7 +64,11 @@ def all_reduce_sum(values: dict[str, torch.Tensor], *, world_size: int = 1) -> d
     dist.all_reduce(flat, op=dist.ReduceOp.SUM)
     return {
         key: chunk.view(values[key].shape)
-        for key, chunk in zip(keys, flat.split([values[key].numel() for key in keys]))
+        for key, chunk in zip(
+            keys,
+            flat.split([values[key].numel() for key in keys]),
+            strict=True,
+        )
     }
 
 
@@ -71,7 +90,12 @@ def build_bank_specs(label_bank: dict, tactile_bank: tuple | None) -> tuple[Bank
     if tactile_bank is not None:
         labels, embeddings = tactile_bank
         specs += [
-            BankSpec(f"task/{task}", labels[start:stop], embeddings[start:stop], task in MULTILABEL_TASKS)
+            BankSpec(
+                f"task/{task}",
+                labels[start:stop],
+                embeddings[start:stop],
+                TACTILE_TASKS[task].multilabel,
+            )
             for task, (start, stop) in TACTILE_SPANS.items()
         ]
     return tuple(specs)
@@ -144,7 +168,8 @@ def _bank_metrics(
     if rows_out is not None:
         rows_out.extend(
             {
-                # The six tasks share one table, so their rows say which task; a family table would only repeat its name.
+                # The six tasks share one table, so rows identify the task; a
+                # family-specific table would only repeat the same name.
                 **({"task": task} if task else {}),
                 "class_id": index,
                 "label": label,
@@ -183,36 +208,42 @@ def new_stats(specs: tuple[BankSpec, ...], device: torch.device) -> dict[str, to
     }
 
 
-def _microbatch_units(specs, z, texts, families, targets, masks):
+def _microbatch_units(specs: tuple[BankSpec, ...], ts_eval: TSEval):
     """Yield (spec, rows of ``z``, multi-hot target) for every unit with rows here.
     The one place that tells family label strings from tactile answered spans apart;
     a visual microbatch carries no families, so it yields nothing at all."""
+    z = ts_eval.embeddings
+    if z is None:
+        return
     by_key = {spec.key: spec for spec in specs}
-    if masks is None:
+    if ts_eval.tactile_masks is None:
         rows_by_key: dict[str, list[int]] = {}
-        for position, family in enumerate(families):
+        for position, family in enumerate(ts_eval.families):
             rows_by_key.setdefault(f"ts_{family}", []).append(position)
         for key, rows in rows_by_key.items():
             spec = by_key[key]
-            ids = torch.tensor([spec.labels.index(texts[row]) for row in rows], dtype=torch.long)
+            ids = torch.tensor([spec.labels.index(ts_eval.labels[row]) for row in rows], dtype=torch.long)
             yield spec, z[rows], F.one_hot(ids, len(spec.labels))
         return
+    if ts_eval.tactile_targets is None:
+        raise ValueError("tactile metric masks require tactile targets")
     for task, (start, stop) in TACTILE_SPANS.items():
         # collate writes whole task spans; requiring the whole span drops a partly-answered row, not misreads it.
-        rows = (masks[:, start:stop] > 0).all(dim=1)
-        yield by_key[f"task/{task}"], z[rows], targets[rows, start:stop]
+        rows = (ts_eval.tactile_masks[:, start:stop] > 0).all(dim=1)
+        yield by_key[f"task/{task}"], z[rows], ts_eval.tactile_targets[rows, start:stop]
 
 
 @torch.no_grad()
 def update_stats(
     stats: dict[str, torch.Tensor],
     specs: tuple[BankSpec, ...],
-    ts_eval: tuple,
+    ts_eval: TSEval | tuple,
     log_logit_scale: torch.Tensor | None,
     logit_bias: torch.Tensor | None,
 ) -> None:
     """Fold one microbatch into the running statistics. No collective, no retention."""
-    for spec, rows, target in _microbatch_units(specs, *ts_eval):
+    evaluation = ts_eval if isinstance(ts_eval, TSEval) else TSEval(*ts_eval)
+    for spec, rows, target in _microbatch_units(specs, evaluation):
         for key, value in _bank_stats(rows, target, spec, log_logit_scale, logit_bias).items():
             # Fixed key set: a diverged rank raises KeyError rather than hanging.
             stats[key] += value

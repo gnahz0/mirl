@@ -45,9 +45,9 @@ def _inputs() -> dict:
     """Fixed random inputs, stored alongside the outputs they produced."""
     generator = torch.Generator().manual_seed(0)
 
-    # smellnet: many labels, skewed support, several classes never observed.
-    smell_labels = tuple(f"smell_{index:02d}" for index in range(50))
-    smell_draw = torch.randint(0, 12, (24,), generator=generator).tolist()
+    # Wide single-label case: skewed support with several classes never observed.
+    wide_labels = tuple(f"wide_{index:02d}" for index in range(50))
+    wide_draw = torch.randint(0, 12, (24,), generator=generator).tolist()
 
     # ecg: few labels, a dominant majority class, one class entirely absent.
     ecg_labels = ("normal", "af", "lbbb", "rbbb", "pvc", "pac", "st")
@@ -79,10 +79,10 @@ def _inputs() -> dict:
     )
 
     return {
-        "smell": {
+        "wide": {
             "z": _unit(generator, 24),
-            "labels": [smell_labels[index] for index in smell_draw],
-            "candidates": smell_labels,
+            "labels": [wide_labels[index] for index in wide_draw],
+            "candidates": wide_labels,
             "bank": _unit(generator, 50),
         },
         "ecg": {
@@ -107,16 +107,25 @@ def _rows(report: list[dict]) -> list[dict]:
     return [{key: value for key, value in row.items()} for row in report]
 
 
+def _sorted_tree(value):
+    """Sort nested mappings while callers retain semantic top-level block order."""
+    if isinstance(value, dict):
+        return {key: _sorted_tree(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_sorted_tree(item) for item in value]
+    return value
+
+
 def main() -> None:
     data = _inputs()
-    smell, ecg, tactile = data["smell"], data["ecg"], data["tactile"]
+    wide, ecg, tactile = data["wide"], data["ecg"], data["tactile"]
     golden: dict[str, object] = {}
 
-    smell_rows: list[dict] = []
-    golden["smellnet"] = _label_ranking_metrics(
-        smell["z"], smell["labels"], smell["candidates"], smell["bank"], per_class_out=smell_rows
+    wide_rows: list[dict] = []
+    golden["wide_single_label"] = _label_ranking_metrics(
+        wide["z"], wide["labels"], wide["candidates"], wide["bank"], per_class_out=wide_rows
     )
-    golden["smellnet_rows"] = _rows(smell_rows)
+    golden["wide_single_label_rows"] = _rows(wide_rows)
 
     ecg_rows: list[dict] = []
     golden["ecg"] = _label_ranking_metrics(
@@ -135,16 +144,13 @@ def main() -> None:
     )
     golden["tactile_rows"] = _rows(tactile_rows)
 
-    # Both single-label families through one call, then the equal-family rollup.
+    # Active single-label metrics merged with tactile for the equal-family rollup.
     mixed_reports: dict[str, list[dict]] = {}
     mixed = _ts_prediction_metrics(
-        torch.cat([smell["z"], ecg["z"]]),
-        [*smell["labels"], *ecg["labels"]],
-        ["smellnet"] * 24 + ["ecg"] * 32,
-        {
-            "smellnet": (smell["candidates"], smell["bank"]),
-            "ecg": (ecg["candidates"], ecg["bank"]),
-        },
+        ecg["z"],
+        ecg["labels"],
+        ["ecg"] * len(ecg["labels"]),
+        {"ecg": (ecg["candidates"], ecg["bank"])},
         per_class_reports=mixed_reports,
     )
     golden["mixed"] = _merge_prediction_metrics(mixed, golden["tactile"])
@@ -157,43 +163,56 @@ def main() -> None:
             "n/img_image": 2,
             "n/img_video": 1,
             "n/ts_signal": 9,
-            "n/ts_smellnet": 3,
             "n/ts_ecg": 3,
             "n/ts_tactile": 3,
         },
         golden["mixed"],
     )
 
-    payload = {
-        "inputs": {
-            "smell": {
-                "z": smell["z"].tolist(),
-                "labels": smell["labels"],
-                "candidates": list(smell["candidates"]),
-                "bank": smell["bank"].tolist(),
-            },
-            "ecg": {
-                "z": ecg["z"].tolist(),
-                "labels": ecg["labels"],
-                "candidates": list(ecg["candidates"]),
-                "bank": ecg["bank"].tolist(),
-            },
-            "tactile": {
-                "z": tactile["z"].tolist(),
-                "labels": list(tactile["labels"]),
-                "bank": tactile["bank"].tolist(),
-                "targets": tactile["targets"].tolist(),
-                "masks": tactile["masks"].tolist(),
-                "bias": tactile["bias"].tolist(),
-                "log_logit_scale": tactile["log_logit_scale"],
-            },
+    inputs = {
+        "wide": {
+            "z": wide["z"].tolist(),
+            "labels": wide["labels"],
+            "candidates": list(wide["candidates"]),
+            "bank": wide["bank"].tolist(),
         },
-        "golden": golden,
+        "ecg": {
+            "z": ecg["z"].tolist(),
+            "labels": ecg["labels"],
+            "candidates": list(ecg["candidates"]),
+            "bank": ecg["bank"].tolist(),
+        },
+        "tactile": {
+            "z": tactile["z"].tolist(),
+            "labels": list(tactile["labels"]),
+            "bank": tactile["bank"].tolist(),
+            "targets": tactile["targets"].tolist(),
+            "masks": tactile["masks"].tolist(),
+            "bias": tactile["bias"].tolist(),
+            "log_logit_scale": tactile["log_logit_scale"],
+        },
+    }
+    payload = {
+        "golden": {
+            name: _sorted_tree(golden[name])
+            for name in (
+                "ecg",
+                "ecg_rows",
+                "groups_val",
+                "mixed",
+                "mixed_report_families",
+                "wide_single_label",
+                "wide_single_label_rows",
+                "tactile",
+                "tactile_rows",
+            )
+        },
+        "inputs": {name: _sorted_tree(inputs[name]) for name in ("ecg", "wide", "tactile")},
     }
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    FIXTURE.write_text(json.dumps(payload, indent=1, sort_keys=True))
+    FIXTURE.write_text(json.dumps(payload, indent=1))
     print(f"wrote {FIXTURE} ({FIXTURE.stat().st_size} bytes)")
-    for name in ("smellnet", "ecg", "tactile", "mixed"):
+    for name in ("wide_single_label", "ecg", "tactile", "mixed"):
         print(f"  {name}: {len(golden[name])} scalars")
 
 

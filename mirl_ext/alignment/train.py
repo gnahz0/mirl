@@ -6,14 +6,14 @@ import argparse
 import logging
 import math
 import sys
-import wandb
-import transformers
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
+import transformers
+import wandb
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -61,7 +61,11 @@ def build_loaders(
     HomogeneousBatchSampler,
     DataLoader,
 ]:
-    train_ds = AlignmentDataset(list(cfg.data.train_files))
+    sample_media_kinds = tuple(cfg.data.sample_media_kinds)
+    train_ds = AlignmentDataset(
+        list(cfg.data.train_files),
+        sample_media_kinds=sample_media_kinds,
+    )
 
     train_sampler = HomogeneousBatchSampler(
         train_ds,
@@ -81,7 +85,10 @@ def build_loaders(
         persistent_workers=bool(cfg.train.num_workers),
     )
 
-    val_ds = AlignmentDataset(list(cfg.data.val_files))
+    val_ds = AlignmentDataset(
+        list(cfg.data.val_files),
+        sample_media_kinds=sample_media_kinds,
+    )
     val_loader = DataLoader(
         val_ds,
         batch_sampler=HomogeneousBatchSampler(
@@ -275,11 +282,14 @@ def train(cfg: DictConfig) -> None:
         qwen35_path=cfg.model.qwen35_path,
         siglip2_text_path=cfg.model.siglip2_text_path,
         max_video_frames=cfg.data.max_video_frames,
+        tactile_video_fps=cfg.data.tactile_video_fps,
+        tactile_min_video_frames=cfg.data.tactile_min_video_frames,
+        tactile_max_video_frames=cfg.data.tactile_max_video_frames,
     ).to(device)
 
     if cfg.train.gradient_checkpointing:
         model.trainable_visual.gradient_checkpointing_enable()
-    
+
     if init_checkpoint:
         load_checkpoint(model, str(init_checkpoint))
 
@@ -310,7 +320,7 @@ def train(cfg: DictConfig) -> None:
         num_warmup_steps=math.ceil(total_steps * cfg.train.warmup_ratio),
         num_training_steps=total_steps,
     )
-    
+
     model, optimizer = accelerator.prepare(model, optimizer)
     base_model = accelerator.unwrap_model(model)
     resume_progress = None
@@ -325,7 +335,7 @@ def train(cfg: DictConfig) -> None:
                 f"total_steps {saved_total_steps} != {total_steps}; use "
                 "train.init_checkpoint for a weights-only continuation"
             )
-    
+
     if is_main:
         wandb_run = wandb.init(
             project=cfg.wandb.project,

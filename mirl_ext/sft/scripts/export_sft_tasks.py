@@ -2,8 +2,9 @@
 
 Runs on the cluster (where the parquets live); generation also runs cluster-side
 (compute nodes reach the teacher endpoint). Every SFT row gets a teacher trace,
-so there is no sampling here -- the split is the sampling. Each task carries the FULL original prompt (all system+user turns
-flattened), every media reference in original order, its ground truth (for
+so there is no sampling here -- the split is the sampling. Each task carries
+the FULL original prompt (all system+user turns flattened), every media
+reference in original order, its ground truth (for
 laptop-side validation only -- the generator strips it before building
 requests), and answer_style: sources in schema.OPEN_SOURCES are free text with
 no exact-match gate, everything else is gradable.
@@ -26,6 +27,7 @@ from mirl_ext.data.schema import (  # noqa: E402
     media_refs,
     prompt_text,
 )
+from mirl_ext.sft.artifacts import source_row_fingerprint  # noqa: E402
 
 
 def main() -> None:
@@ -57,8 +59,7 @@ def main() -> None:
         for family in wanted:
             src = half_root / f"{family}.parquet"
             if not src.exists():
-                print(f"[skip] {src} not found")
-                continue
+                raise FileNotFoundError(f"requested SFT family is missing: {src}")
             rows = pq.read_table(src).to_pylist()
             # Keep original parquet positions: uid must join back to the row.
             eligible = [
@@ -78,6 +79,7 @@ def main() -> None:
                     "uid": f"{family}#{i}",
                     "family": family,
                     "row_index": i,
+                    "source_row_fingerprint": source_row_fingerprint(row, family, i),
                     "data_source": data_source,
                     "prompt": prompt_text(row),
                     "ground_truth": gt,

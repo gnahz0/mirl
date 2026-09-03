@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -27,10 +26,15 @@ from mirl_ext.data.schema import (  # noqa: E402
     media_stem,
     prompt_messages,
 )
+from mirl_ext.sft.artifacts import (  # noqa: E402
+    FrozenMediaIndex,
+    frozen_media_index,
+    source_row_fingerprint,
+)
+from mirl_ext.sft.traces import accepted_traces  # noqa: E402
 
-# One config knob controls both sides: the teacher staged this many frames, and
-# the student rows are rewritten to sample the same count. (The RL half keeps
-# its upstream per-row values -- tactile GRPO samples 12.)
+# Generic-video fallback for untraced/open rows. Teacher-traced rows always use
+# the exact frozen frame list instead (tactile 4..24; other RGB videos 8).
 VIDEO_FRAMES = int(config_path("video_frames", "MIRL_VIDEO_FRAMES", "8"))
 
 
@@ -50,51 +54,26 @@ def sft_messages(row: dict) -> list[dict]:
     return [{"role": "user", "content": merged}] + rest[1:]
 
 
-def last_records(paths: list[Path]) -> tuple[dict[str, dict], int]:
-    """(uid -> LAST record per uid, skipped-line count). The lenient trace-file
-    core shared by accepted_traces, gen_sft_targets.read_status, and
-    report_traces.load_last_records: unparseable/uid-less lines
-    (kill-truncated tails) are skipped and counted."""
-    last: dict[str, dict] = {}
-    skipped = 0
-    for path in paths:
-        for line in path.read_text().splitlines():
-            if line.strip():
-                try:
-                    rec = json.loads(line)
-                    last[rec["uid"]] = rec
-                except (json.JSONDecodeError, KeyError):
-                    skipped += 1
-    return last, skipped
-
-
-def accepted_traces(paths: list[Path]) -> dict[str, dict]:
-    """uid -> last accepted record. Resume files may hold several records per
-    uid (an error line later superseded); the LAST line per uid wins, and only
-    accepted ones build rows. Status-less records (gen_sft_episodes traces,
-    plus legacy files) count as accepted."""
-    last, skipped = last_records(paths)
-    if skipped:
-        print(f"[warn] skipped {skipped} unparseable trace line(s)")
-    return {
-        uid: rec for uid, rec in last.items() if rec.get("status", "accepted") == "accepted"
-    }
-
-
-def frame_index(staged_dir: Path) -> dict[str, list[str]]:
-    """stem -> ordered staged frame paths, from ONE directory listing (a glob
-    per row re-scans a ~100k-file NFS dir and takes hours)."""
-    index: dict[str, list[str]] = {}
-    if staged_dir.is_dir():
-        for name in sorted(os.listdir(staged_dir)):
-            if name.endswith(".jpg") and "_f" in name:
-                index.setdefault(name.rsplit("_f", 1)[0], []).append(str(staged_dir / name))
-    return index
-
-
-def build_record(row: dict, trace: dict, frames: dict[str, list[str]] | None = None) -> dict:
+def build_record(
+    row: dict,
+    trace: dict,
+    frozen: FrozenMediaIndex | None = None,
+) -> dict:
+    expected_source = trace.get("source_row_fingerprint")
+    if not expected_source:
+        raise ValueError(f"{trace['uid']}: trace has no source-row provenance")
+    actual_source = source_row_fingerprint(
+        row,
+        str(trace["family"]),
+        int(trace["row_index"]),
+    )
+    if actual_source != expected_source:
+        raise ValueError(
+            f"{trace['uid']}: source row changed since task export, refusing to write"
+        )
     gt = (row.get("reward_model") or {}).get("ground_truth")
-    assert gt == trace["ground_truth"], f"{trace['uid']}: join mismatch, refusing to write"
+    if gt != trace["ground_truth"]:
+        raise ValueError(f"{trace['uid']}: ground-truth join mismatch, refusing to write")
     # Minimal audit keys: join back to the trace file (which holds model,
     # prompt version, wrong guesses, ...) via uid when more detail is needed.
     # mode distinguishes verified (answer_blind_zero_shot) from coverage-tier
@@ -104,20 +83,41 @@ def build_record(row: dict, trace: dict, frames: dict[str, list[str]] | None = N
         "ground_truth": gt,
         "accepted_attempt": trace.get("accepted_attempt"),
         "mode": trace.get("mode"),
+        "source_row_fingerprint": expected_source,
+        "staging_version": trace.get("staging_version"),
+        "task_fingerprint": trace.get("task_fingerprint"),
     }
     # Set the config frame count and drop None-valued keys: qwen_vl_utils does
     # ele.get("min_frames", DEFAULT), and an explicit None defeats the default
-    # and crashes frame sampling. With --frames-from-staging, swap the mp4 for
-    # the pre-extracted frame list (same frames the teacher saw; qwen_vl_utils
-    # treats a path list as a video) so training never seek-decodes video.
+    # and crashes frame sampling. With --media-from-staging, use the exact
+    # frozen images/frames the teacher saw; qwen_vl_utils treats a path list as
+    # a video, so training never seek-decodes the original mp4.
+    images = []
+    for image in row.get("images") or []:
+        src = image.get("image") if isinstance(image, dict) else image
+        if frozen is None:
+            images.append(image)
+            continue
+        if not src:
+            raise ValueError(f"{trace['uid']}: image entry has no source path")
+        staged = frozen.images.get(media_stem(src))
+        if not staged:
+            raise ValueError(f"{trace['uid']}: no frozen staged image for {src!r}")
+        images.append({**image, "image": staged} if isinstance(image, dict) else {"image": staged})
+
     videos = []
     for v in row.get("videos") or []:
         src = v.get("video") if isinstance(v, dict) else v
-        if frames is not None and src:
-            staged = frames.get(media_stem(src))
-            if staged:
-                videos.append({"video": staged})
-                continue
+        if frozen is not None:
+            if not src:
+                raise ValueError(f"{trace['uid']}: video entry has no source path")
+            staged = frozen.videos.get(media_stem(src))
+            if not staged:
+                raise ValueError(
+                    f"{trace['uid']}: no frozen staged frames for video {src!r}"
+                )
+            videos.append({"video": staged})
+            continue
         videos.append(
             {k: val for k, val in {**v, "max_frames": VIDEO_FRAMES}.items() if val is not None}
             if isinstance(v, dict) else v
@@ -125,7 +125,7 @@ def build_record(row: dict, trace: dict, frames: dict[str, list[str]] | None = N
     return {
         "data_source": row.get("data_source"),
         "messages": sft_messages(row) + [{"role": "assistant", "content": trace["response"]}],
-        "images": row.get("images") or [],
+        "images": images,
         "videos": videos,
         "extra_info": json.dumps({**extra_info(row), **provenance}),
     }
@@ -154,15 +154,19 @@ def main() -> None:
         "directly on their ground-truth text (captions/answers; no teacher)",
     )
     ap.add_argument(
+        "--media-from-staging",
         "--frames-from-staging",
+        dest="media_from_staging",
         type=Path,
         default=None,
-        help="sft_media root; video rows train on the staged 8-frame list "
-        "instead of seek-decoding the mp4 (falls back to the mp4 when unstaged)",
+        help="frozen-media root; rows train on the exact images/video frames "
+        "seen by the teacher; missing media are fatal",
     )
     args = ap.parse_args()
     if not args.traces and not args.open_gt:
         ap.error("nothing to build: pass --traces and/or --open-gt")
+    if args.traces and args.media_from_staging is None:
+        ap.error("--media-from-staging is required when building teacher-traced rows")
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -179,10 +183,14 @@ def main() -> None:
     for family, items in sorted(by_family.items()):
         rows = pq.read_table(Path(args.split_root) / "sft" / f"{family}.parquet").to_pylist()
         records = []
-        staged = frame_index(args.frames_from_staging / family) if args.frames_from_staging else None
+        frozen = (
+            frozen_media_index(args.media_from_staging / family)
+            if args.media_from_staging
+            else None
+        )
         for t in items:
             row = rows[t["row_index"]]
-            record = build_record(row, t, staged)
+            record = build_record(row, t, frozen)
             check_record(record, t["uid"])
             records.append(record)
         total += len(records)
@@ -209,7 +217,11 @@ def main() -> None:
             src = Path(args.split_root) / "sft" / f"{family}.parquet"
             if not src.exists():
                 continue
-            open_staged = frame_index(args.frames_from_staging / family) if args.frames_from_staging else None
+            open_frozen = (
+                frozen_media_index(args.media_from_staging / family)
+                if args.media_from_staging
+                else None
+            )
             records = []
             for i, row in enumerate(pq.read_table(src).to_pylist()):
                 gt = str((row.get("reward_model") or {}).get("ground_truth") or "")
@@ -219,8 +231,15 @@ def main() -> None:
                 # the caption standing in as the "response".
                 record = build_record(
                     row,
-                    {"uid": f"{family}#{i}", "ground_truth": gt, "response": gt},
-                    open_staged,
+                    {
+                        "uid": f"{family}#{i}",
+                        "family": family,
+                        "row_index": i,
+                        "source_row_fingerprint": source_row_fingerprint(row, family, i),
+                        "ground_truth": gt,
+                        "response": gt,
+                    },
+                    open_frozen,
                 )
                 check_record(record, f"{family}#{i}")
                 records.append(record)

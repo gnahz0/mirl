@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from mirl_ext.sft.scripts.build_sft_parquet import accepted_traces, frame_index
-from mirl_ext.sft.scripts.select_trace_frames import sha256
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from mirl_ext.sft.artifacts import (  # noqa: E402
+    frame_index,
+    sha256,
+    verify_frozen_media_manifest,
+    verify_frozen_selection,
+)
+from mirl_ext.sft.traces import accepted_traces  # noqa: E402
 
 
 def main() -> None:
@@ -15,7 +22,12 @@ def main() -> None:
     parser.add_argument("--parquet-root", type=Path, required=True)
     parser.add_argument("--media-root", type=Path, required=True)
     parser.add_argument("--traces", nargs="+", type=Path, required=True)
-    parser.add_argument("--max-frames", type=int, default=8)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="override the frozen manifest's frame limit",
+    )
     parser.add_argument("--smoke-train-prefix", type=int, default=256)
     parser.add_argument("--val-prefix", type=int, default=512)
     args = parser.parse_args()
@@ -23,6 +35,13 @@ def main() -> None:
     import pyarrow.parquet as pq
 
     traces = accepted_traces(args.traces)
+    frozen_manifest_path = verify_frozen_media_manifest(args.media_root)
+    frozen_manifest = json.loads(frozen_manifest_path.read_text())
+    manifest_max_frames = frozen_manifest.get("max_frames_per_video")
+    max_frames = args.max_frames if args.max_frames is not None else manifest_max_frames
+    if not isinstance(max_frames, int) or max_frames <= 0:
+        raise ValueError(f"invalid maximum frame count: {max_frames}")
+    verify_frozen_selection(frozen_manifest, traces, args.traces)
     files = sorted(args.parquet_root.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"no parquets under {args.parquet_root}")
@@ -49,6 +68,12 @@ def main() -> None:
                 raise ValueError(f"{uid}: no accepted source trace")
             if info.get("ground_truth") != trace.get("ground_truth"):
                 raise ValueError(f"{uid}: parquet/trace ground-truth mismatch")
+            if info.get("source_row_fingerprint") != trace.get("source_row_fingerprint"):
+                raise ValueError(f"{uid}: parquet/trace source-row-fingerprint mismatch")
+            if info.get("staging_version") != trace.get("staging_version"):
+                raise ValueError(f"{uid}: parquet/trace staging-version mismatch")
+            if info.get("task_fingerprint") != trace.get("task_fingerprint"):
+                raise ValueError(f"{uid}: parquet/trace task-fingerprint mismatch")
             if info.get("mode") not in {"answer_blind_zero_shot", "answer_conditioned"}:
                 raise ValueError(f"{uid}: unexpected generation mode {info.get('mode')!r}")
             if row["messages"][-1] != {"role": "assistant", "content": trace["response"]}:
@@ -73,7 +98,7 @@ def main() -> None:
                 if len(videos) != 1:
                     raise ValueError(f"{uid}: expected one video entry, got {len(videos)}")
                 frames = videos[0]["video"]
-                if not isinstance(frames, list) or not 0 < len(frames) <= args.max_frames:
+                if not isinstance(frames, list) or not 0 < len(frames) <= max_frames:
                     raise ValueError(f"{uid}: invalid staged frame list length {len(frames)}")
                 stems = {Path(frame).name.rsplit("_f", 1)[0] for frame in frames}
                 if len(stems) != 1:
@@ -96,13 +121,20 @@ def main() -> None:
     if missing_traces:
         preview = ", ".join(sorted(missing_traces)[:8])
         raise ValueError(f"{len(missing_traces)} accepted traces missing from parquets; first: {preview}")
-    missing_images = [path for path in image_paths if not path.is_file()]
-    if missing_images:
-        raise FileNotFoundError(f"{len(missing_images)} missing images; first: {missing_images[0]}")
+    media_root = args.media_root.absolute()
+    bad_images = [
+        path
+        for path in image_paths
+        if not path.is_file() or not path.absolute().is_relative_to(media_root)
+    ]
+    if bad_images:
+        raise FileNotFoundError(
+            f"{len(bad_images)} missing/out-of-root images; first: {bad_images[0]}"
+        )
     bad_frames = [
         path
         for path in frame_paths
-        if not path.is_file() or not path.is_relative_to(args.media_root)
+        if not path.is_file() or not path.absolute().is_relative_to(media_root)
     ]
     if bad_frames:
         raise FileNotFoundError(f"{len(bad_frames)} missing/out-of-root frames; first: {bad_frames[0]}")
@@ -116,7 +148,11 @@ def main() -> None:
         "train": {"image": len(train_prefix) - sum(train_prefix), "video": sum(train_prefix)},
         "val": {"image": len(val_prefix) - sum(val_prefix), "video": sum(val_prefix)},
     }
+    training_media = {
+        path.absolute() for path in image_paths | frame_paths
+    }
     manifest = {
+        "manifest_version": 2,
         "rows": {split: len(flags) for split, flags in split_flags.items()},
         "modalities": modalities,
         "accepted_trace_rows": len(traces),
@@ -124,7 +160,13 @@ def main() -> None:
         "train_val_shared_media_groups": 0,
         "prefix_modalities": prefix_counts,
         "parquet_sha256": {path.name: sha256(path) for path in files},
-        "frame_manifest_sha256": sha256(args.media_root / "manifest.json"),
+        "frozen_media_manifest": {
+            "path": str(frozen_manifest_path.absolute()),
+            "sha256": sha256(frozen_manifest_path),
+        },
+        "training_media_sha256": {
+            str(path): sha256(path) for path in sorted(training_media)
+        },
     }
     manifest_path = args.parquet_root / "audit_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")

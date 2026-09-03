@@ -8,17 +8,10 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 
 from .data import TACTILE_SPANS, TASK_LABELS
-from .metrics import _TS_FAMILIES
-from .model import MultimodalAlignmentModel
+from .metrics import _TS_FAMILIES, TSEval
+from .model import AlignmentOutput, MultimodalAlignmentModel
 
 LabelBank = dict[str, tuple[tuple[str, ...], torch.Tensor]]
-TSEval = tuple[
-    torch.Tensor | None,
-    list[str],
-    list[str],
-    torch.Tensor | None,
-    torch.Tensor | None,
-]
 
 
 @torch.no_grad()
@@ -181,9 +174,8 @@ def _compute_losses(
 
     Returns:
         (total, metrics, ts_eval): the weighted scalar training loss, detached
-        scalar metrics keyed for W&B, and the ``TSEval`` tuple consumed by
-        ``update_stats`` — (embeddings, labels, families, tactile targets,
-        tactile masks), empty/None for visual batches.
+        scalar metrics keyed for W&B, and the named ``TSEval`` consumed by
+        ``update_stats``, empty/None for visual batches.
     """
     metrics: dict[str, float] = {}
 
@@ -191,18 +183,22 @@ def _compute_losses(
     media = batch["media"]
     family = batch["family"]
     labels = batch["text"]
-    feat_img, feat_ref_img, img_token_counts, feat_ts, log_logit_scale, logit_bias = model(
-        kind,
-        media,
-        family,
-        int(cfg.data.max_image_tokens),
-    )
+    raw_output = model(kind, media, family, int(cfg.data.max_image_tokens))
+    # NamedTuple keeps legacy tuple-returning test doubles and wrappers usable
+    # while the objective itself no longer relies on positional field meanings.
+    output = raw_output if isinstance(raw_output, AlignmentOutput) else AlignmentOutput(*raw_output)
+    log_logit_scale = output.log_logit_scale
+    logit_bias = output.logit_bias
 
     total = (log_logit_scale.float() + logit_bias.float()) * 0.0
     tactile_targets: torch.Tensor | None = None
     tactile_masks: torch.Tensor | None = None
 
-    z_ts = F.normalize(feat_ts.float(), dim=-1, eps=1e-6) if feat_ts is not None else None
+    z_ts = (
+        F.normalize(output.signal_embeddings.float(), dim=-1, eps=1e-6)
+        if output.signal_embeddings is not None
+        else None
+    )
     if z_ts is not None:
         if family == "tactile":
             _, text_embeddings = tactile_bank
@@ -236,16 +232,18 @@ def _compute_losses(
             metrics[f"loss/ts_{family}"] = l_ts.detach().item()
 
     visual_sample_loss = total.new_empty(0)
-    if feat_img is not None:
+    if output.visual_embeddings is not None:
+        if output.reference_embeddings is None or output.visual_token_counts is None:
+            raise ValueError("visual embeddings require reference embeddings and token counts")
         token_loss = 1.0 - F.cosine_similarity(
-            feat_img.float(),
-            feat_ref_img.detach().float(),
+            output.visual_embeddings.float(),
+            output.reference_embeddings.detach().float(),
             dim=-1,
         )
         visual_sample_loss = torch.segment_reduce(
             token_loss,
             reduce="mean",
-            lengths=img_token_counts,
+            lengths=output.visual_token_counts,
         )
 
     visual_count = log_logit_scale.new_tensor(visual_sample_loss.numel())
@@ -261,9 +259,9 @@ def _compute_losses(
     metrics["loss/total"] = total.detach().item()
     metrics["logit_scale"] = log_logit_scale.detach().exp().item()
     metrics["logit_bias"] = logit_bias.detach().item()
-    ts_eval: TSEval = (
-        (z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
+    ts_eval = (
+        TSEval(z_ts.detach(), labels, [family] * len(labels), tactile_targets, tactile_masks)
         if z_ts is not None
-        else (None, [], [], None, None)
+        else TSEval.empty()
     )
     return total, metrics, ts_eval

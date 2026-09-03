@@ -123,7 +123,7 @@ def main() -> None:
         "--families",
         nargs="*",
         default=None,
-        help="subset of FAMILIES to split (default: all six). Splitting a SUBSET is "
+        help="subset of FAMILIES to split (default: all configured). Splitting a SUBSET is "
         "safe only if it includes every family sharing a group key -- tactile and "
         "haptic_ts share 3DHaptic clips, so split them together or not at all.",
     )

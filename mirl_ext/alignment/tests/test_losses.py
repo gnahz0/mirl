@@ -14,6 +14,7 @@ from mirl_ext.alignment.data import (  # noqa: E402
     TASK_LABELS,
 )
 from mirl_ext.alignment.metrics import (  # noqa: E402
+    TSEval,
     _bank_metrics,
     _bank_stats,
     _merge_prediction_metrics,
@@ -270,9 +271,11 @@ def test_general_objective_averages_structured_tasks_only_for_tactile():
     assert total.detach().item() == pytest.approx(metrics["loss/ts_tactile"])
     assert metrics["loss/siglip"] == pytest.approx(metrics["loss/ts_tactile"])
     assert {key for key in metrics if key.startswith("loss/task/")} == {f"loss/task/{task}" for task in TACTILE_SPANS}
-    # ts_eval now carries the (B, 30) target/mask pair rather than per-task dicts.
-    assert task_eval[3].shape == (2, TACTILE_NUM_LABELS)
-    assert task_eval[4].shape == (2, TACTILE_NUM_LABELS)
+    # The named result carries the (B, 30) target/mask pair and stays tuple-compatible.
+    assert isinstance(task_eval, TSEval)
+    assert task_eval.tactile_targets.shape == (2, TACTILE_NUM_LABELS)
+    assert task_eval.tactile_masks.shape == (2, TACTILE_NUM_LABELS)
+    assert task_eval[3] is task_eval.tactile_targets
 
 
 def test_structured_tactile_metrics_merge_as_one_family():

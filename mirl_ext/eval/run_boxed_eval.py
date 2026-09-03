@@ -82,7 +82,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("results.json"))
     ap.add_argument("--max-samples", type=int, default=0, help="per family, pre-filter; 0 = all")
     ap.add_argument("--max-tokens", type=int, default=4096)
-    ap.add_argument("--max-video-frames", type=int, default=8, help="linspace frame budget for mp4 rows (RL default 8)")
+    ap.add_argument(
+        "--max-video-frames",
+        type=int,
+        default=24,
+        help="safety ceiling; tactile uses 1 FPS (4..24), while human and CLIMB request 8",
+    )
     ap.add_argument("--max-model-len", type=int, default=15360)
     ap.add_argument("--max-prompt-length", type=int, default=11264, help="RL's data.max_prompt_length filter")
     ap.add_argument("--filter-workers", type=int, default=8)

@@ -173,7 +173,9 @@ args=(
     data.video_key=videos
     "data.custom_cls.path=${MIRL_ROOT}/mirl_ext/data/dataset.py"
     data.custom_cls.name=MIRLDataset
-    +data.max_video_frames=8
+    # Tactile raw videos use 1 FPS with a 4-frame floor and 24-frame ceiling;
+    # human-behavior and CLIMB request 8; physically shorter clips use all available.
+    +data.max_video_frames=24
     +data.max_video_bytes=52428800
     +data.max_image_tokens=12288
     +data.max_image_tokens_total=24576

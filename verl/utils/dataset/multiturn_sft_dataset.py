@@ -30,7 +30,7 @@ from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
-from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.models.transformers.qwen2_vl import get_rope_index as get_qwen2_vl_rope_index
 from verl.utils import hf_tokenizer
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -40,6 +40,15 @@ from verl.utils.tokenizer.chat_template import apply_chat_template, extract_syst
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _get_rope_index(processor, **kwargs) -> torch.Tensor:
+    """Dispatch Qwen-VL position IDs to the matching model implementation."""
+    if processor.__class__.__name__ == "Qwen3VLProcessor":
+        from verl.models.transformers.qwen3_vl import get_rope_index as get_qwen3_vl_rope_index
+
+        return get_qwen3_vl_rope_index(processor, **kwargs)
+    return get_qwen2_vl_rope_index(processor, **kwargs)
 
 
 def once(func):
@@ -348,7 +357,7 @@ class MultiTurnSFTDataset(Dataset):
             video_grid_thw = multi_modal_inputs.get("video_grid_thw", None)
             second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts", None)
 
-            vision_position_ids = get_rope_index(
+            vision_position_ids = _get_rope_index(
                 self.processor,
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,

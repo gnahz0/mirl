@@ -9,20 +9,21 @@
   `google/siglip2-so400m-patch16-naflex`.
 - **Time-series loss:** **SigLIP sigmoid**
   ([arXiv:2303.15343](https://arxiv.org/abs/2303.15343)) against cached SigLIP2
-  text labels. SmellNet and ECG use class-balanced 50- and 7-label banks with
-  bias derived from `1 / number_of_classes`. Tactile uses six closed QA banks,
-  multi-positive targets where appropriate, and measured positive-rate biases.
+  text labels. ECG uses the complete label vocabulary found in the active split.
+  Tactile uses one 30-label bank spanning six closed QA tasks, with multi-positive
+  targets for initial-contact fingers and highest-pressure fingers.
 - **Preservation loss:** sample-balanced cosine distance between every
-  pre-merger student and anchor encoder token on real images/videos.
+  pre-merger student and anchor encoder token on real images.
 
 Transformers computes SigLIP2 loss only inside the full model forward and assumes
-a square one-image/one-text identity pairing. The sensor objective instead has a
+a square one-image/one-text identity pairing. The sensor objective instead has
 rectangular sample-by-label matrices and repeated positives, so it uses PyTorch's
-equivalent `binary_cross_entropy_with_logits` primitive directly. SmellNet and
-ECG sum each anchor's complete label bank before a class-balanced mean. Tactile
-uses a global observed-pair mean for each task and an equal mean across its six
-tasks. Cosine preservation uses `cosine_similarity` and `segment_reduce`; there
-is no project-local loss module.
+equivalent `binary_cross_entropy_with_logits` primitive directly. ECG sums each
+sample's complete candidate bank before an inverse-frequency class-balanced
+sample mean. Tactile masks labels outside the row's observed tasks, averages the
+observed pairs within each task, then gives the six observed tasks equal weight.
+Cosine preservation uses `cosine_similarity` and `segment_reduce`; there is no
+project-local loss module.
 
 The Qwen tower is not replaced by Google's standalone vision tower. Qwen3.5
 uses a Qwen-specific `Qwen3_5VisionModel` whose exact final weights are loaded
@@ -39,7 +40,7 @@ from the Qwen checkpoint. Its geometry is:
 
 A semantic tile boundary must therefore be a multiple of 32 pixels. Stage 1
 mean-pools the model's 1152-D pre-merger `last_hidden_state` for sensor alignment
-and preserves every pre-merger image/video token. The frozen 4096-D merger remains
+and preserves every pre-merger image token. The frozen 4096-D merger remains
 the interface consumed by the language tower in Stage 2.
 
 The SigLIP2 text tower is the closest contrastive label encoder because the Qwen
@@ -52,17 +53,8 @@ pretrained 4096-D Qwen merger remains frozen.
 
 | family | rows | on-disk contract | important variation |
 |---|---:|---|---|
-| SmellNet | 2,279 | CSV | 1,979 mixture files: timestamp + 4 sensors; 300 base files: 6 sensors. Native lengths 517–900. |
 | ECG | 49,305 | bare contiguous `torch.bfloat16` tensor, `format=ts_pt` | Every file is 8×2500 across PTB-XL (21,837), Georgia (10,344), Chapman-Shaoxing (10,247), and CPSC (6,877). |
-| tactile | 2,210 | `torch.float32` dictionary, `format=tactile_pt` | v1 (1,318): right 16×16 tactile only; v2 (892): left/right/aligned/mat tactile. The loader selects the right tactile tensor. |
-
-The cleaned SmellNet indexes contain 1,192 training recordings (250 base and
-942 mixture) and 297 validation recordings (50 base and 247 mixture) after
-removing byte/numerical duplicates under different paths. Stage 1 currently
-excludes `smellnet_mixture` before it constructs label vocabularies, samplers, or
-metrics. The active task is therefore the 50-way base benchmark: five training
-recordings and one validation recording for every substance. There are zero
-shared paths, basenames, raw hashes, or numerical hashes across the splits.
+| tactile | 2,210 | `torch.float32` dictionary, `format=tactile_pt` | v1 (1,318): right 16×16 tactile only; v2 (892): left/right/aligned/mat tactile. The production index selects a tensor key for each recording (currently the right tactile map). |
 
 ECG source-specific exception: four Georgia files contained whole missing leads,
 for 12,500 NaNs total:
@@ -79,41 +71,34 @@ none occur there. The raw `.pt` files are retained on scratch for provenance and
 recovery; neither alignment config can sample them.
 
 Some tactile files also contain force statistics and additional v2 maps. The
-clean baseline ignores that optional metadata and loads only the selected right
-16×16 pressure sequence, giving every tactile sample the same tensor contract.
+clean baseline ignores that optional metadata and loads the `[time, height,
+width]` pressure sequence named by the row's single `signals` entry, giving every
+tactile sample the same tensor contract.
+
+The file names describe two views of the same recordings:
+`haptic_ts_{train,valid}.parquet` supplies the native pressure sequences, while
+`tactile_{train,valid}.parquet` supplies the closed QA annotations. The latter's
+RGB-video rows are both visual-preservation samples and the annotation table
+used for the label join.
+`AlignmentDataset` constructs train and validation separately and joins the QA
+answers to native sequences by recording stem within that split.
 
 ## Temporal representation
 
-The families share a `[-1, 1]` numeric contract. Smell sensor rows and tactile
-taxels use robust normalization over time. ECG uses `clip(x, -4, 4) / 4`
-because the stored tensors are already per-lead z-scored.
+Both signal families use the same finite-value check and z-score transform:
+subtract the mean, divide by a standard deviation clamped to at least `1e-6`,
+clip to ±4 standard deviations, and divide by 4. ECG applies it independently
+to each lead over time. Tactile applies one global transform to all values in a
+recording. A constant signal therefore maps to zero.
 
-Robustly normalized rows normally use:
+The result is a floating-point `[-1, 1]` Qwen video tensor without line plots,
+PIL, or uint8 quantization. Scalar intensity is repeated identically across RGB;
+no color channel has a separate engineered meaning. ECG padding pixels are
+exactly `-1`, after normalization, so they remain distinct from constant data.
 
-`scale = 0.7 * (MAD / 0.6745) + 0.3 * std`
+### ECG scalar pseudo-video
 
-`pixel = tanh((value - median) / (2 * scale))`
-
-When `MAD / 0.6745 <= 1e-6`, `scale` falls back to the full standard
-deviation. This preserves contrast in quantized or sparse traces instead of
-shrinking their scale to `0.3 * std`. If both statistics are zero, the scale is
-clamped to `1e-6` and the constant row maps exactly to zero.
-
-MAD is weighted over std (0.7/0.3) because outlier resistance is the whole point
-of using MAD; an even split re-injects the std's spike sensitivity. The tanh gain
-of 2 (not 4) uses more of the `[-1, 1]` range — a ±1σ sample maps to
-`tanh(0.5) ≈ 0.46` rather than `tanh(0.25) ≈ 0.245` — so the pseudo-video has real
-contrast while tanh still saturates genuine outliers.
-
-This follows TimeOmni-VL's robust-fidelity idea and maps directly to Qwen's
-normal `[-1, 1]` pixel range without line plots, PIL, or uint8 quantization.
-The normalized scalar intensity is repeated identically across RGB. Exact `-1`
-marks missing/padded pixels; no color channel has a separate engineered meaning.
-
-### Unified scalar video: SmellNet and ECG
-
-- Treat both inputs identically as `(channels, time)`; only their native dimensions
-  differ.
+- Treat the input as `(channels, time)`.
 - Put each consecutive 32-step block in one video frame. A channel occupies one 32×32 merger
   cell, with its 32 values repeated vertically and identically across RGB.
 - Qwen's native temporal patcher fuses adjacent frames, so each output token covers
@@ -127,60 +112,78 @@ Example token counts:
 
 | shape | post-merger tokens |
 |---|---:|
-| SmellNet base: 6×867 | 84 |
 | ECG: 8×2500 | 320 |
 
-All families use this temporal Qwen input grammar; there is no image/hybrid mode.
+Every ECG row uses this temporal grammar. Image-preservation rows retain their
+native visual inputs instead of being converted to scalar frames.
 
 ### Tactile: pseudo-video
 
-- Every source is a 30-FPS sequence of 16×16 pressure maps (median 177 frames;
-  range 47–4,606).
-- Feed every recording at its complete native duration. There is no temporal
-  windowing, cropping, frame selection, or cap.
-- Robustly normalize each taxel over the full recording and repeat pressure
-  identically across RGB. There is no fixed pressure ceiling or engineered
-  force/delta channel.
+- Every source is a 30-FPS sequence of 16×16 pressure maps. In the current
+  truncated indexes, training spans 47–720 frames (median 179) and validation
+  spans 63–720 frames (median 171).
+- Feed every timestep in each referenced tensor. There is no alignment-time
+  windowing, frame selection, or maximum-frame setting; the corpus preparation
+  step has already truncated the longest recordings to 24 seconds.
+- Globally z-score the complete recording and repeat pressure identically across
+  RGB. There is no fixed pressure ceiling or engineered force/delta channel.
 - Nearest-neighbor expand each 16×16 tactile map to one 32×32 merger cell.
 - Qwen's temporal kernel fuses adjacent frame pairs.
 
 A recording with `T` tactile frames produces `ceil(T / 2)` output tokens: one
-spatial pressure token per temporal frame pair. The median 177-frame recording
-therefore produces 89 tokens; the longest observed 4,606-frame recording
-produces 2,303 tokens.
+spatial pressure token per temporal frame pair. The median 179-frame training
+recording therefore produces 90 tokens; the current 720-frame maximum produces
+360 tokens.
 
 ## Training recipe
 
 - Every microbatch contains one media kind and one `data_source`; SigLIP negatives
   still come from the complete family label bank.
-- Stage 1 expands multi-image or multi-video rows into one preservation anchor per
-  unique physical path because it ignores QA annotations. SFT and RL must instead
-  preserve row grouping and load all media in prompt order.
+- Stage 1 uses the first image path from each image row as a preservation anchor.
+  Human-behavior and CLIMB videos use at most eight uniformly spaced frames.
+  Tactile RGB+heatmap composites use approximately 1 FPS with a four-frame
+  floor and 24-frame ceiling. Native signals are never downsampled by either
+  video rule.
 - Visual rows and signal sources omitted from `train.signal_repeat_factors` are
   visited once per epoch. Configured low-resource signal sources repeat complete
   independently shuffled passes. Validation is always one-pass. Source groups
   smaller than the GPU count are skipped so every rank receives a sample.
-- Repeat factors approximate square-root sampling; the three sensor families are
-  not forced to equal exposure. The six tactile task losses are weighted equally.
-- SmellNet sampling and metrics use only the 50 base substances; mixture rows
-  never enter the active dataset or W&B tables.
-- SmellNet and ECG align to complete 50- and 7-label SigLIP2 banks. Tactile joins
-  six closed QA tasks to pressure recordings by shared recording stem: initial
-  contact, highest pressure, force level, grip stability, contact geometry, and
-  local shape. Their choices are verbalized and encoded once. Open answers are
-  reserved for SFT and tactile videos remain preservation anchors only.
-- SmellNet, ECG, and tactile all retain their complete native time axes in both
-  training and validation. One dataset row produces one sensor embedding.
+- Configured repeats rebalance the low-resource tactile source without forcing
+  the two sensor families to equal exposure. The AICR config repeats
+  `haptic_tactile` 5 times per epoch (approximate square-root balancing), as
+  does the ORCD config;
+  image sources and ECG are one-pass. The six tactile task losses are weighted
+  equally.
+- ECG aligns to the complete split vocabulary (seven labels in the current
+  indexes). Tactile joins six closed QA tasks to pressure recordings by shared
+  recording stem: initial fingers, highest-pressure fingers, force level, grip
+  stability, contact feature, and local shape. Initial fingers and
+  highest-pressure fingers are multi-label; the other four tasks are exactly
+  one label. Their 30 choices are verbalized and encoded once. Conflicting
+  annotations remove only that task, while a tactile recording with no
+  unambiguous closed-task annotation fails dataset construction. Open tactile
+  responses are ignored as supervision; tactile video pixels remain visual
+  preservation inputs.
+- Collation represents each tactile recording with a `[30]` multi-hot target and
+  a `[30]` observation mask. An observed task marks its entire label span in the
+  mask; positive choices set one or more target bits. Unobserved or conflicting
+  tasks stay masked out, so their zero targets are never trained as negatives.
+  The shared parser always returns a set of option indices; task specifications
+  enforce 1–6 choices for the two multi-label tasks and exactly one choice for
+  the other four.
+- ECG and tactile retain their complete native time axes in both training and
+  validation. One signal row produces one sensor embedding.
 - Frozen SigLIP2 embeddings and Qwen's 1152-D pre-merger states are compared
   directly.
 - Accelerate wraps the model with standard DDP. Sensor loss is evaluated on
   rank-local rows; only small class/observation counts and metric statistics are
   reduced across ranks.
-- AdamW uses `1e-5` for Qwen, `3e-3` for the
-  temperature, weight decay `0.05`, gradient clipping `1.0`, and 3% warmup.
-- The production schedule is one sampler epoch. Validation runs every 200 steps
-  over the complete one-pass sensor validation sampler, visiting every SmellNet,
-  ECG, and tactile validation recording once.
+- AdamW applies one configured learning rate to all trainable parameters
+  (`1e-5` on AICR and `5e-5` on ORCD), with zero weight decay, gradient clipping
+  at `1.0`, and 3% warmup. The learned logit scale and bias share this optimizer.
+- Both production configs run three sampler epochs. Validation runs every 200
+  optimizer steps and at each epoch end over the complete one-pass validation
+  sampler, visiting every ECG and tactile recording once.
 - `train.init_checkpoint` names an `alignment_state.pt` file and warm-starts the
   encoder and learned temperature with a fresh optimizer and schedule.
   `train.resume_checkpoint` names the matching `last/trainer_state.pt` file and
@@ -188,8 +191,9 @@ produces 2,303 tokens.
   `train.init_checkpoint` to point at the sibling `last/alignment_state.pt`.
   Validation overwrites `last/` at optimizer-step boundaries while `best/` and
   `final/` remain lightweight model exports.
-- Every signal family logs accuracy, macro-F1, Recall@1, Recall@5, and mAP.
-  Accuracy is an any-positive top-1 hit; Recall@k is the fraction of a sample's
-  positive labels recovered in the top k. They coincide at k=1 for single-label
-  tasks but not for multi-positive tactile tasks. `overall` is the equal-family
-  mean, and checkpoint selection uses `val-core/f1_macro/overall`.
+- Every signal family logs accuracy, Recall@1, Recall@5, and mAP, plus auxiliary
+  prediction-coverage statistics. Accuracy is an any-positive top-1 hit;
+  Recall@k is the fraction of a sample's positive labels recovered in the top k.
+  They coincide at k=1 for single-label tasks but not for multi-positive tactile
+  tasks. Tactile first averages its six tasks equally, then `overall` averages
+  ECG and tactile equally. Checkpoint selection uses `val-core/map/overall`.

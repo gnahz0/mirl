@@ -35,9 +35,12 @@ style but are load-bearing:
   highest-pressure may have multiple positives). `log_logit_scale` and
   `logit_bias` init to log(10) and -10 and train **without weight decay**
   (the ndim<=1 optimizer group in `train.py` enforces this).
-- **Rendering**: series are z-scored per channel over time (already-z-scored
-  ECG passes through unchanged); tactile is z-scored over the whole recording
-  (per-taxel scaling would amplify untouched-taxel noise). Both clamp at 4
+- **Rendering**: one uniform `normalize()` for every family — z-score per
+  channel over time, no per-family branches and no "already normalized"
+  detection (z-scoring is idempotent, so pre-z-scored ECG comes out unchanged
+  as a mathematical consequence, not a special case); tactile is z-scored
+  over the whole recording (per-taxel scaling would amplify untouched-taxel
+  noise). Both clamp at 4
   sigma into [-1, 1]; constant rows map to zero; non-finite input raises.
   Semantic boundaries land on 32 px (patch 16 x merger 2x2) so a merged token
   never spans two channels; -1.0 is the tail-padding value. Qwen's own video
@@ -46,14 +49,15 @@ style but are load-bearing:
   Low-resource signal sources repeat complete shuffled passes via integer
   `train.signal_repeat_factors` (approximately square-root sampling);
   validation is one-pass; the sampler skips groups too small to give every
-  rank a sample. Visual rows are preservation anchors — their annotation text
-  is ignored.
+  rank a sample. Image and RGB-video rows are preservation anchors — their
+  annotation text is ignored for that loss. Human-behavior and CLIMB videos
+  use at most 8 frames; tactile composites use approximately 1 fps with a
+  4-frame floor and 24-frame ceiling. Native sensor sequences stay dense.
 - **Metrics carry no placeholders.** A key is present iff its branch fired;
   never pre-populate `loss/*` with 0.0. The cross-rank reduction uses the
   static `_REDUCED_METRIC_KEYS` list — deriving keys from a step's dict
   deadlocks when ranks disagree. Selection uses `val-core/map/overall`
-  (equal-family mean over ECG and tactile; SmellNet was a third family until
-  its 2026-08-31 exclusion — old-lineage metrics are not comparable).
+  (equal-family mean over ECG and tactile).
 - **Checkpoint config keys are exact file paths, never directories**:
   `train.init_checkpoint` -> an `alignment_state.pt` (weights-only, fresh
   schedule); `train.resume_checkpoint` -> the matching `last/trainer_state.pt`
@@ -92,7 +96,7 @@ saves `best/` and a resumable `last/`; the run also saves one final encoder.
   filtered val set — always quote margins over the MAJORITY baseline — and
   label prevalence is strongly corpus-dependent.
 - **Per-family evals are mandatory.** Mixed validation once hid chance-level
-  smell and tactile behavior.
+  tactile behavior.
 - **Only the encoder transfers to Stage 2.** `distill` is the learn-vs-
   preserve knob (image cosine above 0.99 guardrail).
 - `num_workers` x prefetch is a host-RAM multiplier for video decode, not
@@ -121,11 +125,17 @@ saves `best/` and a resumable `last/`; the run also saves one final encoder.
 Every family has a published recipe that contradicts some choice this code
 makes; read the relevant one before changing a data path.
 
-- **SmellNet is EXCLUDED from the project** (decision 2026-08-31, this
-  branch): its parquets/raw CSVs stay on disk (`smellnet_*` at the data
-  root, backup at `data/raw_backup/SmellNet_base_data`) but no pipeline
-  reads them. Alignment code/tests keep their smellnet parts — that lineage
-  already trained the current encoder and is frozen history.
+- **Tactile is TRUNCATED to 24 s corpus-wide** (decision 2026-09-02): the
+  >24 s tail (~94 recordings, 4%) is repeated squeeze cycles carrying no new
+  signal. Truncated twins live beside the originals with IDENTICAL basenames
+  (`truncated24/` mp4s, `truncated24_pt/` taxel+force tensors); every tactile
+  train/valid parquet AND the alignment `haptic_ts_*` parquets reference the
+  twins (backups: `*.pre_trunc24.parquet`; full originals untouched).
+  For teacher traces, `stage_tactile_v2.py` keeps each video's full synchronized
+  RGB+heatmap composite and samples approximately 1 fps over the same window.
+  Clips under 4 s get four distinct uniformly spaced frames; all clips include
+  their first and final frame. Source `.pt` tensors remain the dense tactile
+  stream used by alignment and are not teacher-media staging artifacts.
 - **Tactile** ([OpenTouch](https://opentouch-tactile.github.io/),
   [arXiv:2512.16842](https://arxiv.org/abs/2512.16842)): upstream has **no
   text modality** — semantics come from a closed 29-class grasp taxonomy; the
@@ -138,9 +148,13 @@ makes; read the relevant one before changing a data path.
   dataset classes normalize only by the recording's global peak-to-peak range
   (no filter, no z-score — those exist only in its MIMIC pipelines). Standard
   practice is per-lead z-score, Butterworth 1-47 Hz, 2-3 s crops with TTA.
-  ECG diagnosis is inherently multi-label, so single-label top-1 is
-  mis-specified — report macro AUROC; single-run f1 deltas under ~0.01 are
-  noise.
+  ECG diagnosis is inherently multi-label, but the delivered
+  `ecg_train.json` already carries exactly ONE superclass per record
+  (verified: zero multi-label rows) — the flattening happened in CLIMB's
+  preprocessing, not in this repo; our parquets are faithful to it. So
+  single-label top-1 is mis-specified by inheritance — always quote the
+  0.441 majority baseline; macro AUROC would be proper; single-run f1
+  deltas under ~0.01 are noise.
 
 ## GRPO data protocol (launcher is run_qwen35_grpo.sh — trust it, verify lists)
 
@@ -153,9 +167,9 @@ makes; read the relevant one before changing a data path.
   full corpora). Validation files live at the root, never split.
 - **RL touches gradable sources only**: tactile/human_behaviour use the
   `_closed` variants (open free-text stripped, was 28% of each); haptic_ts
-  is excluded entirely (100% `haptic_tactile` open captions); smellnet is
-  excluded project-wide. haptic_mcq exists only for SFT — no RL half was
-  ever minted.
+  is excluded entirely (100% `haptic_tactile` open captions). haptic_mcq is
+  RETIRED (2026-09-01): synthetic plot-MCQ rows are not part of SFT or RL;
+  `haptic_mcq_valid.parquet` remains on disk only as a ts-plot eval artifact.
 
 ## Gotcha: `prompt` is a MESSAGE LIST, not a string
 

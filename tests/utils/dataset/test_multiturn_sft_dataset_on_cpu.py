@@ -30,10 +30,56 @@ from transformers.utils import get_json_schema
 
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.dataset.dataset_utils import DatasetPadMode, SFTTensorCollator
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset, _get_rope_index
 from verl.utils.model import extract_multi_modal_inputs
 
 custom_model_prefix = Path("~/models").expanduser().resolve()
+
+
+def test_qwen3_rope_index_expands_video_grid_per_timestamp_run():
+    processor_type = type("Qwen3VLProcessor", (), {})
+    processor = processor_type()
+    processor.image_processor = type("ImageProcessor", (), {"merge_size": 1})()
+    processor.image_token_id = 10
+    processor.video_token_id = 11
+    processor.vision_start_token_id = 12
+
+    # Qwen3-VL emits one vision run per timestamp, while its processor returns
+    # one [T, H, W] grid row for the complete video.
+    video_run = [processor.vision_start_token_id] + [processor.video_token_id] * 4
+    input_ids = torch.tensor(video_run * 2)
+    position_ids = _get_rope_index(
+        processor,
+        input_ids=input_ids,
+        video_grid_thw=torch.tensor([[2, 2, 2]]),
+        attention_mask=torch.ones_like(input_ids),
+    )
+
+    assert position_ids.shape == (3, input_ids.numel())
+
+
+def test_qwen2_rope_index_dispatch_preserves_qwen2_path(monkeypatch):
+    import verl.utils.dataset.multiturn_sft_dataset as dataset_module
+
+    expected = torch.tensor([[7]])
+    calls = []
+
+    def fake_qwen2_rope_index(processor, **kwargs):
+        calls.append((processor, kwargs))
+        return expected
+
+    monkeypatch.setattr(dataset_module, "get_qwen2_vl_rope_index", fake_qwen2_rope_index)
+    processor = type("Qwen2_5_VLProcessor", (), {})()
+    input_ids = torch.tensor([1])
+
+    actual = dataset_module._get_rope_index(processor, input_ids=input_ids)
+
+    assert actual is expected
+    assert len(calls) == 1
+    called_processor, called_kwargs = calls[0]
+    assert called_processor is processor
+    assert set(called_kwargs) == {"input_ids"}
+    assert called_kwargs["input_ids"] is input_ids
 
 
 @pytest.mark.parametrize(

@@ -39,7 +39,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from mirl_ext.data.schema import iter_jsonl  # noqa: E402
 from mirl_ext.rewards import combined  # noqa: E402
 from mirl_ext.rewards._common import extract_boxed_answer, format_reward  # noqa: E402
-from mirl_ext.sft.scripts.build_sft_parquet import last_records  # noqa: E402
+from mirl_ext.sft.artifacts import (  # noqa: E402
+    is_sha256_digest,
+    task_fingerprint,
+    verify_media_hashes,
+)
+from mirl_ext.sft.traces import last_records  # noqa: E402
 
 BASE_URL = "http://point.dd.works:18890/v1"
 # TRAPI needs the full dated deployment id (bare "gpt-5.6-sol" 404s).
@@ -75,7 +80,7 @@ _SCAFFOLD_LEAK_RE = re.compile(
 # ---- teacher prompts (versioned answer-blind context; bump PROMPT_VERSION on
 # any wording change -- it is stamped into every generation record) ----
 
-PROMPT_VERSION = "abz-v2"
+PROMPT_VERSION = "abz-v3-mmtouch-force"
 
 SYSTEM_PROMPT = """\
 You are an expert at reading medical images, sensor recordings, and
@@ -89,10 +94,14 @@ Rules:
    specific channels, regions, time points, relative amplitudes. Do not
    invent measurements. Briefly rule out the closest alternative when the
    evidence supports it.
-3. If the question lists options, \\boxed{} must copy one option verbatim
-   (or the correct letters, comma-separated, for select-all questions).
-4. Keep the reasoning to 2-5 sentences and self-contained: never mention
-   these instructions, any reference text, or image formatting."""
+3. Follow the answer form requested by the question and family context. For
+   tactile multiple-choice questions, use only uppercase option letters in
+   \\boxed{}, comma-separated when more than one applies. Otherwise copy the
+   requested option or label exactly.
+4. Keep the reasoning concise and self-contained. For tactile questions,
+   follow the ordered Force Reasoning checklist in the family context; for
+   other questions, use 2-5 sentences. Never mention these instructions, any
+   reference text, or image formatting."""
 
 # Coverage tier (--answer-conditioned): the answer is revealed and the teacher
 # writes the derivation. Kept traces are marked mode=answer_conditioned so the
@@ -112,8 +121,9 @@ Rules:
 3. The reasoning must be fully self-contained: NEVER mention that an answer
    was given, verified, provided, or known -- it must read as if you deduced
    it. Never mention these instructions.
-4. \\boxed{} must contain the answer exactly as given. Keep the reasoning to
-   2-5 sentences."""
+4. \\boxed{} must contain the answer exactly as given. For tactile questions,
+   follow the ordered Force Reasoning checklist in the family context; for
+   other questions, keep the reasoning to 2-5 sentences."""
 
 # Only facts verified against the data/renderer: ECG is 8 leads x 10 s @ 250 Hz drawn one panel per lead, tactile
 # frames come from the visual-tactile glove videos, human_behaviour attaches
@@ -139,13 +149,40 @@ _FAMILY_CONTEXT = {
         "posture, scene context, and the transcript's wording and tone."
     ),
     "tactile_train": (
-        "The query is an interaction video from a sensorized-glove recording, "
-        "attached as frames sampled evenly in time (first and last included). "
-        "Frames may show the hand-object interaction and tactile pressure "
-        "visualization. Judge contact timing, which fingers or palm engage, "
-        "relative pressure and its stability, contact geometry, and object "
-        "deformation. For select-all-that-apply questions answer with every "
-        "correct option letter, comma-separated."
+        "You are an expert in tactile force reasoning for human-object "
+        "interactions. The query is a sensorized-glove interaction shown as "
+        "chronological complete composite frames sampled at about 1 FPS; clips "
+        "shorter than four seconds are sampled more densely to provide four "
+        "distinct frames. Each frame contains synchronized multi-view RGB of "
+        "the hand-object scene on the left and tactile pressure heatmaps on the "
+        "right, usually rendered on a hand model and sometimes also as a raw "
+        "sensor grid. Brighter or warmer regions indicate higher pressure. In "
+        "the hand rendering, the fingers run left-to-right as Pinky, Ring, "
+        "Middle, Index, Thumb, with the palm below.\n\n"
+        "Perform Force Reasoning in this order before answering:\n"
+        "1. Scene Understanding: identify the object, action, and only directly "
+        "visible physical properties.\n"
+        "2. Contact Analysis: determine which fingers or palm regions contact "
+        "the object, the contact region, and whether contact is concentrated or "
+        "distributed.\n"
+        "3. Force Analysis: compare relative pressure intensity and distribution, "
+        "identify the strongest regions, and assess balance or asymmetry without "
+        "inventing measurements.\n"
+        "4. Temporal Force Dynamics: track contact onset, force build-up, peaks, "
+        "drops, shifts, stability, and the final state over the full sequence.\n"
+        "5. Force-Action Coupling: relate the pressure pattern to the observed "
+        "action and check whether tactile evidence supports or contradicts the "
+        "visual appearance.\n"
+        "6. Question-Specific Reasoning: for initial-contact questions inspect "
+        "the earliest genuine contact; for highest-pressure questions inspect "
+        "the full sequence and include ties; for stability look for persistent "
+        "contact versus shifts, drops, or slip; for contact geometry and local "
+        "shape combine RGB shape with the tactile footprint; for force level use "
+        "only visible calibrated evidence and never fabricate Newton values.\n\n"
+        "Use only evidence relevant to the question. For every tactile "
+        "multiple-choice question, put only the uppercase option letter in "
+        "\\boxed{}; if multiple options apply, include every letter separated "
+        "by commas."
     ),
     "haptic_ts_train": (
         "The query is a tactile recording from a sensorized glove, shown as a "
@@ -153,18 +190,11 @@ _FAMILY_CONTEXT = {
         "contact starts and ends, how pressure is distributed and evolves, and "
         "force stability."
     ),
-    "haptic_mcq_train": (
-        "The query is a tactile recording from a sensorized glove, shown as a "
-        "taxel-activation heatmap over time plus a total-force trace. Judge when "
-        "contact starts and ends, how pressure is distributed and evolves, and "
-        "force stability. For select-all-that-apply questions answer with every "
-        "correct option letter, comma-separated."
-    ),
 }
 
 
-
 # ---- shared helpers (imported by gen_sft_episodes) ----
+
 
 def load_api_key() -> str:
     """Read the key from disk/env. Never printed, never logged."""
@@ -193,14 +223,6 @@ def make_client(timeout: float):
 def backoff(attempt: int) -> None:
     """Exponential + jitter. Callers skip it after the final attempt."""
     time.sleep(min(30.0, 2.0**attempt) * (0.5 + random.random()))
-
-
-def read_status(path: Path) -> dict[str, str]:
-    """uid -> last recorded status (status-less records — gen_sft_episodes
-    traces, plus legacy files — count as accepted)."""
-    if not path.exists():
-        return {}
-    return {uid: rec.get("status", "accepted") for uid, rec in last_records([path])[0].items()}
 
 
 def add_teacher_client_args(ap: argparse.ArgumentParser) -> None:
@@ -240,6 +262,7 @@ def _norm(s: str) -> str:
 
 # ---- answer-blind zero-shot generation ----
 
+
 @dataclasses.dataclass(frozen=True)
 class TeacherTask:
     """Everything the request builder may see. Deliberately has NO ground-truth
@@ -251,10 +274,13 @@ class TeacherTask:
     prompt: str
     image_paths: tuple[str, ...]
     frame_paths: tuple[str, ...]
-    staging_version: str | None
+    source_row_fingerprint: str = ""
+    staging_version: str = ""
+    task_fingerprint: str = ""
+    media_sha256: tuple[str, ...] = ()
 
     @classmethod
-    def from_row(cls, t: dict) -> "TeacherTask":
+    def from_row(cls, t: dict) -> TeacherTask:
         return cls(
             uid=t["uid"],
             family=t["family"],
@@ -262,7 +288,10 @@ class TeacherTask:
             prompt=t["prompt"],
             image_paths=tuple(t.get("image_paths") or []),
             frame_paths=tuple(t.get("frame_paths") or []),
-            staging_version=t.get("staging_version"),
+            source_row_fingerprint=t.get("source_row_fingerprint", ""),
+            staging_version=t.get("staging_version", ""),
+            task_fingerprint=t.get("task_fingerprint", ""),
+            media_sha256=tuple(t.get("media_sha256") or []),
         )
 
 
@@ -270,9 +299,37 @@ class MediaMissing(Exception):
     pass
 
 
-def build_request(
-    task: TeacherTask, image_root, answer: str | None = None
-) -> tuple[list[dict], int]:
+def task_media(task: TeacherTask, image_root) -> list[dict]:
+    """Build ordered teacher-media parts and announce timestamped tactile frames."""
+    media = task.frame_paths or task.image_paths  # frames staged oldest -> newest
+    parts = []
+    for raw in media:
+        resolved = _resolve_image(raw, image_root)
+        if resolved is None:
+            raise MediaMissing(raw)
+        name = Path(raw).name
+        # Current tactile staging encodes composite-frame timestamps in
+        # milliseconds. Keep support for legacy interleaved staging so old
+        # artifacts can still be inspected, though generation provenance stops
+        # them from being resumed under the current prompt/staging versions.
+        composite_match = re.search(r"_f\d+_t(\d{6})\.(?:jpe?g|png)$", name, re.I)
+        if composite_match:
+            sec = int(composite_match.group(1)) / 1000.0
+            parts.append(
+                {
+                    "type": "text",
+                    "text": f"[t={sec:g}s synchronized RGB + tactile heatmap]",
+                }
+            )
+        elif "__rgb" in name or "__ts" in name:
+            sec = int(name.rsplit("_t", 1)[1].split(".")[0]) / 10.0
+            label = f"[t={sec:g}s camera]" if "__rgb" in name else f"[t={sec:g}s-{sec + 1:g}s touch sensor]"
+            parts.append({"type": "text", "text": label})
+        parts.append(_img(str(resolved)))
+    return parts
+
+
+def build_request(task: TeacherTask, image_root, answer: str | None = None) -> tuple[list[dict], int]:
     """(chat messages, media count). Order: family context, question, media.
     ``answer`` is the ONE sanctioned path for ground truth into a request --
     only --answer-conditioned mode passes it."""
@@ -281,21 +338,43 @@ def build_request(
     if answer is not None:
         text += f"\n\nVERIFIED ANSWER: {answer}\nWrite the reasoning that derives this answer from the media alone."
     content: list[dict] = [{"type": "text", "text": text}]
-
-    media = task.frame_paths or task.image_paths  # frames staged oldest -> newest
-    for raw in media:
-        resolved = _resolve_image(raw, image_root)
-        if resolved is None:
-            raise MediaMissing(raw)
-        content.append(_img(str(resolved)))
+    media_parts = task_media(task, image_root)
+    content += media_parts
     system = SYSTEM_PROMPT if answer is None else RATIONALIZE_SYSTEM
     return (
         [
             {"role": "system", "content": system},
             {"role": "user", "content": content},
         ],
-        len(media),
+        sum(part.get("type") == "image_url" for part in media_parts),
     )
+
+
+def _verify_teacher_media(tasks: list[TeacherTask], image_root: Path | None) -> None:
+    """Check every to-be-billed task against hashes written during staging."""
+    digest_cache: dict[str, str] = {}
+    errors = []
+    for task in tasks:
+        raw_media = task.frame_paths or task.image_paths
+        if not raw_media:
+            errors.append((task.uid, "no staged teacher media"))
+            continue
+        resolved = []
+        try:
+            for raw in raw_media:
+                path = _resolve_image(raw, image_root)
+                if path is None:
+                    raise FileNotFoundError(raw)
+                resolved.append(path)
+            verify_media_hashes(resolved, task.media_sha256, digest_cache)
+        except (FileNotFoundError, ValueError) as exc:
+            errors.append((task.uid, str(exc)))
+    if errors:
+        preview = ", ".join(f"{uid} ({error})" for uid, error in errors[:8])
+        raise SystemExit(
+            f"{len(errors)} task(s) failed staged-media integrity checks; "
+            f"re-copy or re-stage before billing (first: {preview})"
+        )
 
 
 def validate(text: str, ground_truth: str, task: TeacherTask) -> tuple[bool, str, str | None]:
@@ -356,12 +435,15 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args) -> dict:
         "error": None,
         "ground_truth": ground_truth,  # local audit only; never in the request
         "media_count": 0,
+        "source_row_fingerprint": task.source_row_fingerprint,
         "staging_version": task.staging_version,
+        "task_fingerprint": task.task_fingerprint,
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
     try:
         messages, n_media = build_request(
-            task, args.image_root,
+            task,
+            args.image_root,
             answer=ground_truth if args.answer_conditioned else None,
         )
     except MediaMissing as exc:
@@ -391,13 +473,51 @@ def generate_one(client, task: TeacherTask, ground_truth: str, args) -> dict:
         record["n_attempts"] = attempt
         good, reason, predicted = validate(text, ground_truth, task)
         if good:
-            record.update(
-                status="accepted", accepted_attempt=attempt, response=text, parsed_answer=predicted
-            )
+            record.update(status="accepted", accepted_attempt=attempt, response=text, parsed_answer=predicted)
             return record
         record["attempts"].append({"attempt": attempt, "reason": reason, "predicted": predicted})
     record["status"] = "exhausted"
     return record
+
+
+def _resume_incompatibilities(
+    task: TeacherTask,
+    record: dict,
+    ground_truth: str,
+    *,
+    answer_conditioned: bool,
+) -> tuple[str, ...]:
+    """Explain why a completed trace cannot be reused for this teacher task."""
+    expected = {
+        "family": task.family,
+        "data_source": task.data_source,
+        "ground_truth": ground_truth,
+        "source_row_fingerprint": task.source_row_fingerprint,
+        "staging_version": task.staging_version,
+        "task_fingerprint": task.task_fingerprint,
+        "prompt_version": PROMPT_VERSION,
+    }
+    reasons = tuple(field for field, value in expected.items() if record.get(field) != value)
+    if not answer_conditioned and record.get("mode") != MODE:
+        reasons += ("mode",)
+    return reasons
+
+
+def _pending_tasks(
+    tasks: list[TeacherTask],
+    status: dict[str, str],
+    *,
+    answer_conditioned: bool,
+) -> list[TeacherTask]:
+    """Select the next tier without silently skipping answer-blind attempts.
+
+    The coverage tier is a fallback for tasks that completed every blind
+    attempt with a valid but wrong answer. Fresh and transport-error tasks must
+    first run (or retry) in answer-blind mode.
+    """
+    if answer_conditioned:
+        return [task for task in tasks if status.get(task.uid) == "exhausted"]
+    return [task for task in tasks if status.get(task.uid) not in {"accepted", "exhausted"}]
 
 
 def dry_run(tasks: list[TeacherTask], args, answers=None) -> None:
@@ -425,9 +545,7 @@ def dry_run(tasks: list[TeacherTask], args, answers=None) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tasks", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--image-root", type=Path, default=None)
@@ -436,32 +554,71 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=None, help="omit = endpoint default (1.0)")
     add_teacher_client_args(ap)
     ap.add_argument(
-        "--answer-conditioned", action="store_true",
+        "--answer-conditioned",
+        action="store_true",
         help="coverage tier: reveal the verified answer and generate the "
         "derivation (marked mode=answer_conditioned). Targets rows the "
         "answer-blind pass exhausted (and fresh/errored rows).",
     )
-    ap.add_argument("--dry-run", action="store_true",
-                    help="print one sanitized request per family; no API call")
+    ap.add_argument("--dry-run", action="store_true", help="print one sanitized request per family; no API call")
     args = ap.parse_args()
 
     rows = list(iter_jsonl(args.tasks))
     legacy = sum(1 for t in rows if "answer_style" not in t)
     if legacy:
         raise SystemExit(
-            f"{legacy} tasks lack answer_style (legacy task file) -- re-export with "
-            "export_sft_tasks.py first"
+            f"{legacy} tasks lack answer_style (legacy task file) -- re-export with export_sft_tasks.py first"
         )
     if args.families:
         rows = [t for t in rows if t["family"] in args.families]
+    bad_provenance = [
+        t.get("uid", "<missing uid>")
+        for t in rows
+        if not t.get("staging_version")
+        or not is_sha256_digest(t.get("source_row_fingerprint"))
+        or not t.get("task_fingerprint")
+        or t.get("task_fingerprint") != task_fingerprint(t)
+    ]
+    if bad_provenance:
+        preview = ", ".join(map(str, bad_provenance[:8]))
+        raise SystemExit(
+            f"{len(bad_provenance)} task(s) lack valid staging provenance; "
+            f"re-run stage_media.py with a fresh --out-root (first: {preview})"
+        )
     n_open = sum(1 for t in rows if t["answer_style"] == "open")
     rows = [t for t in rows if t["answer_style"] != "open"]
     answers = {t["uid"]: t["ground_truth"] for t in rows}
     tasks = [TeacherTask.from_row(t) for t in rows]
 
-    status = read_status(args.out)
     skip = {"accepted"} if args.answer_conditioned else {"accepted", "exhausted"}
-    todo = [t for t in tasks if status.get(t.uid) not in skip]
+    previous, skipped_lines = last_records([args.out]) if args.out.exists() else ({}, 0)
+    if skipped_lines:
+        print(f"[warn] skipped {skipped_lines} unparseable trace line(s)")
+    incompatible = []
+    for task in tasks:
+        record = previous.get(task.uid)
+        if record is None or record.get("status", "accepted") not in skip:
+            continue
+        reasons = _resume_incompatibilities(
+            task,
+            record,
+            answers[task.uid],
+            answer_conditioned=args.answer_conditioned,
+        )
+        if reasons:
+            incompatible.append((task.uid, reasons))
+    if incompatible:
+        preview = ", ".join(f"{uid} ({'/'.join(reasons)})" for uid, reasons in incompatible[:8])
+        raise SystemExit(
+            f"{len(incompatible)} completed trace(s) do not match the current tasks; "
+            f"use a new --out trace file (first: {preview})"
+        )
+    status = {uid: record.get("status", "accepted") for uid, record in previous.items()}
+    todo = _pending_tasks(
+        tasks,
+        status,
+        answer_conditioned=args.answer_conditioned,
+    )
     random.Random(args.seed).shuffle(todo)  # --limit then samples across families
     if args.limit:
         todo = todo[: args.limit]
@@ -469,6 +626,7 @@ def main() -> None:
         f"tasks={len(tasks)} skipped_open={n_open} done={sum(1 for s in status.values() if s != 'error')} "
         f"retry_errors={sum(1 for s in status.values() if s == 'error')} to_generate={len(todo)}"
     )
+    _verify_teacher_media(todo, args.image_root)
     if args.dry_run:
         dry_run(todo or tasks, args, answers)
         return
@@ -499,17 +657,25 @@ def main() -> None:
     # Append+flush per record (a kill must not lose paid work); as_completed so a
     # slow call never stalls the resume checkpoint.
     with args.out.open("a") as fh, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futs = {
-            pool.submit(generate_one, client, t, answers[t.uid], args): t
-            for t in todo
-        }
+        futs = {pool.submit(generate_one, client, t, answers[t.uid], args): t for t in todo}
         for done, fut in enumerate(as_completed(futs), 1):
             try:
                 rec = fut.result()
             except Exception as exc:  # noqa: BLE001 -- never drop the other paid records
                 t = futs[fut]
-                rec = {"uid": t.uid, "family": t.family, "data_source": t.data_source,
-                       "status": "error", "error": f"worker:{type(exc).__name__}: {exc}"}
+                rec = {
+                    "uid": t.uid,
+                    "family": t.family,
+                    "data_source": t.data_source,
+                    "status": "error",
+                    "error": f"worker:{type(exc).__name__}: {exc}",
+                    "prompt_version": PROMPT_VERSION,
+                    "mode": "answer_conditioned" if args.answer_conditioned else MODE,
+                    "ground_truth": answers[t.uid],
+                    "source_row_fingerprint": t.source_row_fingerprint,
+                    "staging_version": t.staging_version,
+                    "task_fingerprint": t.task_fingerprint,
+                }
             fh.write(json.dumps(rec) + "\n")
             fh.flush()
             stats[(rec["family"], rec["status"])] += 1
@@ -519,10 +685,7 @@ def main() -> None:
 
     print(f"\n{'family':24s} {'accepted':>8s} {'exhausted':>9s} {'error':>6s}")
     for fam in sorted({f for f, _ in stats}):
-        print(
-            f"{fam:24s} {stats[(fam, 'accepted')]:8d} {stats[(fam, 'exhausted')]:9d} "
-            f"{stats[(fam, 'error')]:6d}"
-        )
+        print(f"{fam:24s} {stats[(fam, 'accepted')]:8d} {stats[(fam, 'exhausted')]:9d} {stats[(fam, 'error')]:6d}")
     print(f"-> {args.out}  (run report_traces.py for pass@1/pass@k and per-class yield)")
 
 

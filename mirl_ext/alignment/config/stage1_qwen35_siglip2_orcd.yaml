@@ -4,6 +4,7 @@ log_level: INFO
 
 data:
   root: ${oc.env:MIRL_ALIGN_DATA_ROOT,data}
+  sample_media_kinds: [signal, image, video]
   train_files:
     - ${data.root}/ecg_train_nan_filtered.parquet
     - ${data.root}/haptic_ts_train.parquet
@@ -15,10 +16,13 @@ data:
     - ${data.root}/climb_valid.parquet
     - ${data.root}/tactile_valid.parquet
   # tactile_{train,valid} supplies both closed QA labels for haptic_ts and
-  # visual-preservation anchors.
+  # RGB+tactile-heatmap visual-preservation anchors.
 
   # The human-behavior archive is not present on ORCD.
   max_video_frames: 8
+  tactile_video_fps: 1.0
+  tactile_min_video_frames: 4
+  tactile_max_video_frames: 24
   max_image_tokens: 1024
 
 model:

@@ -58,7 +58,7 @@ Token cost drops vs the plots: ECG ≈ 320 video tokens + 40 timestamp runs
 Signals were stripped from the GRPO parquets by the plot rewrite, but
 `$DATA/trainedve_raw/<family>_{train,valid}.parquet` (persistent, on /work)
 holds the same row populations with `signals` intact — verified 100%
-row-index-aligned on ground_truth and data_source across all six files. The
+row-index-aligned on ground_truth and data_source across all four files. The
 builder joins **by row index** and asserts ground-truth equality per row (the
 SFT join guard). Rows whose signal is non-finite (`normalize` raises) are
 dropped and counted — expect exactly 4 in ecg_train (the `nan_filtered` delta).
@@ -67,8 +67,8 @@ dropped and counted — expect exactly 4 in ecg_train (the `nan_filtered` delta)
 
 - `mirl_ext/rl/build_ts_native_parquet.py` (new): renders strips to
   `$MIRL_SCRATCH_ROOT/data/ts_native/<family>/` (idempotent, tmp+rename) and
-  writes `<family>_{train,valid}_tsnative.parquet` next to the originals with
-  the **identical Arrow schema** (all six current parquets share
+writes `<family>_{train,valid}_tsnative.parquet` next to the originals with
+  the **identical Arrow schema** (all four current parquets share
   `videos: list<struct<video, min_frames, max_frames>>`; we fill
   `{"video": strip, "min_frames": None, "max_frames": None}` — the None-popping
   in `MIRLDataset._build_messages` already handles that shape). `--probe` mode
@@ -99,3 +99,33 @@ launcher now errors on `TS_TOKENS=1` — no model adapter, no builder here.
   the MIRLDataset fetch + HF video processor; the first smoke run should
   confirm vLLM applies the same processor path (the tactile-mp4 rows already
   validated frames-tensor+metadata flow end-to-end in job 172783).
+
+## Interleaved sparse-video + dense-ts (planned; user decision 2026-09-01)
+
+The thesis-grade experiment: sample VIDEO sparsely (~1 fps or sparser) and the
+tactile TIME SERIES densely (native ~30 Hz), temporally interleaved in one
+prompt. If sparse-video+dense-ts matches or beats dense-video at equal/lower
+token cost, that demonstrates the ts channel is a useful AND efficient input —
+the project's central claim.
+
+- Sampling ratio: start 1:1 (one video frame per ts second), allow 1:2+ (one
+  video frame anchoring multiple ts steps). Interleave in temporal order.
+- Token economics (measured): one ts frame (32x32 taxel map) = 1 merged token;
+  one video frame ~40-80 tokens. Dense ts is ~30-80x cheaper per temporal
+  sample. Median 6 s grasp at 1 fps video + 30 Hz ts ~ 570 tokens; the 154 s
+  compliance sessions need a video cap (~16-24 frames evenly spaced) + full ts
+  (~2.3k tokens) to stay inside the 11264 prompt budget.
+- Recording lengths (n=300): 66% are 3-8 s single grasps; 8.3% exceed 1000
+  frames — all compliance/deformability sessions where squeeze rhythm is the
+  signal. Subsample ts only above ~1024 frames; never linspace-truncate.
+- Teacher traces use the same format: interleaved image sequence
+  [vframe, ts-chunk, vframe, ts-chunk, ...] to the API with a system note
+  defining the alignment; ts chunks must go as an ordered sequence (frames,
+  never one tall stacked strip).
+- Student engineering: true interleaving needs custom media assembly in
+  MIRLDataset (alternating video-frame images and ts-chunk pseudo-video
+  segments); v0 fallback is two time-aligned streams (sparse video + full ts
+  strip) with the alignment stated in the prompt.
+- Eval arms to justify the claim: (a) video-8 baseline (current), (b) video
+  dense, (c) sparse video + dense ts interleaved, (d) ts only. Token-matched
+  comparisons between (b) and (c) carry the argument.
