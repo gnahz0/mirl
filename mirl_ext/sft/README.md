@@ -21,8 +21,9 @@ The mode field keeps the two tiers separable downstream: filter to
 Sources in `schema.OPEN_SOURCES` (haptic_ts descriptions, tactile
 captions/notes, free-text video QA) have no exact-match gate and are skipped.
 
-Cluster parquet commands run inside srun (`srun -p cpu -c 8 --mem=32G …`);
-`data/sft/` is not synced — scp task/trace files.
+Run Parquet preprocessing in a sufficiently provisioned CPU allocation. Keep
+generated task and trace files outside version control and transfer them with
+the site's supported data workflow.
 
 ```bash
 # cluster: split (ratio = sft_frac in config.json), export every SFT row, stage media.
@@ -43,8 +44,8 @@ python mirl_ext/sft/scripts/stage_tactile_v2.py \
     --out-root $MIRL_SCRATCH_ROOT/data/sft_tactile_v10_mmtouch_min4/media
 # emits $DATA/split/sft_tasks.tactile_v2.jsonl
 
-# internet-capable cluster CPU node: preview (no API call), generate (billed;
-# rerun = resume), report
+# On an authorized networked CPU node, preview with --dry-run, generate
+# (potentially billable and resumable), then report.
 python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \
     --out data/sft/traces_v4.jsonl --image-root data/sft/media_v4 --dry-run
 python mirl_ext/sft/scripts/gen_sft_targets.py --tasks data/sft/sft_tasks.staged.jsonl \

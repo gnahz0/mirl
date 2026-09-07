@@ -46,18 +46,12 @@ from mirl_ext.sft.artifacts import (  # noqa: E402
 )
 from mirl_ext.sft.traces import last_records  # noqa: E402
 
-BASE_URL = "http://point.dd.works:18890/v1"
-# TRAPI needs the full dated deployment id (bare "gpt-5.6-sol" 404s).
+# The teacher service uses a dated deployment ID.
 DEFAULT_MODEL = "gpt-5.6-sol_2026-07-09"
 
 MODE = "answer_blind_zero_shot"
 MIN_THINK_CHARS, MAX_THINK_CHARS = 60, 3000
 TRANSPORT_RETRIES = 3  # network retries per reasoning attempt
-
-KEY_PATHS = [
-    Path.home() / ".config/mirl/microsoft_openai_key",
-    Path.home() / "mit/rlm-compaction/.env",
-]
 
 # Oracle-phrase guard (also imported by gen_sft_episodes).
 _LEAK_RE = re.compile(
@@ -198,26 +192,25 @@ _FAMILY_CONTEXT = {
 
 def load_api_key() -> str:
     """Read the key from disk/env. Never printed, never logged."""
-    if os.environ.get("MIRL_OPENAI_KEY"):
-        return os.environ["MIRL_OPENAI_KEY"].strip()
-    for path in KEY_PATHS:
-        if not path.is_file():
-            continue
-        text = path.read_text()
-        if path.name.endswith(".env"):
-            for line in text.splitlines():
-                if line.startswith("OPENAI_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip("'\"")
-        elif text.strip():
-            return text.strip()
-    raise SystemExit("No API key. Put it in ~/.config/mirl/microsoft_openai_key or MIRL_OPENAI_KEY.")
+    key = os.environ.get("MIRL_OPENAI_KEY", "").strip()
+    if key:
+        return key
+    path = Path(os.environ.get("MIRL_OPENAI_KEY_FILE", "~/.config/mirl/microsoft_openai_key")).expanduser()
+    if path.is_file():
+        key = path.read_text().strip()
+        if key:
+            return key
+    raise SystemExit("No teacher API key. Set MIRL_OPENAI_KEY or MIRL_OPENAI_KEY_FILE.")
 
 
 def make_client(timeout: float):
     """Explicit timeout, no SDK retries -- the caller owns retry policy."""
+    base_url = os.environ.get("MIRL_OPENAI_BASE_URL", "").strip()
+    if not base_url:
+        raise SystemExit("Set MIRL_OPENAI_BASE_URL in private mirl.env before generating traces.")
     from openai import OpenAI
 
-    return OpenAI(base_url=BASE_URL, api_key=load_api_key(), timeout=timeout, max_retries=0)
+    return OpenAI(base_url=base_url, api_key=load_api_key(), timeout=timeout, max_retries=0)
 
 
 def backoff(attempt: int) -> None:

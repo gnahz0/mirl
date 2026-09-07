@@ -69,11 +69,11 @@ def report(records: list[dict]) -> None:
     n_completions = len(all_attempts) + sum(
         1 for r in records if r.get("status", "accepted") == "accepted"
     )
-    malformed = sum(1 for a in all_attempts if a["reason"] != "wrong")
-    leaks = sum(1 for a in all_attempts if a["reason"] == "leak")
+    reasons = collections.Counter(a["reason"] for a in all_attempts)
+    malformed = len(all_attempts) - reasons["wrong"]
+    leaks = reasons["leak"]
     print(f"\ncompletions={n_completions} malformed_rate={pct(malformed, n_completions)} "
           f"leak_rejection_rate={pct(leaks, n_completions)}")
-    reasons = collections.Counter(a["reason"] for a in all_attempts)
     if reasons:
         print(f"rejection reasons: {dict(reasons.most_common())}")
 

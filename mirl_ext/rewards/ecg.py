@@ -6,8 +6,6 @@ This is a paper-metric-aligned RL fallback, not a published ECG-JEPA RL recipe.
 Only exact correctness contributes reward; other metrics are diagnostic.
 """
 
-import re
-
 from ._common import extract_boxed_answer, format_reward, jaccard, score_dict, set_prf1
 
 CATEGORIES = [
@@ -22,7 +20,7 @@ CATEGORIES = [
 
 
 def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip().lower())
+    return " ".join(text.lower().split())
 
 
 def _predicted_category(text: str) -> str | None:

@@ -40,7 +40,7 @@ cherry-picked.
 
 - **Environment complete:** `environments/mirl-qwen35` records the working
   `mirl-b200` prefix, exact Conda/Pip artifacts, build order, and CPU/B200 kernel
-  verifier. Runtime and compiler caches are rooted on `/scratch`.
+  verifier. Runtime and compiler caches are rooted below `$MIRL_SCRATCH_ROOT`.
 - **Combined image/video path complete:** `mirl_ext.data.MIRLDataset`, all six
   reward families, the deterministic eight-row real-media smoke fixture, and
   focused tests are ported. Historical general-purpose data builders not
@@ -48,13 +48,18 @@ cherry-picked.
 - **Qwen3.5 combined trainer complete:**
   `examples/mirl/multiverse/run_qwen35_grpo.sh` and
   `examples/mirl/slurm/run_combined_b200.sbatch` replace the historical
-  combined launcher. Two-B200 job `172783` completed all eight examples and 16
-  rollouts through `training/global_step:1` with exit code 0.
+  combined launcher. A two-B200 smoke run completed all eight examples and 16
+  rollouts through `training/global_step:1`.
 - **One upstream regression was reopened:** current Qwen3.5 video prompts use
   one visual-token run per timestamped temporal patch, while returning one
   aggregate video grid. The focused adapter in
   `verl/experimental/agent_loop/agent_loop.py` expands only the position grid;
   its regression tests live in `tests/mirl/test_qwen35_mrope.py`.
+  An initial run completed an optimizer step but failed five video rows with
+  `StopIteration` in `Qwen3VLModel.get_rope_index`: four
+  timestamp-separated token runs were paired with one `[4,H,W]` video grid.
+  Expanding only the position grids to four `[1,H,W]` entries fixed the issue;
+  the aggregate encoder grid stayed unchanged.
 - **Since superseded (was "still deferred"):** Stage-1 visual alignment now
   runs as the production Qwen3.5 pipeline in `mirl_ext/alignment/` (launcher
   `mirl_ext/alignment/run_stage1_b200.sbatch`), and the native time-series

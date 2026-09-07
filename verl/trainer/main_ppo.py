@@ -132,6 +132,15 @@ class TaskRunnerV1:
 
     def run(self, config: DictConfig):
         """Run the PPO training process."""
+        from verl.utils.tracking import configure_wandb_auth
+
+        backends = config.trainer.get("logger", [])
+        if isinstance(backends, str):
+            backends = [backends]
+        if {"wandb", "tracking"}.intersection(backends or []):
+            # Fail on the wrong account before costly media/model preparation.
+            configure_wandb_auth()
+
         import transfer_queue as tq
 
         from verl.trainer.ppo.v1 import get_trainer_cls

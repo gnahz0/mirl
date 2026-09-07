@@ -6,6 +6,13 @@ from mirl_ext.rewards import ecg
 
 
 class ECGRewardTests(unittest.TestCase):
+    def test_whitespace_normalization_includes_unicode_spaces(self):
+        for whitespace in ("\t", "\n", "\r\n", "\u00a0", "\u2003", "\u3000"):
+            answer = whitespace + whitespace.join(("CONDUCTION", "DISTURBANCE")) + whitespace
+            with self.subTest(whitespace=repr(whitespace)):
+                self.assertEqual(ecg._norm(answer), "conduction disturbance")
+                self.assertEqual(ecg.compute_score(answer, "Conduction Disturbance")["score"], 1.0)
+
     def test_all_categories_accept_case_and_whitespace(self):
         for category in ecg.CATEGORIES:
             answer = " \n" + category.upper().replace(" ", "\t  ") + "  "

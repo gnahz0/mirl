@@ -1,22 +1,42 @@
 # MIRL on Qwen3.5
 
-For an agent-to-agent operational handoff with exact job history, environment
-pins, reproduction commands, and deferred work, read
-[`CONTINUATION.md`](CONTINUATION.md) first.
+For the current pipeline, see the [alignment design](qwen35-alignment.md),
+[SFT guide](../../mirl_ext/sft/README.md), and
+[Slurm launchers](../../examples/mirl/slurm/README.md). Environment pins and
+verification commands live in the
+[environment guide](../../environments/mirl-qwen35/README.md).
 
 This worktree ports MIRL's multimodal reinforcement-learning pipeline from the
 historical Qwen3-VL fork to Qwen3.5. It is based on official verl commit
 `6a6242f3d8ec7d9f8b4936f4905144707d91fe3b`; MIRL-specific behavior lives in
 `mirl_ext` instead of patching verl internals.
 
+## Local configuration
+
+For a new deployment, copy [mirl.env.example](../../mirl.env.example) to
+`mirl.env`, fill in your paths and account settings, and run `source mirl.env`
+before submitting jobs. The real configuration and credential files are ignored
+by Git; keep them out of source code and documentation.
+
+Alignment, SFT, and RL share `mirl_ext/wandb_env.sh`. Set
+`WANDB_EXPECTED_USERNAME`, `MIRL_WANDB_ENTITY`, and `WANDB_API_KEY_FILE` in private
+configuration; the helper verifies identity before training. Teacher generation
+also requires `MIRL_OPENAI_BASE_URL` and either `MIRL_OPENAI_KEY_FILE` or
+`MIRL_OPENAI_KEY`. It does not search other project checkouts for credentials.
+
+The shared-account W&B integration is a narrow upstream exception in
+`verl/utils/tracking.py`, `verl/trainer/constants_ppo.py`, and
+`verl/trainer/main_ppo.py`: file-based credentials and an expected identity are
+opt-in, verified in the logging process, and forwarded to Ray as file paths
+rather than secret key values. Other deployments retain upstream authentication.
+
 ## What is implemented
 
 - `mirl_ext.data.MIRLDataset` adapts the existing Parquet files to current
   verl, including JSON-encoded `extra_info`, historical phantom audio markers,
   TorchCodec video decoding, and bounded image/video token policies.
-- `mirl_ext.rewards.combined.compute_score` dispatches the five active MIRL
-  reward families: tactile, human behaviour, medical/CLIMB, ECG, and haptic
-  time series.
+- `mirl_ext.rewards.combined.compute_score` dispatches tactile, human behaviour,
+  medical/CLIMB, and ECG rewards, with legacy haptic scoring kept for compatibility.
 - `examples/mirl/multiverse/run_qwen35_grpo.sh` is the Qwen3.5-9B FSDP2 + vLLM
   GRPO launcher. `SMOKE=1` reduces it to eight real-media examples and one
   optimizer step.
@@ -27,7 +47,8 @@ historical Qwen3-VL fork to Qwen3.5. It is based on official verl commit
   consuming nonexistent media grids.
 - `environments/mirl-qwen35` defines and verifies the B200-specific `mirl-b200`
   stack. Temporary files, pip downloads, Ray sockets, and compiler caches live
-  on `/scratch`, while source, logs, and Parquet indexes remain on `/work`.
+  below `$MIRL_SCRATCH_ROOT`, while source, logs, and Parquet indexes remain
+  below `$MIRL_CLUSTER_ROOT`.
 
 The current GRPO launcher trains on the closed, gradable ECG, CLIMB, human
 behaviour, and tactile sets; open-ended haptic descriptions are deliberately
@@ -100,11 +121,11 @@ a fresh run; do not release an old held submission with stale labels/settings.
 | `mirl_ext/data/build_smoke.py` | Deterministic eight-row fixture from real MIRL data |
 | `mirl_ext/rewards/` | Five active reward implementations and combined dispatcher |
 | `mirl_ext/alignment/` | Qwen3.5 vision/SigLIP2 ECG+tactile alignment pipeline |
+| `mirl_ext/sft/` | SFT data preparation, training, and export |
 | `examples/mirl/multiverse/run_qwen35_grpo.sh` | Local/allocation launcher |
 | `examples/mirl/slurm/run_combined_b200.sbatch` | Two-B200 one-step smoke submission |
 | `environments/mirl-qwen35/` | Rebuild script, verifier, and exact environment records |
 | `tests/mirl/` | Dataset, reward, and Qwen3.5 video-MRoPE regressions |
-| `docs/mirl/CONTINUATION.md` | Frozen 2026-07-21 migration handoff (current state: `mirl_ext/CLAUDE.md`) |
 | `docs/mirl/qwen35-migration-ledger.md` | Historical file-by-file migration decisions |
 
 ## Verify `mirl-b200`
@@ -139,8 +160,8 @@ context settings only after the smoke remains green.
 
 ## Verified result
 
-On 2026-07-21, Slurm job `172783` completed with exit code 0 on two B200s. It
-used all eight fixture rows (three image and five video examples), generated
-two rollouts per row, updated the actor once (`training/global_step:1`), and
-processed 25,232 tokens. The environment preflight exercised FlashAttention,
-causal-conv1d, and the FLA gated-delta kernel on the B200 before training.
+A two-B200 smoke run completed all eight fixture rows (three image and five
+video examples), generated two rollouts per row, updated the actor once
+(`training/global_step:1`), and processed 25,232 tokens. The environment
+preflight exercised FlashAttention, causal-conv1d, and the FLA gated-delta
+kernel before training.

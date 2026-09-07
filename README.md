@@ -30,9 +30,9 @@ verl is the open-source version of **[HybridFlow: A Flexible and Efficient RLHF 
 > tested Qwen3.5 timestamped-video MRoPE compatibility fix. Start with the
 > [MIRL Qwen3.5 overview](docs/mirl/README.md) for the architecture, environment,
 > data contract, and smoke-test command. The detailed historical disposition is
-> in the [migration ledger](docs/mirl/qwen35-migration-ledger.md). Agents
-> resuming the work should start with the current
-> [continuation handoff](docs/mirl/CONTINUATION.md).
+> in the [migration ledger](docs/mirl/qwen35-migration-ledger.md). Current
+> training instructions are in the [SFT guide](mirl_ext/sft/README.md) and
+> [Slurm launcher guide](examples/mirl/slurm/README.md).
 
 verl is flexible and easy to use with:
 

@@ -118,4 +118,24 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    if os.environ.get("WANDB_API_KEY_FILE"):
+        # Forward non-secret logging settings explicitly: an existing Ray
+        # daemon may have another user's environment. Never include the key in
+        # runtime_env, which is serialized and printed by the training driver.
+        for key in (
+            "WANDB_API_KEY_FILE",
+            "WANDB_EXPECTED_USERNAME",
+            "WANDB_ENTITY",
+            "WANDB_RUN_ID",
+            "WANDB_RESUME",
+            "WANDB_MODE",
+            "WANDB_BASE_URL",
+            "WANDB_DIR",
+            "WANDB_DATA_DIR",
+            "WANDB_CONFIG_DIR",
+            "WANDB_CACHE_DIR",
+            "NETRC",
+        ):
+            if key in os.environ:
+                runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

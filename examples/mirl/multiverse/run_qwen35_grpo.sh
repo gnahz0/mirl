@@ -130,25 +130,6 @@ if [[ "${SMOKE}" == "1" ]]; then
     SP_SIZE="${SMOKE_SP_SIZE:-1}"
 fi
 
-# Force OUR wandb identity: the shared account's ~/.netrc holds a colleague's
-# login, and Ray workers resolved to it once (run landed in the wrong entity).
-# Env key + entity beat the netrc (verified); fail loudly if the key is absent.
-if [[ "${SMOKE}" != "1" ]]; then
-    WANDB_KEY_FILE="$MIRL_CLUSTER_ROOT/.wandb_key"
-    if [[ ! -r "${WANDB_KEY_FILE}" ]]; then
-        echo "missing W&B key: ${WANDB_KEY_FILE}" >&2
-        exit 1
-    fi
-    export WANDB_API_KEY="$(<"${WANDB_KEY_FILE}")"
-    export WANDB_ENTITY="${MIRL_WANDB_ENTITY:?source mirl.env first}"
-    # Shared-account netrc trap, layer 2: some Ray worker-spawn path resolved
-    # the COLLEAGUE's key from /home/dvdai_mit despite driver env forcing
-    # (jobs 632349/634092: actor "logged in as weianxie" -> CommError). Point
-    # HOME at our namespace so ~/.netrc is OUR netrc in every child process.
-    export HOME="$MIRL_CLUSTER_ROOT"
-    echo "wandb: forcing entity=${WANDB_ENTITY} (key file: ${WANDB_KEY_FILE}; HOME=${HOME})"
-fi
-
 CKPT_DIR="${CKPT_DIR:-$MIRL_SCRATCH_ROOT/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 LOG_DIR="${LOG_DIR:-$MIRL_CLUSTER_ROOT/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}" "${LOG_DIR}"
@@ -247,6 +228,9 @@ args=(
 )
 
 cd "${MIRL_ROOT}"
+if [[ "${SMOKE}" != "1" && "${DRY_RUN:-0}" != "1" ]]; then
+    source mirl_ext/wandb_env.sh
+fi
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     exec "${PYTHON}" -m verl.trainer.main_ppo "${args[@]}" --cfg job "$@"
 fi

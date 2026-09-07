@@ -1,10 +1,8 @@
 # MIRL Qwen3.5 environment
 
 This directory records the B200-specific environment used by the Qwen3.5
-migration. The active prefix is
-`$MIRL_PYENV`; the pre-migration environment is
-preserved at
-`$MIRL_PYENV-pre-qwen35-20260720`.
+migration. The active prefix is `$MIRL_PYENV`; use the build script below to
+create an isolated test prefix.
 
 ## Pinned stack
 

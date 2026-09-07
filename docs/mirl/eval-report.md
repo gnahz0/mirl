@@ -2,7 +2,7 @@
 
 - Offline harness: `mirl_ext/eval/run_boxed_eval.py`, greedy, GRPO val parquets, RL scorer, RL 11264-token prompt filter.
 - base = Qwen3.5-9B snapshot; pilot = SFT on 20% traces (p20-hom); full = SFT on all traces (sft-full-v1, step 3992).
-- serving = same full-SFT model measured by the GRPO stack (`val_before_train`, job 601639, closed sources only, n<=40/source for video families).
+- serving = same full-SFT model measured by the GRPO stack (`val_before_train`, closed sources only, n<=40/source for video families).
 - `acc` is exact-match on the boxed answer -- fine for single-label sources, punishing for multi-label (see chest_xray note).
 
 ## Family summary (offline)

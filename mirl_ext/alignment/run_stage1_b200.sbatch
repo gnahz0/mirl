@@ -50,15 +50,10 @@ export MIRL_OUTPUT_DIR="${MIRL_SCRATCH_ROOT}/checkpoints/alignment_qwen35_canoni
 mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
   "$XDG_CACHE_HOME" "$WANDB_DIR" "$WANDB_DATA_DIR" "$MIRL_OUTPUT_DIR"
 
-if [ -r "$MIRL_CLUSTER_ROOT/.wandb_key" ]; then
-  export WANDB_API_KEY="$(<"$MIRL_CLUSTER_ROOT/.wandb_key")"
-  export WANDB_MODE=online
-else
-  export WANDB_MODE=offline
-fi
-
 source "${MIRL_CONDA_SH:?}"
 conda activate "${MIRL_PYENV:?}"
+
+source mirl_ext/wandb_env.sh
 
 python -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' || {
   echo "FATAL: CUDA is unavailable on $(hostname)"

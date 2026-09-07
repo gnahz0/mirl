@@ -33,6 +33,32 @@ MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
 
 
+def configure_wandb_auth() -> str | None:
+    """Opt-in file credentials, verified in the process that will log the run.
+
+    Only the file path crosses Ray/Hydra configuration boundaries; the key is
+    loaded into this process and never written to the shared account's netrc.
+    """
+    key_file = os.environ.get("WANDB_API_KEY_FILE")
+    if not key_file:
+        return None
+    expected = os.environ.get("WANDB_EXPECTED_USERNAME")
+    if not expected:
+        raise ValueError("WANDB_EXPECTED_USERNAME is required with WANDB_API_KEY_FILE")
+    key = Path(key_file).read_text().strip()
+    if not key:
+        raise ValueError("WANDB_API_KEY_FILE is empty")
+    # Override a Ray daemon's inherited credential before SDK initialization.
+    os.environ["WANDB_API_KEY"] = key
+    import wandb
+
+    actual = wandb.Api(api_key=key).viewer.username
+    if actual.casefold() != expected.casefold():
+        raise RuntimeError(f"W&B authenticated as {actual!r}, expected {expected!r}")
+    logger.info("W&B credential verified in process %s: %s", os.getpid(), actual)
+    return actual
+
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 
@@ -75,9 +101,14 @@ class Tracking:
 
             import wandb
 
-            settings = None
+            verified_user = configure_wandb_auth()
+            settings_kwargs = {}
+            if verified_user is not None:
+                # Explicit settings also override any stale SDK setup state.
+                settings_kwargs["api_key"] = os.environ["WANDB_API_KEY"]
             if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+                settings_kwargs["https_proxy"] = config["trainer"]["wandb_proxy"]
+            settings = wandb.Settings(**settings_kwargs) if settings_kwargs else None
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb

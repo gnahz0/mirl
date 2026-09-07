@@ -85,14 +85,7 @@ echo "verified audited SFT artifacts $AUDIT_SHA; run=$EXPERIMENT_NAME"
 
 # Auto-resume is safe only inside the checkpoint directory bound to this exact
 # audit manifest. Any rebuilt parquet/media manifest gets a new directory.
-WANDB_KEY_FILE=$MIRL_CLUSTER_ROOT/.wandb_key
-if [ ! -r "$WANDB_KEY_FILE" ]; then
-    echo "missing W&B key: $WANDB_KEY_FILE" >&2
-    exit 1
-fi
-export WANDB_API_KEY="$(<"$WANDB_KEY_FILE")"
-export WANDB_ENTITY=$MIRL_WANDB_ENTITY
-export WANDB_MODE=online
+source mirl_ext/wandb_env.sh
 export WANDB_RUN_ID="mirl-sft-$EXPERIMENT_NAME"
 export WANDB_RESUME=allow
 export WANDB_DIR=$MIRL_CLUSTER_ROOT/wandb

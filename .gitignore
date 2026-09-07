@@ -95,6 +95,12 @@ celerybeat-schedule
 # dotenv
 .env
 
+# Private deployment configuration and credentials (use mirl.env.example).
+/mirl.env
+/CLAUDE.local.md
+/.wandb_key
+/.netrc
+
 # virtualenv
 venv/
 .venv/
