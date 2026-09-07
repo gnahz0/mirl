@@ -85,11 +85,12 @@ else
 fi
 
 PROJECT_NAME="${PROJECT_NAME:-multiverse-qwen35}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-combined-qwen35-9b}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-combined-qwen35-9b-paper-hbacls}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-11264}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
+OVERLONG_BUFFER_LENGTH="${OVERLONG_BUFFER_LENGTH:-512}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-15360}"
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-8192}"
 ROLLOUT_N="${ROLLOUT_N:-5}"
@@ -105,7 +106,7 @@ DATALOADER_WORKERS="${DATALOADER_WORKERS:-8}"
 
 if [[ "${SMOKE}" == "1" ]]; then
     smoke_file="${DATA_ROOT}/qwen35_smoke.parquet"
-    "${PYTHON}" -m mirl_ext.data.build_smoke --data-root "${DATA_ROOT}" --output "${smoke_file}"
+    "${PYTHON}" -m mirl_ext.data.build_smoke --data-root "${TRAIN_ROOT}" --output "${smoke_file}"
     train_files="[\"${smoke_file}\"]"
     val_files="[\"${smoke_file}\"]"
     EXPERIMENT_NAME="${SMOKE_EXPERIMENT_NAME:-smoke-qwen35-9b}"
@@ -113,6 +114,7 @@ if [[ "${SMOKE}" == "1" ]]; then
     PPO_MINI_BATCH_SIZE=8
     MAX_PROMPT_LENGTH=4096
     MAX_RESPONSE_LENGTH=128
+    OVERLONG_BUFFER_LENGTH=32
     MAX_MODEL_LEN=4224
     MAX_BATCHED_TOKENS=4096
     ROLLOUT_N=2
@@ -181,6 +183,14 @@ args=(
     +data.max_image_tokens_total=24576
     "reward.custom_reward_function.path=${MIRL_ROOT}/mirl_ext/rewards/combined.py"
     reward.custom_reward_function.name=compute_score
+    # Match the original MIRL baseline's DAPO length shaping while retaining
+    # modality-specific scores. This does not enable DAPO group filtering.
+    reward.reward_manager.name=dapo
+    +reward.reward_kwargs.overlong_buffer_cfg.enable=True
+    "+reward.reward_kwargs.overlong_buffer_cfg.len=${OVERLONG_BUFFER_LENGTH}"
+    +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0
+    +reward.reward_kwargs.overlong_buffer_cfg.log=True
+    "+reward.reward_kwargs.max_resp_len=${MAX_RESPONSE_LENGTH}"
     "actor_rollout_ref.model.path=${MODEL_PATH}"
     actor_rollout_ref.model.use_remove_padding=False
     actor_rollout_ref.model.enable_gradient_checkpointing=True

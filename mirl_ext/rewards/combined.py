@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mirl_ext.data.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, TACTILE_SOURCES
+from mirl_ext.data.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, OPEN_SOURCES, TACTILE_SOURCES
 from mirl_ext.rewards import ecg, haptic_ts, human_behaviour, medical, tactile
 
 
@@ -30,6 +30,8 @@ def compute_score(
     if data_source in TACTILE_SOURCES:
         return tactile.compute_score(solution_str, ground_truth)
     if data_source in HUMAN_BEHAVIOUR_SOURCES:
+        if data_source in OPEN_SOURCES:
+            raise NotImplementedError(f"HBA classification reward cannot grade open QA: {data_source!r}")
         return human_behaviour.compute_score(solution_str, ground_truth)
     if data_source in MEDICAL_SOURCES:
         return medical.compute_score(solution_str, ground_truth)

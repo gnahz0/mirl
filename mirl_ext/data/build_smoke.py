@@ -11,14 +11,20 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from mirl_ext.data.schema import (
+    HUMAN_BEHAVIOUR_SOURCES,
+    MEDICAL_SOURCES,
+    OPEN_SOURCES,
+    TACTILE_SOURCES,
+)
 
 SELECTIONS = {
-    "ecg_train.parquet": 1,
-    "haptic_ts_train.parquet": 1,
-    "climb_train.parquet": 1,
-    "human_behaviour_train.parquet": 2,
-    "tactile_train.parquet": 2,
+    "ecg_train.parquet": 2,
+    "climb_train.parquet": 2,
+    "human_behaviour_train_closed.parquet": 2,
+    "tactile_train_closed.parquet": 2,
 }
+ACTIVE_SMOKE_SOURCES = frozenset({"ecg"} | MEDICAL_SOURCES | HUMAN_BEHAVIOUR_SOURCES | TACTILE_SOURCES) - OPEN_SOURCES
 
 
 def _prompt_chars(row: dict) -> int:
@@ -41,6 +47,10 @@ def _usable(row: dict, max_video_bytes: int) -> bool:
     )
 
 
+def _closed(row: dict) -> bool:
+    return str(row.get("data_source", "")) in ACTIVE_SMOKE_SOURCES
+
+
 def build(data_root: Path, output: Path, max_video_bytes: int, scan_rows: int = 2048) -> None:
     selected_tables = []
     for filename, count in SELECTIONS.items():
@@ -51,17 +61,23 @@ def build(data_root: Path, output: Path, max_video_bytes: int, scan_rows: int = 
             for row in batch.to_pylist():
                 if row_index >= scan_rows:
                     break
-                if _usable(row, max_video_bytes):
+                if _closed(row) and _usable(row, max_video_bytes):
                     candidates.append((_prompt_chars(row), row_index, row))
                 row_index += 1
             if row_index >= scan_rows:
                 break
         candidates = heapq.nsmallest(count, candidates, key=lambda candidate: candidate[:2])
         if len(candidates) < count:
-            raise RuntimeError(f"{filename}: found {len(candidates)} usable rows, need {count}")
-        selected_tables.append(pa.Table.from_pylist([candidate[2] for candidate in candidates], schema=parquet.schema_arrow))
+            raise RuntimeError(f"{filename}: found {len(candidates)} closed usable rows, need {count}")
+        selected_tables.append(
+            pa.Table.from_pylist([candidate[2] for candidate in candidates], schema=parquet.schema_arrow)
+        )
 
-    combined = pa.concat_tables(selected_tables)
+    combined = pa.concat_tables(selected_tables, promote_options="default")
+    # Each source parquet carries HF feature metadata for its original schema.
+    # After Arrow promotes source-specific null fields, those stale features no
+    # longer describe the merged table; let HF infer them from the unified schema.
+    combined = combined.replace_schema_metadata(None)
     output.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(combined, output, compression="zstd")
 

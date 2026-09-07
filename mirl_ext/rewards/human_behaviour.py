@@ -1,36 +1,46 @@
-"""Reward scoring for human behaviour prediction tasks.
+"""Human Behavior Atlas's closed-classification reward: 0.8 exact + 0.2 format.
 
-Ground truth and predictions are single words/phrases (e.g. "anger", "happy").
-Exact-match accuracy + token similarity + format compliance.
+Implements only the CLS scoring semantics from HBA's HARPO reward, not HARPO's
+advantage estimator, QA embedding reward, or inner overlength penalty. veRL's
+DAPO reward manager handles response-token length separately, exactly once.
 
-Training reward = acc + format_weight * format + sim_weight * similarity
+Source: MIT-MI/human_behavior_atlas, commit 9cd5ced80243eb02d85a8aa49a3f373544d9d3a3
+https://github.com/MIT-MI/human_behavior_atlas/blob/9cd5ced80243eb02d85a8aa49a3f373544d9d3a3/training/rl/reward_function/human_behaviour_harpo.py
+
+Precision/recall/F1/Jaccard compare whole categorical labels, not their words.
+They are per-response diagnostics, not dataset-level macro or weighted F1.
+``similarity`` aliases label-set Jaccard for the shared metric interface; it
+does not contribute an additional shaping term.
 """
 
-from difflib import SequenceMatcher
+import re
 
-from ._common import extract_boxed_answer, format_reward, jaccard, score_dict, set_prf1
+from ._common import format_reward, jaccard, score_dict, set_prf1
 
 
-def compute_score(
-    predict_str: str,
-    ground_truth: str,
-    format_weight: float = 0.2,
-    sim_weight: float = 0.5,
-) -> dict:
-    boxed = extract_boxed_answer(predict_str)
-    pred_label = (boxed or "").lower()
-    gt_label = ground_truth.lower()
+def compute_score(predict_str: str, ground_truth: str) -> dict:
+    response = re.sub(r"\s*(<|>|/)\s*", r"\1", predict_str or "")
+    # Match HBA's first-match priority, including its unboxed-text fallback.
+    matches = (
+        re.search(pattern, response) for pattern in (r"\\boxed{([^}]*)}", r"\[(.*?)\]", r"<answer>(.*?)</answer>")
+    )
+    pred_label = next((match.group(1) for match in matches if match), response).strip().lower()
+    gt_label = (ground_truth or "").strip().lower()
 
-    fmt = format_reward(predict_str)
-    acc = 1.0 if pred_label == gt_label else 0.0
-    pred_tokens, gt_tokens = set(pred_label.split()), set(gt_label.split())
-    precision, recall, f1 = set_prf1(pred_tokens, gt_tokens)
-    jacc = jaccard(pred_tokens, gt_tokens)
-    similarity = 0.5 * jacc + 0.5 * SequenceMatcher(None, pred_label, gt_label).ratio()
-
-    score = acc + format_weight * fmt + sim_weight * similarity
+    fmt = format_reward(response)
+    acc = float(pred_label == gt_label)
+    pred_labels = {pred_label} if pred_label else set()
+    gt_labels = {gt_label} if gt_label else set()
+    precision, recall, f1 = set_prf1(pred_labels, gt_labels)
+    jacc = jaccard(pred_labels, gt_labels)
 
     return score_dict(
-        score=score, acc=acc, precision=precision, recall=recall,
-        f1=f1, jacc=jacc, similarity=similarity, fmt=fmt,
+        score=0.8 * acc + 0.2 * fmt,
+        acc=acc,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        jacc=jacc,
+        similarity=jacc,
+        fmt=fmt,
     )

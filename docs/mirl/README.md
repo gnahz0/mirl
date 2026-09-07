@@ -44,6 +44,54 @@ therefore keeps padding removal and Ulysses sequence parallelism disabled, in
 line with the current upstream Qwen3.5 video recipe, while retaining FSDP2 for
 training sharding.
 
+## Selected reward sources (2026-09-07)
+
+The recipe is **GRPO with one veRL DAPO length penalty**, not the full HARPO
+or DAPO training algorithm. `combined.compute_score` routes each response to
+one task scorer; unrelated modalities' rewards are not summed together.
+
+- **Tactile:** unchanged MMTouch reward, `0.5 * exact_set + 0.4 * label_jaccard
+  + 0.1 * format`, documented in the MMTouch appendix, pp. 5–6. The source
+  manuscript is not a separately public reward-code repository.
+- **Human behavior:** HBA's HARPO **classification branch**, `0.8 * exact
+  + 0.2 * format`, from [the pinned upstream file](https://github.com/MIT-MI/human_behavior_atlas/blob/9cd5ced80243eb02d85a8aa49a3f373544d9d3a3/training/rl/reward_function/human_behaviour_harpo.py).
+  The small adapter preserves its first-box/bracket/answer/plain-text extraction,
+  tag normalization, and stripped lowercase comparison. It does not use QA
+  embeddings or HBA's inner length penalty. Open human-behavior QA is rejected.
+- **Medical/CLIMB:** reward is 1 only for an exact normalized diagnosis-set
+  match, otherwise 0. This uses the order-independent correctness criterion
+  in [CLIMB-QA Appendix B](https://arxiv.org/html/2503.07667v1#A2).
+- **ECG:** reward is 1 only for the exact normalized category, otherwise 0.
+  It preserves the seven-category single-label task provided by
+  [CLIMB's ECG adapter](https://github.com/DDVD233/CLIMB/blob/0f767b1ea168810b998981078dc27e7f9a4e4675/src/datasets/ecg/ptbxl.py#L35),
+  not the original ECG-JEPA five-superclass multilabel task.
+
+The medical/ECG repositories publish evaluation criteria, not corresponding
+text-based RL reward functions. Using their correctness criteria as RL rewards
+is an explicit MIRL adaptation, **not** reproduction of a published RL recipe.
+There are no word-similarity or format bonuses for these two families. This
+replaces the older MIRL branch's custom weighted rewards and prevents its
+medical separator/order errors and ECG substring/negation false positives.
+Medical answers still use the last box; ECG accepts a last boxed answer or
+an otherwise bare exact category, not arbitrary prose. The SFT response-structure
+gate and ECG exact-label special case are unchanged. Human-behavior/medical
+acceptance uses the updated scorers, so parser-normalization edge cases can change.
+
+All scorers expose the same eight numeric diagnostic keys for veRL mixed-batch
+collation. HBA/ECG diagnostics compare whole labels and medical diagnostics
+compare diagnosis sets. These per-response F1 values are **not** dataset-level
+macro/weighted classification F1. Compare evaluation outputs only when both
+models were scored with the same recipe; old aggregate scores are not directly
+comparable and existing saved responses should be rescored before comparison.
+
+The outer DAPO manager alone applies `min((3584 - response_tokens) / 512, 0)`
+at response cap 4096 and logs `overlong_reward`/`overlong`. It leaves the raw
+task `score` available. GRPO then standardizes the five rewards within each
+prompt; KL stays in the actor loss. Sampling proportions, token-mean reduction,
+and clipping are unchanged. The GRPO launcher's default run name includes `paper-hbacls`
+to distinguish this objective from older rewards. Start from the SFT export in
+a fresh run; do not release an old held submission with stale labels/settings.
+
 ## Repository map
 
 | Path | Purpose |

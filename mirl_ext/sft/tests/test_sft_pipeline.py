@@ -224,8 +224,8 @@ def test_wrong_answers_are_wrong_not_repaired():
 
 
 def test_ecg_gate_requires_verbatim_category():
-    # rewards.ecg substring-matches category mentions ("Abnormal" contains
-    # "Normal"); the SFT keep-gate must demand the exact label instead.
+    # Both RL and SFT require the exact label, including rejection of
+    # "no Myocardial Infarction"; SFT also checks response structure.
     t = _task(data_source="ecg")
     assert not _v(GOOD_THINK + " \\boxed{Abnormal}", gt="Normal", task=t)[0]
     assert not _v(GOOD_THINK + " \\boxed{no Myocardial Infarction}", gt="Myocardial Infarction", task=t)[0]

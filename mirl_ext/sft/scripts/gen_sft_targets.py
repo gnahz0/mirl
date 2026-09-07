@@ -406,8 +406,8 @@ def validate(text: str, ground_truth: str, task: TeacherTask) -> tuple[bool, str
         return False, "format", None
     predicted = _norm(boxed)
     if task.data_source == "ecg":
-        # rewards.ecg matches category MENTIONS (lenient partial credit for RL) and
-        # would accept "Abnormal" for "Normal"; the keep-gate needs the verbatim label.
+        # Both RL and SFT require an exact category label; SFT additionally
+        # requires the response structure checked above.
         correct = predicted == _norm(ground_truth)
     else:
         correct = combined.compute_score(task.data_source, text, ground_truth)["acc"] == 1.0
@@ -544,6 +544,16 @@ def dry_run(tasks: list[TeacherTask], args, answers=None) -> None:
         print(json.dumps(messages, indent=2)[:6000])
 
 
+def _verify_reward_scorers(tasks: list[TeacherTask], answers: dict[str, str]) -> None:
+    """Check each route with a real target before making any teacher requests."""
+    representatives = {str(task.data_source): task for task in tasks}
+    for source, task in sorted(representatives.items()):
+        try:
+            combined.compute_score(source, "", answers[task.uid])
+        except (NotImplementedError, ValueError) as exc:
+            raise SystemExit(f"reward preflight failed for {source!r}: {exc}") from exc
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tasks", type=Path, required=True)
@@ -633,15 +643,7 @@ def main() -> None:
     if not todo:
         return
 
-    # Fail before billing if any data_source has no reward scorer to validate with.
-    bad = []
-    for src in sorted({str(t.data_source) for t in todo}):
-        try:
-            combined.compute_score(src, "<think>x</think> \\boxed{y}", "y")
-        except NotImplementedError:
-            bad.append(src)
-    if bad:
-        raise SystemExit(f"no reward scorer for data_source(s) {bad} -- fix before generating")
+    _verify_reward_scorers(todo, answers)
     # A killed run can leave a partial last line; never fuse the next record onto it.
     if args.out.exists() and args.out.stat().st_size:
         with args.out.open("rb") as fh:
