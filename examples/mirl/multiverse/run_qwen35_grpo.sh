@@ -85,7 +85,7 @@ else
 fi
 
 PROJECT_NAME="${PROJECT_NAME:-multiverse-qwen35}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-combined-qwen35-9b-paper-hbacls}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-combined-qwen35-9b-climbf1}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-11264}"
@@ -131,6 +131,7 @@ if [[ "${SMOKE}" == "1" ]]; then
 fi
 
 CKPT_DIR="${CKPT_DIR:-$MIRL_SCRATCH_ROOT/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-$MIRL_SCRATCH_ROOT/validation/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 LOG_DIR="${LOG_DIR:-$MIRL_CLUSTER_ROOT/logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}" "${LOG_DIR}"
 
@@ -220,6 +221,8 @@ args=(
     "trainer.nnodes=${NNODES}"
     trainer.balance_batch=False
     "trainer.default_local_dir=${CKPT_DIR}"
+    "trainer.validation_data_dir=${VALIDATION_DATA_DIR}"
+    "+trainer.log_reward_group_metrics=${LOG_REWARD_GROUP_METRICS:-True}"
     "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
     "trainer.save_freq=${SAVE_FREQ}"
     "trainer.test_freq=${TEST_FREQ}"

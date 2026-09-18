@@ -12,6 +12,7 @@ from typing import Any
 import torch
 from PIL import Image
 
+from mirl_ext.data.prompts import normalize_prompt_messages
 from mirl_ext.data.schema import HUMAN_BEHAVIOUR_SOURCES, MEDICAL_SOURCES, TACTILE_SOURCES
 from mirl_ext.data.schema import extra_info as parse_extra_info
 from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -129,6 +130,11 @@ class MIRLDataset(RLHFDataset):
 
     def _build_messages(self, example: dict, key: str):
         normalized = copy.deepcopy(example)
+        normalized[key] = normalize_prompt_messages(
+            normalized[key],
+            data_source=normalized.get("data_source"),
+            dataset=parse_extra_info(normalized).get("dataset"),
+        )
         if not (normalized.get(self.audio_key, None) or []):
             for message in normalized[key]:
                 content = message.get("content")

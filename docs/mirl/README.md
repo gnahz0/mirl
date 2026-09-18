@@ -65,7 +65,7 @@ therefore keeps padding removal and Ulysses sequence parallelism disabled, in
 line with the current upstream Qwen3.5 video recipe, while retaining FSDP2 for
 training sharding.
 
-## Selected reward sources (2026-09-07)
+## Selected reward sources (2026-09-17)
 
 The recipe is **GRPO with one veRL DAPO length penalty**, not the full HARPO
 or DAPO training algorithm. `combined.compute_score` routes each response to
@@ -79,24 +79,28 @@ one task scorer; unrelated modalities' rewards are not summed together.
   The small adapter preserves its first-box/bracket/answer/plain-text extraction,
   tag normalization, and stripped lowercase comparison. It does not use QA
   embeddings or HBA's inner length penalty. Open human-behavior QA is rejected.
-- **Medical/CLIMB:** reward is 1 only for an exact normalized diagnosis-set
-  match, otherwise 0. This uses the order-independent correctness criterion
-  in [CLIMB-QA Appendix B](https://arxiv.org/html/2503.07667v1#A2).
+- **Medical/CLIMB:** `0.5 * diagnosis-set F1`, the condition-answer term in
+  [MIRL's selected batch reward](https://github.com/DDVD233/mirl/blob/16860b932c0300ba1ce9cee7c7b7ce975abdd96d/examples/reward_function/medical.py#L369).
+  The [CLIMB GRPO launcher](https://github.com/DDVD233/mirl/blob/16860b932c0300ba1ce9cee7c7b7ce975abdd96d/examples/fairness/climb_vanilla_training_grpo.sh)
+  selects this batch function, not the different scalar function in that file.
+  We omit bbox/JSON auxiliaries because these tasks request condition answers,
+  not localization; the upstream batch reward does not include its logged length score.
+  Exact set accuracy remains a separate validation metric.
 - **ECG:** reward is 1 only for the exact normalized category, otherwise 0.
   It preserves the seven-category single-label task provided by
   [CLIMB's ECG adapter](https://github.com/DDVD233/CLIMB/blob/0f767b1ea168810b998981078dc27e7f9a4e4675/src/datasets/ecg/ptbxl.py#L35),
   not the original ECG-JEPA five-superclass multilabel task.
 
-The medical/ECG repositories publish evaluation criteria, not corresponding
-text-based RL reward functions. Using their correctness criteria as RL rewards
-is an explicit MIRL adaptation, **not** reproduction of a published RL recipe.
-There are no word-similarity or format bonuses for these two families. This
-replaces the older MIRL branch's custom weighted rewards and prevents its
-medical separator/order errors and ECG substring/negation false positives.
+The CLIMB benchmark repository supplies evaluation criteria; the separate MIRL
+RL repository supplies the medical F1 reward above. ECG's exact-category reward
+remains an adaptation of its task's evaluation criterion. Neither scorer adds
+word-similarity or format bonuses. Medical parsing retains case/whitespace and
+mixed-separator normalization; ECG retains its substring/negation safeguards.
 Medical answers still use the last box; ECG accepts a last boxed answer or
 an otherwise bare exact category, not arbitrary prose. The SFT response-structure
 gate and ECG exact-label special case are unchanged. Human-behavior/medical
-acceptance uses the updated scorers, so parser-normalization edge cases can change.
+acceptance checks exact `acc`, not the RL reward, so partial medical answers
+are still rejected as teacher targets.
 
 All scorers expose the same eight numeric diagnostic keys for veRL mixed-batch
 collation. HBA/ECG diagnostics compare whole labels and medical diagnostics
@@ -109,9 +113,25 @@ The outer DAPO manager alone applies `min((3584 - response_tokens) / 512, 0)`
 at response cap 4096 and logs `overlong_reward`/`overlong`. It leaves the raw
 task `score` available. GRPO then standardizes the five rewards within each
 prompt; KL stays in the actor loss. Sampling proportions, token-mean reduction,
-and clipping are unchanged. The GRPO launcher's default run name includes `paper-hbacls`
-to distinguish this objective from older rewards. Start from the SFT export in
-a fresh run; do not release an old held submission with stale labels/settings.
+and clipping are unchanged. This remains our mixed-task GRPO recipe, not an exact
+copy of upstream's batch manager and KL settings. Default run names now include
+`climbf1` to separate this objective from earlier exact-only medical rewards.
+Start from the SFT export in a fresh run, not an old RL optimizer checkpoint.
+
+INSPECT CT prompts now consistently offer `Subsegmental-only PE` and
+`Acute Subsegmental-only PE`. The shared prompt adapter corrects only malformed
+choice lines, independently of the answer; raw parquets and targets are untouched.
+RL train/validation and newly exported teacher/SFT prompts use the same fix.
+Already-built teacher tasks and SFT parquets require rebuilding to change their
+stored prompts. Re-evaluate the SFT start on corrected validation prompts before
+comparing the new RL run against it; historical CT inputs differed.
+
+The launcher saves validation responses, source/dataset identifiers, and row
+indices under scratch `validation/<project>/<run>/` (`VALIDATION_DATA_DIR=null`
+disables this). It also enables per-source reward-group diagnostics for the
+single-turn GRPO path: measured reward means and the fraction of multi-response
+groups with identical rewards. Such groups have no GRPO outcome advantage.
+These diagnostics do not alter sampling, rewards, or gradients.
 
 ## Repository map
 

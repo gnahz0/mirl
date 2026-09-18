@@ -16,6 +16,8 @@ import string
 from dataclasses import dataclass
 from pathlib import Path
 
+from mirl_ext.data.prompts import normalize_prompt_messages
+
 _CONFIG = Path(__file__).parents[1] / "sft" / "config.json"
 
 
@@ -231,7 +233,10 @@ def prompt_messages(row: dict) -> list[dict]:
     """The row's FULL prompt message list -- NOT prompt[0]: climb/tactile
     carry system + user turns, and dropping the user turn loses the question and
     the <image>/<video> placeholder (this bug shipped once)."""
-    return [{"role": m["role"], "content": m["content"]} for m in row["prompt"]]
+    messages = [{"role": m["role"], "content": m["content"]} for m in row["prompt"]]
+    return normalize_prompt_messages(
+        messages, data_source=row.get("data_source"), dataset=extra_info(row).get("dataset")
+    )
 
 
 def prompt_text(row: dict) -> str:

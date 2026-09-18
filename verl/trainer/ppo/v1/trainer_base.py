@@ -134,6 +134,14 @@ class PPOTrainer(ABC):
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        if self.config.trainer.get("log_reward_group_metrics", False):
+            if (
+                self.trainer_mode != "sync"
+                or self.parameter_sync_step != 1
+                or self.config.algorithm.adv_estimator != "grpo"
+                or self.config.actor_rollout_ref.rollout.agent.default_agent_loop != "single_turn_agent"
+            ):
+                raise ValueError("reward group metrics require single-turn, synchronous GRPO with parameter_sync_step=1")
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
@@ -891,6 +899,8 @@ class PPOTrainer(ABC):
             f.write(str(self.global_steps))
 
     def _validate(self) -> dict[str, float]:
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        validation_metadata: dict[str, dict] = {}
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -910,6 +920,26 @@ class PPOTrainer(ABC):
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
+            if val_data_dir:
+                # Join by prompt UID, never replay position: generation may finish out of order.
+                sources = batch_dict.get("data_source")
+                extras = batch_dict.get("extra_info")
+                for i, uid in enumerate(batch_dict["uid"]):
+                    extra_info = extras[i] if extras is not None else {}
+                    if isinstance(extra_info, str):
+                        try:
+                            extra_info = json.loads(extra_info)
+                        except json.JSONDecodeError:
+                            extra_info = {}
+                    if not isinstance(extra_info, dict):
+                        extra_info = {}
+                    validation_metadata[uid] = {
+                        "data_source": sources[i] if sources is not None else "unknown",
+                        "dataset": extra_info.get("dataset"),
+                        "index": extra_info.get("index"),
+                        # Stable across checkpoints when the validation split/order is unchanged.
+                        "validation_index": len(validation_metadata),
+                    }
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
@@ -1011,7 +1041,6 @@ class PPOTrainer(ABC):
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump to local dir
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             # Sort according to uid (so that generations in the same rollout are together)
             sort_keys = []
@@ -1031,6 +1060,7 @@ class PPOTrainer(ABC):
                 for parts in [key.rsplit("_", 2)]
             ]
             session_final_indices = [session_to_sample_idx[session] for session in dump_all_sessions]
+            dump_metadata = [validation_metadata[sample_uids[i]] for i in session_final_indices]
             self._dump_generations(
                 inputs=dump_all_inputs,
                 outputs=dump_all_outputs,
@@ -1039,7 +1069,11 @@ class PPOTrainer(ABC):
                 reward_extra_infos_dict={
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
                 }
-                | {"uid": dump_all_keys},
+                | {"uid": dump_all_keys}
+                | {
+                    key: [metadata[key] for metadata in dump_metadata]
+                    for key in ("data_source", "dataset", "index", "validation_index")
+                },
                 dump_path=val_data_dir,
             )
 
@@ -1522,7 +1556,11 @@ class PPOTrainer(ABC):
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        log_reward_groups = self.config.trainer.get("log_reward_group_metrics", False)
+        if log_reward_groups:
+            fields.append("data_source")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        data_sources = data.pop("data_source").tolist() if log_reward_groups else None
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
@@ -1537,6 +1575,19 @@ class PPOTrainer(ABC):
             metrics.update(kl_metrics)
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+
+        if log_reward_groups:
+            from mirl_ext.rewards.diagnostics import masked_reward_sums, reward_group_metrics
+
+            metrics.update(
+                reward_group_metrics(
+                    outcome_rewards=masked_reward_sums(data.batch["token_level_scores"], data.batch["response_mask"]),
+                    advantage_rewards=masked_reward_sums(data.batch["token_level_rewards"], data.batch["response_mask"]),
+                    uids=data.non_tensor_batch["uid"].tolist(),
+                    data_sources=data_sources,
+                    is_padding=[tag.get("is_padding", False) for tag in batch.tags],
+                )
+            )
 
         # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
         # Only runs in decoupled mode (computes once per batch using stable π_old)

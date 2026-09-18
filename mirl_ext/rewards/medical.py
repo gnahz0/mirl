@@ -1,9 +1,9 @@
-"""Exact condition-set correctness for the MIRL adaptation of CLIMB-QA.
+"""CLIMB-QA reward: upstream MIRL's ``0.5 * condition-set F1`` term.
 
-CLIMB Appendix B defines order-agnostic equality of predicted and target sets:
-https://arxiv.org/html/2503.07667v1
-This is a paper-metric-aligned RL fallback, not a published CLIMB RL recipe.
-Only exact correctness contributes reward; other metrics are diagnostic.
+Source: DDVD233/mirl, commit 16860b932c0300ba1ce9cee7c7b7ce975abdd96d,
+examples/reward_function/medical.py::medical_compute_score_batch.
+Keep exact-set accuracy diagnostic; omit the upstream bbox/JSON auxiliaries
+because this pipeline requests boxed condition answers, not localization.
 """
 
 import re
@@ -23,7 +23,7 @@ def parse_conditions(text: str) -> set[str]:
 
 
 def compute_score(predict_str: str, ground_truth: str) -> dict:
-    """Reward an exact, nonempty condition set from the last boxed answer."""
+    """Reward condition-set overlap from the last boxed answer; keep exact accuracy."""
     if not isinstance(ground_truth, str):
         raise ValueError("Medical ground truth must be a nonempty condition string.")
     gt_conditions = parse_conditions(ground_truth)
@@ -36,7 +36,7 @@ def compute_score(predict_str: str, ground_truth: str) -> dict:
     jacc = jaccard(pred_conditions, gt_conditions)
 
     return score_dict(
-        score=acc,
+        score=0.5 * f1,
         acc=acc,
         precision=precision,
         recall=recall,

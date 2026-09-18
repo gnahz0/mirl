@@ -43,8 +43,9 @@ def test_hba_classification_reward_rejects_open_qa(source):
         ("initial_fingers", "A,B", "A,B", 1.0),
         ("initial_fingers", "A", "A,B", 0.3),
         ("highest_pressure", "C", "A,B", 0.1),
-        ("mri", "Glioma Tumor", "Glioma Tumor", 1.0),
+        ("mri", "Glioma Tumor", "Glioma Tumor", 0.5),
         ("mri", "zzz", "Glioma Tumor", 0.0),
+        ("chest_xray", "Edema", "Edema, Pleural Effusion", 1 / 3),
         ("meld_emotion", "happy", "happy", 1.0),
         ("meld_emotion", "zzz", "happy", 0.2),
         ("ecg", "Normal", "Normal", 1.0),
@@ -71,6 +72,7 @@ class _FixedResponseTokenizer:
     [
         ("ecg", "Normal", "Normal"),
         ("mri", "Glioma Tumor", "Glioma Tumor"),
+        ("chest_xray", "Edema", "Edema, Pleural Effusion"),
         ("meld_emotion", "happy", "happy"),
         ("initial_fingers", "B,A", "A,B"),
         ("highest_pressure", "A", "A,B"),
@@ -169,6 +171,30 @@ def test_grpo_normalizes_within_prompt_not_across_modalities():
     assert torch.count_nonzero(advantages[:, 0]).item() == 0
 
 
+def test_medical_partial_answers_supply_signal_without_changing_exact_accuracy():
+    import numpy as np
+    import torch
+
+    from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+
+    answers = ["Edema", "Pleural Effusion", "Pneumonia"]
+    scored = [
+        compute_score("chest_xray", r"\boxed{" + answer + "}", "Edema, Pleural Effusion")
+        for answer in answers
+    ]
+    assert [result["acc"] for result in scored] == [0.0, 0.0, 0.0]
+    assert [result["score"] for result in scored] == pytest.approx([1 / 3, 1 / 3, 0.0])
+    rewards = torch.tensor([[result["score"]] for result in scored])
+    advantages, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=rewards,
+        response_mask=torch.ones_like(rewards),
+        index=np.array(["same_prompt"] * len(answers)),
+        norm_adv_by_std_in_grpo=True,
+    )
+    assert advantages[:2].gt(0).all()
+    assert advantages[2].lt(0).all()
+
+
 def test_mixed_reward_metrics_have_the_uniform_numeric_schema_required_by_verl():
     import numpy as np
 
@@ -198,7 +224,7 @@ def test_mixed_reward_metrics_have_the_uniform_numeric_schema_required_by_verl()
             "mri",
             "reasoning</think>\\boxed{Support Devices, Pleural Effusion}",
             "Pleural Effusion, Support Devices",
-            1.0,
+            0.5,
             1.0,
         ),
         ("meld_emotion", "[ HAPPY ]", "happy", 0.8, 0.0),
